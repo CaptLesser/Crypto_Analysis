@@ -291,6 +291,7 @@ def _plan_asset_work_span(**kwargs: Any) -> Optional[PlannedAssetWorkSpan]:
             task=str(tail_kwargs["task"]),
             horizon_minutes=int(tail_kwargs["horizon_minutes"]),
             asset=str(tail_kwargs["asset"]),
+            include_recompute=bool(tail_kwargs.get("include_recompute", False)),
         ))
         if canonical_io_config is not None
         else forecast_output_tail_ts

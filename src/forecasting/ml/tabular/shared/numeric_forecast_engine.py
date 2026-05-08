@@ -228,6 +228,7 @@ def walk_forward_predict(
     pred_mean = default_float_full((n,), 0.0)
     pred_std = default_float_full((n,), 0.0)
     y_eval = default_float_nan_full((n,))
+    prediction_finalized = np.zeros((n,), dtype=bool)
     pending_ts: List[int] = []
 
     if selected_window_bars is None:
@@ -361,6 +362,7 @@ def walk_forward_predict(
                     add_elapsed(detail_timing, "wf_predict_core_s", elapsed)
                     pred_mean[current_idx] = pm_block
                     pred_std[current_idx] = ps_block
+                    prediction_finalized[current_idx] = True
                     diag_predict_count += int(len(current_idx))
                     diag_predict_s += elapsed
                     segment_start = next_segment_start
@@ -387,13 +389,18 @@ def walk_forward_predict(
     pred_out["pred_std"] = pred_std_series
     pred_out["pred_p10"] = pred_p10_series
     pred_out["pred_p90"] = pred_p90_series
+    pred_out["is_forward_filled"] = ~prediction_finalized
+    pred_out["needs_recompute"] = ~prediction_finalized
 
     eval_out = df[["ts", "asset"]].copy()
     eval_out[label_base] = y_eval_series
+    eval_finalized = np.isfinite(y)
     if task == "log_return":
         dz = float(engine_config.future_direction_deadzone)
         direction = np.where(y_eval_series > dz, 1, np.where(y_eval_series < -dz, -1, 0)).astype(int)
         eval_out["future_direction"] = direction
+    eval_out["is_forward_filled"] = ~eval_finalized
+    eval_out["needs_recompute"] = ~eval_finalized
     add_elapsed(detail_timing, "wf_output_frame_build_s", time.monotonic() - t_output_frame)
 
     t_meta = time.monotonic()

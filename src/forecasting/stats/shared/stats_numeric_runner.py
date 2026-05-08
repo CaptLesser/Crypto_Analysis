@@ -524,8 +524,6 @@ def _eval_rows_from_predictions(rows: Sequence[Dict[str, Any]], *, task: str) ->
     target_col = NUMERIC_TASK_TO_TARGET_COLUMN.get(str(task), str(task))
     out: List[Dict[str, Any]] = []
     for row in rows:
-        if bool(row.get("needs_recompute", False)) or bool(row.get("is_forward_filled", False)):
-            continue
         if "_stats_actual" not in row or "pred_p50" not in row:
             continue
         actual = pd.to_numeric(pd.Series([row.get("_stats_actual")]), errors="coerce").iloc[0]
@@ -726,9 +724,9 @@ def _run_stats_asset_shard_core(
                 task=str(task),
                 run_id=run_id,
             )
-            eval_rows = _eval_rows_from_predictions(rows, task=str(task))
             if bool(payload.get("fill_to_edge", False)):
                 rows = _extend_rows_to_source_edge(rows, interval_minutes=int(interval), edge_ts=(int(edge_ts) if edge_ts is not None else None))
+            eval_rows = _eval_rows_from_predictions(rows, task=str(task))
             public_rows = [_public_prediction_row(row) for row in rows]
             forecast_row_count += int(len(public_rows))
             eval_row_count += int(len(eval_rows))
@@ -1054,6 +1052,7 @@ def run_stats_numeric_module(spec: StatsNumericModuleSpec) -> None:
                             task=str(tail_kwargs["task"]),
                             horizon_minutes=int(tail_kwargs["horizon_minutes"]),
                             asset=str(tail_kwargs["asset"]),
+                            include_recompute=bool(tail_kwargs.get("include_recompute", False)),
                         ),
                         decide_range_from_disk_edges_fn=decide_range_from_disk_edges,
                         fit_window_start_fn=fit_window_start,

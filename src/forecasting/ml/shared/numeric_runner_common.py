@@ -166,6 +166,20 @@ def canonical_prediction_value_columns(rows: Sequence[Dict[str, Any]]) -> List[s
     return [*ordered, *extras]
 
 
+CANONICAL_FORECAST_FLAG_COLUMNS = ("is_forward_filled", "needs_recompute")
+
+
+def _canonical_flag_value(value: Any) -> bool:
+    if value is None:
+        return False
+    try:
+        if bool(pd.isna(value)):
+            return False
+    except Exception:
+        pass
+    return bool(value)
+
+
 def canonicalize_forecast_rows(
     *,
     rows: Sequence[Dict[str, Any]],
@@ -187,9 +201,12 @@ def canonicalize_forecast_rows(
         for source_col, dst_col in zip(prediction_cols, expected_cols):
             if source_col in row:
                 out[dst_col] = row.get(source_col)
+        for flag_col in CANONICAL_FORECAST_FLAG_COLUMNS:
+            out[flag_col] = _canonical_flag_value(row.get(flag_col, False))
         out_rows.append(out)
+    flag_cols = list(CANONICAL_FORECAST_FLAG_COLUMNS)
     if not out_rows:
-        return pd.DataFrame(columns=["asset", "ts", *expected_cols]), expected_cols
+        return pd.DataFrame(columns=["asset", "ts", *expected_cols, *flag_cols]), expected_cols
     return pd.DataFrame(out_rows), expected_cols
 
 
@@ -229,9 +246,12 @@ def canonicalize_eval_rows(
                 if dst_col not in expected_cols:
                     expected_cols.append(dst_col)
                 out[dst_col] = row.get(source_col)
+        for flag_col in CANONICAL_FORECAST_FLAG_COLUMNS:
+            out[flag_col] = _canonical_flag_value(row.get(flag_col, False))
         out_rows.append(out)
+    flag_cols = list(CANONICAL_FORECAST_FLAG_COLUMNS)
     if not out_rows:
-        return pd.DataFrame(columns=["asset", "ts", *expected_cols]), expected_cols
+        return pd.DataFrame(columns=["asset", "ts", *expected_cols, *flag_cols]), expected_cols
     return pd.DataFrame(out_rows), expected_cols
 
 
@@ -361,6 +381,7 @@ def canonical_physical_output_tail_ts(
     horizon_minutes: int,
     asset: str,
     store: str = "forecast",
+    include_recompute: bool = False,
 ) -> Optional[int]:
     base = io_config.parquet_root / module_table(io_config, store=store, interval=int(interval_minutes)) / f"asset={str(asset)}"
     if not base.exists():
@@ -374,6 +395,7 @@ def canonical_physical_output_tail_ts(
                 horizon_minutes=int(horizon_minutes),
             )
         ]
+        value_cols = list(required_cols)
     else:
         required_cols = [
             canonical_forecast_column(
@@ -383,6 +405,10 @@ def canonical_physical_output_tail_ts(
                 horizon_minutes=int(horizon_minutes),
             )
         ]
+        task_short = str(io_config.naming.task_short.get(str(task), canonical_table_slug(task)))
+        pred_prefix = f"{io_config.naming.prediction_prefix}_pred_"
+        pred_suffix = f"_{task_short}_{int(horizon_minutes)}m"
+        value_cols = list(required_cols)
     completed_ts: List[np.ndarray] = []
     for path in sorted(base.glob("year=*/month=*/*.parquet")):
         frame = validated_existing_month_parquet(
@@ -396,9 +422,21 @@ def canonical_physical_output_tail_ts(
         )
         if frame.empty or not all(col in frame.columns for col in required_cols):
             continue
+        if str(store) == "forecast":
+            value_cols = [
+                str(col)
+                for col in frame.columns
+                if str(col).startswith(pred_prefix) and str(col).endswith(pred_suffix)
+            ]
+            if not value_cols:
+                value_cols = list(required_cols)
         mask = frame["asset"].astype(str).eq(str(asset))
-        for col in required_cols:
+        for col in value_cols:
             mask = mask & pd.to_numeric(frame[col], errors="coerce").notna()
+        if str(store) in {"forecast", "eval"} and not bool(include_recompute):
+            for flag_col in CANONICAL_FORECAST_FLAG_COLUMNS:
+                if flag_col in frame.columns:
+                    mask = mask & ~frame[flag_col].fillna(False).astype(bool)
         ts = pd.to_numeric(frame.loc[mask, "ts"], errors="coerce").dropna().astype("int64")
         if not ts.empty:
             completed_ts.append(ts.to_numpy(dtype=np.int64))
