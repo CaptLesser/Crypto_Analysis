@@ -12,7 +12,7 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolE
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, MutableMapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -588,6 +588,108 @@ class PlannedAssetWorkSpan:
     dst_tail_ts: Optional[int]
 
 
+TailPlanningCacheKey = Tuple[str, str, str, int, int, str, bool]
+
+
+class TailPlanningCache:
+    """Run-local memo for exact output-tail planning questions."""
+
+    def __init__(self) -> None:
+        self._values: Dict[TailPlanningCacheKey, Optional[int]] = {}
+        self._locks: Dict[TailPlanningCacheKey, threading.Lock] = {}
+        self._guard = threading.Lock()
+
+    def get_or_compute(self, key: TailPlanningCacheKey, compute: Callable[[], Optional[int]]) -> Optional[int]:
+        with self._guard:
+            if key in self._values:
+                return self._values[key]
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[key] = lock
+        with lock:
+            with self._guard:
+                if key in self._values:
+                    return self._values[key]
+            try:
+                value = compute()
+            except Exception:
+                with self._guard:
+                    if self._locks.get(key) is lock:
+                        self._locks.pop(key, None)
+                raise
+            with self._guard:
+                self._values[key] = value
+                self._locks.pop(key, None)
+            return value
+
+    def __len__(self) -> int:
+        with self._guard:
+            return len(self._values)
+
+
+def tail_planning_cache_key(
+    *,
+    namespace: str,
+    out_root: Path,
+    asset: str,
+    interval_minutes: int,
+    horizon_minutes: int,
+    task: str,
+    include_recompute: bool,
+) -> TailPlanningCacheKey:
+    return (
+        str(namespace),
+        str(Path(out_root).expanduser().resolve()),
+        str(asset),
+        int(interval_minutes),
+        int(horizon_minutes),
+        str(task),
+        bool(include_recompute),
+    )
+
+
+def _cached_forecast_output_tail_ts(
+    *,
+    forecast_output_tail_ts_fn: Callable[..., Optional[int]],
+    out_root: Path,
+    interval_minutes: int,
+    task: str,
+    horizon_minutes: int,
+    asset: str,
+    include_recompute: bool,
+    tail_cache: Optional[TailPlanningCache | MutableMapping[TailPlanningCacheKey, Optional[int]]],
+    tail_cache_namespace: str,
+) -> Optional[int]:
+    kwargs: Dict[str, Any] = {
+        "out_root": out_root,
+        "interval_minutes": int(interval_minutes),
+        "task": str(task),
+        "horizon_minutes": int(horizon_minutes),
+        "asset": str(asset),
+    }
+    if bool(include_recompute):
+        kwargs["include_recompute"] = True
+    if tail_cache is None:
+        return forecast_output_tail_ts_fn(**kwargs)
+    key = tail_planning_cache_key(
+        namespace=str(tail_cache_namespace),
+        out_root=Path(out_root),
+        asset=str(asset),
+        interval_minutes=int(interval_minutes),
+        horizon_minutes=int(horizon_minutes),
+        task=str(task),
+        include_recompute=bool(include_recompute),
+    )
+    if isinstance(tail_cache, TailPlanningCache):
+        return tail_cache.get_or_compute(key, lambda: forecast_output_tail_ts_fn(**kwargs))
+    if key in tail_cache:
+        return tail_cache[key]
+    value = forecast_output_tail_ts_fn(**kwargs)
+    tail_cache[key] = value
+    return value
+
+
 def planned_work_span_to_payload(span: PlannedAssetWorkSpan) -> Dict[str, Any]:
     return {
         "asset": str(span.asset),
@@ -795,6 +897,8 @@ def plan_asset_work_span(
     decide_range_from_disk_edges_fn: Callable[..., Tuple[Optional[int], Any, str]],
     fit_window_start_fn: Callable[..., int],
     production_start_ts_value: Optional[int] = None,
+    tail_cache: Optional[TailPlanningCache | MutableMapping[TailPlanningCacheKey, Optional[int]]] = None,
+    tail_cache_namespace: str = "partitioned_forecast_output",
 ) -> Optional[PlannedAssetWorkSpan]:
     edge_ts, min_ts = discover_edge_and_min_fn(asset=str(asset), interval_minutes=int(interval))
     if edge_ts is None or min_ts is None:
@@ -804,20 +908,27 @@ def plan_asset_work_span(
     effective_min_ts = max(int(min_ts), int(production_floor_ts))
     if int(target_tail) < int(effective_min_ts):
         return None
-    dst_tail = None if bool(force) else forecast_output_tail_ts_fn(
+    dst_tail = None if bool(force) else _cached_forecast_output_tail_ts(
+        forecast_output_tail_ts_fn=forecast_output_tail_ts_fn,
         out_root=forecast_root,
         interval_minutes=int(interval),
         task=str(task),
         horizon_minutes=int(horizon_minutes),
         asset=str(asset),
+        include_recompute=False,
+        tail_cache=tail_cache,
+        tail_cache_namespace=str(tail_cache_namespace),
     )
-    write_tail = None if bool(force) else forecast_output_tail_ts_fn(
+    write_tail = None if bool(force) else _cached_forecast_output_tail_ts(
+        forecast_output_tail_ts_fn=forecast_output_tail_ts_fn,
         out_root=forecast_root,
         interval_minutes=int(interval),
         task=str(task),
         horizon_minutes=int(horizon_minutes),
         asset=str(asset),
         include_recompute=True,
+        tail_cache=tail_cache,
+        tail_cache_namespace=str(tail_cache_namespace),
     )
     start_for_mode, _, resume_reason = decide_range_from_disk_edges_fn(
         asset=str(asset),

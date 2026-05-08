@@ -22,6 +22,7 @@ from src.forecasting.ml.shared.numeric_runner_common import (
     NumericExistingProductionScope as ExistingProductionScope,
     NumericTestedProductionArtifactScope as TestedProductionArtifactScope,
     PlannedAssetWorkSpan,
+    TailPlanningCache as _shared_TailPlanningCache,
     artifact_model_key as _shared_artifact_model_key,
     build_asset_shard_jobs as _shared_build_asset_shard_jobs,
     build_numeric_family_manifest_payload as _shared_build_numeric_family_manifest_payload,
@@ -305,6 +306,11 @@ def _min_required_history_bars(*, spec: NeuralNumericModuleSpec, seq_len: int, m
 
 def _plan_asset_work_span(**kwargs: Any) -> Optional[PlannedAssetWorkSpan]:
     canonical_io_config = kwargs.pop("canonical_io_config", None)
+    if canonical_io_config is not None:
+        kwargs.setdefault(
+            "tail_cache_namespace",
+            f"canonical_physical:{canonical_io_config.naming.forecast_table_tag}:forecast",
+        )
     tail_fn = (
         (lambda **tail_kwargs: _shared_canonical_physical_output_tail_ts(
             io_config=canonical_io_config,
@@ -1150,6 +1156,7 @@ def run_neural_numeric_module(spec: NeuralNumericModuleSpec) -> None:
     progress_every_seconds = _resolve_progress_every_seconds_for_spec(spec)
     state_flush_combo_cadence = _state_flush_combo_cadence()
     planning_workers = max(1, min(int(worker_budget), max(1, len(assets))))
+    tail_cache = _shared_TailPlanningCache()
     for interval, hm, task in combos:
         combo_key = (int(interval), int(hm), str(task))
         combo_order.append(combo_key)
@@ -1187,6 +1194,7 @@ def run_neural_numeric_module(spec: NeuralNumericModuleSpec) -> None:
             fit_days=int(combo_fit_days),
             forecast_root=forecast_root,
             canonical_io_config=canonical_io_config,
+            tail_cache=tail_cache,
         )
         if planning_workers <= 1 or len(assets) <= 1:
             planned_spans_by_asset = {str(asset_name): plan_fn(asset_name) for asset_name in assets}
