@@ -533,6 +533,14 @@ def validated_module_month_parquet(
     return out
 
 
+def _row_needs_recompute(frame: pd.DataFrame) -> pd.Series:
+    if "needs_recompute" in frame.columns:
+        return frame["needs_recompute"].fillna(False).astype(bool)
+    if "is_forward_filled" in frame.columns:
+        return frame["is_forward_filled"].fillna(False).astype(bool)
+    return pd.Series(False, index=frame.index)
+
+
 def coalesce_keyed_frames(frames: Sequence[pd.DataFrame], expected_cols: Sequence[str]) -> pd.DataFrame:
     valid_frames = [frame for frame in frames if frame is not None and not frame.empty]
     if not valid_frames:
@@ -967,6 +975,7 @@ def completed_edge_from_module_parquet(
     stop_ts: int,
     step_seconds: int,
     allow_head_gap: bool = True,
+    include_recompute: bool = False,
 ) -> Optional[int]:
     base = root / module_table(io_config, store=store, interval=interval) / f"asset={str(asset)}"
     if not base.exists():
@@ -982,6 +991,8 @@ def completed_edge_from_module_parquet(
         populated_mask = asset_mask
         for col in expected_cols:
             populated_mask = populated_mask & pd.to_numeric(d[col], errors="coerce").notna()
+        if not bool(include_recompute):
+            populated_mask = populated_mask & ~_row_needs_recompute(d)
         if not populated_mask.any():
             continue
         ts = ts_num.loc[populated_mask].astype("int64")
