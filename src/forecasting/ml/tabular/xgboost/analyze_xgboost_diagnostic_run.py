@@ -1,0 +1,11 @@
+from __future__ import annotations
+
+from src.forecasting.ml.tabular.shared.tabular_diagnostic_analysis import main_for_model
+
+
+def main() -> None:
+    main_for_model("xgboost")
+
+
+if __name__ == "__main__":
+    main()
