@@ -332,7 +332,13 @@ def build_numeric_family_module(spec: NumericFamilyModuleSpec) -> Dict[str, Any]
     get_start_ts_fn = lambda asset, interval: get_start_ts(io_config, asset, interval)
     get_stop_ts_fn = lambda asset, interval: get_stop_ts(io_config, asset, interval)
     resolve_assets_fn = lambda intervals, assets_arg: resolve_assets(io_config, intervals, assets_arg)
-    compute_future_labels_fn = lambda ohlc, horizon_bars: compute_future_labels(ohlc, horizon_bars, future_direction_deadzone=deadzone_by_task["log_return"])
+    def compute_future_labels_fn(ohlc, horizon_bars, *, target_columns=None):
+        return compute_future_labels(
+            ohlc,
+            horizon_bars,
+            future_direction_deadzone=deadzone_by_task["log_return"],
+            target_columns=target_columns,
+        )
     model_state_path_fn = lambda asset, interval, horizon_minutes, task: model_state_path(io_config, asset, interval, horizon_minutes, task)
     load_model_state_fn = lambda asset, interval, horizon_minutes, task: load_model_state(io_config, asset, interval, horizon_minutes, task)
     save_model_state_fn = lambda asset, interval, horizon_minutes, task, state: save_model_state(io_config, asset, interval, horizon_minutes, task, state)

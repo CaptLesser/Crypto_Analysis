@@ -38,6 +38,7 @@ from src.forecasting.common.stats_module_utils import (
 from src.forecasting.ml.shared.numeric_runner_common import (
     NumericExistingProductionScope,
     NumericTestedProductionArtifactScope,
+    TailPlanningCache,
     build_asset_shard_jobs,
     build_horizon_group_shard_jobs,
     canonical_physical_io_config,
@@ -1026,6 +1027,7 @@ def run_stats_numeric_module(spec: StatsNumericModuleSpec) -> None:
         combo_order: List[Tuple[int, int, str]] = []
         planned_assets_by_combo: Dict[Tuple[int, int, str], List[str]] = {}
         planning_workers = max(1, min(int(args.workers), max(1, len(assets))))
+        tail_cache = TailPlanningCache()
 
         for interval, hm, task in combos:
             plan_started = time.perf_counter()
@@ -1055,6 +1057,8 @@ def run_stats_numeric_module(spec: StatsNumericModuleSpec) -> None:
                         ),
                         decide_range_from_disk_edges_fn=decide_range_from_disk_edges,
                         fit_window_start_fn=fit_window_start,
+                        tail_cache=tail_cache,
+                        tail_cache_namespace=f"canonical_physical:{canonical_io_config.naming.forecast_table_tag}:forecast",
                     )
                 except Exception:
                     return None

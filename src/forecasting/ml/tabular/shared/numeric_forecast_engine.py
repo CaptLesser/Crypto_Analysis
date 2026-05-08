@@ -113,6 +113,32 @@ class NumericForecastEngineConfig:
     work_start_env: str
 
 
+def _required_future_label_columns_for_group(engine_config: NumericForecastEngineConfig, works: Sequence[UnitWork]) -> List[str]:
+    required: List[str] = []
+    seen: set[str] = set()
+    for work in works:
+        task = str(work.task)
+        label_col = str(engine_config.task_label[task])
+        if label_col and label_col not in seen:
+            required.append(label_col)
+            seen.add(label_col)
+        if task == "log_return" and "future_direction" not in seen:
+            required.append("future_direction")
+            seen.add("future_direction")
+    return required
+
+
+def _required_task_label_columns_for_group(engine_config: NumericForecastEngineConfig, works: Sequence[UnitWork]) -> List[str]:
+    required: List[str] = []
+    seen: set[str] = set()
+    for work in works:
+        label_col = str(engine_config.task_label[str(work.task)])
+        if label_col and label_col not in seen:
+            required.append(label_col)
+            seen.add(label_col)
+    return required
+
+
 def state_to_bundle(state: Optional[Dict[str, Any]]) -> Optional[RegressionBundle]:
     if not isinstance(state, dict):
         return None
@@ -685,7 +711,10 @@ def compute_group(engine_config: NumericForecastEngineConfig, work_group: Horizo
             df = feature_df
         else:
             df = feature_df.reset_index(drop=True)
-            missing_future_cols = [col for col in engine_config.future_label_columns if col not in df.columns]
+            active_works = [ctx["work"] for ctx in active_ctx]
+            required_future_label_columns = _required_future_label_columns_for_group(engine_config, active_works)
+            required_task_label_columns = _required_task_label_columns_for_group(engine_config, active_works)
+            missing_future_cols = [col for col in required_future_label_columns if col not in df.columns]
             if missing_future_cols:
                 df = pd.concat(
                     [
@@ -699,19 +728,24 @@ def compute_group(engine_config: NumericForecastEngineConfig, work_group: Horizo
                     ],
                     axis=1,
                 )
-            label_ready_mask = df[list(engine_config.task_label.values())].notna().all(axis=1)
+            label_ready_mask = df[required_task_label_columns].notna().all(axis=1)
             missing_idx = np.flatnonzero(~label_ready_mask.to_numpy(dtype=bool))
             if len(missing_idx) > 0:
                 suffix_start_idx = int(missing_idx[0])
                 add_count(group_detail_counts, "suffix_start_idx", int(suffix_start_idx))
                 add_count(group_detail_counts, "suffix_rows_labeled", int(len(df) - suffix_start_idx))
-                suffix_labels, future_detail = compute_future_labels(df.loc[suffix_start_idx:, ["open", "high", "low", "close", "volume", "trades"]].reset_index(drop=True), horizon_bars=int(work_group.horizon_bars), future_direction_deadzone=float(engine_config.future_direction_deadzone))
+                suffix_labels, future_detail = compute_future_labels(
+                    df.loc[suffix_start_idx:, ["open", "high", "low", "close", "volume", "trades"]].reset_index(drop=True),
+                    horizon_bars=int(work_group.horizon_bars),
+                    future_direction_deadzone=float(engine_config.future_direction_deadzone),
+                    target_columns=required_future_label_columns,
+                )
                 for key_name, value in future_detail.items():
                     if isinstance(value, float):
                         add_elapsed(group_detail_timing, key_name, float(value))
                     elif isinstance(value, int):
                         add_count(group_detail_counts, key_name, int(value))
-                for col in engine_config.future_label_columns:
+                for col in required_future_label_columns:
                     df.loc[suffix_start_idx:, col] = suffix_labels[col].to_numpy()
         label_s = float(time.monotonic() - label_t0)
         data_load_s_total += float(fresh_stats.get("load_total_s", 0.0)) + label_s
