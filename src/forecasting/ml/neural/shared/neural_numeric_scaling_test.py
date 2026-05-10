@@ -22,6 +22,7 @@ from src.forecasting.ml.neural.shared.neural_numeric_model_registry import NEURA
 from src.forecasting.ml.neural.shared.neural_runtime_bootstrap import configure_neural_thread_env
 from src.forecasting.ml.neural.shared.neural_stage1_profile import resolve_execution_profile
 from src.forecasting.ml.shared.numeric_forecast_targets import compute_future_labels
+from src.forecasting.ml.shared.test_branch_function_telemetry import emit_event_for_path, telemetry_scope_for_path
 
 DEFAULT_STAGE2_INTERVALS = (5, 15, 30, 60, 240, 720, 1440)
 DEFAULT_TRAIN_WINDOWS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
@@ -194,40 +195,93 @@ def _resolve_assets(feature_profile_json: Optional[Path], asset_count: int, *, p
     )
 
 
-def _load_asset_frame(module, asset: str, interval: int, start_ts: int, end_ts: int, task: str, *, parquet_root: Path, feature_root: Optional[Path] = None, selected_feature_columns: Optional[Sequence[str]] = None, base_ohlcvt_frame: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def _load_asset_frame(
+    module,
+    asset: str,
+    interval: int,
+    start_ts: int,
+    end_ts: int,
+    task: str,
+    *,
+    parquet_root: Path,
+    feature_root: Optional[Path] = None,
+    selected_feature_columns: Optional[Sequence[str]] = None,
+    base_ohlcvt_frame: Optional[pd.DataFrame] = None,
+    telemetry_path: Optional[Path] = None,
+    model_key: str = "",
+) -> pd.DataFrame:
+    base_event = {
+        "family": "Neural_Numeric",
+        "model": str(model_key),
+        "stage": "stage2",
+        "combo_key": f"{int(interval)}:{str(task)}",
+        "interval_minutes": int(interval),
+        "task": str(task),
+        "asset": str(asset),
+        "module_name": __name__,
+    }
     feature_columns = [NUMERIC_TASK_TO_TARGET_COLUMN[str(task)]]
     if selected_feature_columns is not None:
         feature_columns.extend(str(col) for col in selected_feature_columns if str(col))
     elif bool(getattr(module.MODULE_SPEC, "needs_dynamic_features", False)):
         feature_columns.extend(str(col) for col in getattr(module.MODULE_SPEC, "dynamic_feature_candidates", ()))
-    ohlcvt_frame = (
-        base_ohlcvt_frame
-        if base_ohlcvt_frame is not None
-        else read_ohlcvt(
+    with telemetry_scope_for_path(
+        telemetry_path,
+        **base_event,
+        function_name="read_ohlcvt",
+        phase_name="source_read",
+        parent_phase="diagnostics",
+        source_path=str(Path(parquet_root).resolve()),
+    ) as scope:
+        ohlcvt_frame = (
+            base_ohlcvt_frame
+            if base_ohlcvt_frame is not None
+            else read_ohlcvt(
+                asset=str(asset),
+                interval_min=int(interval),
+                start_ts=int(start_ts),
+                end_ts=int(end_ts),
+                columns=["ts", "asset", "open", "high", "low", "close", "volume", "trades"],
+                root=Path(parquet_root).resolve(),
+            )
+        )
+        scope.set_output(ohlcvt_frame, reason_code=("source_read_empty" if ohlcvt_frame.empty else ""))
+    with telemetry_scope_for_path(
+        telemetry_path,
+        **base_event,
+        function_name="read_feature_window_columns",
+        phase_name="feature_load",
+        parent_phase="diagnostics",
+        source_path=str(Path(feature_root or _source_feature_root(fallback=Path(parquet_root).resolve())).resolve()),
+    ) as scope:
+        feature_frame = read_feature_window_columns(
+            root=Path(feature_root or _source_feature_root(fallback=Path(parquet_root).resolve())).resolve(),
+            interval_minutes=int(interval),
             asset=str(asset),
-            interval_min=int(interval),
+            columns=list(dict.fromkeys(feature_columns)),
             start_ts=int(start_ts),
             end_ts=int(end_ts),
-            columns=["ts", "asset", "open", "high", "low", "close", "volume", "trades"],
-            root=Path(parquet_root).resolve(),
         )
-    )
-    feature_frame = read_feature_window_columns(
-        root=Path(feature_root or _source_feature_root(fallback=Path(parquet_root).resolve())).resolve(),
-        interval_minutes=int(interval),
-        asset=str(asset),
-        columns=list(dict.fromkeys(feature_columns)),
-        start_ts=int(start_ts),
-        end_ts=int(end_ts),
-    )
+        scope.set_output(feature_frame, reason_code=("feature_load_empty" if feature_frame.empty else ""))
     if ohlcvt_frame.empty:
         return ohlcvt_frame.sort_values("ts").reset_index(drop=True)
-    merged = ohlcvt_frame.merge(
-        feature_frame,
-        on=["ts", "asset"],
-        how="left",
-        suffixes=("", "_feature"),
-    )
+    with telemetry_scope_for_path(
+        telemetry_path,
+        input_obj=ohlcvt_frame,
+        required_columns=["ts", "asset", "high", "low", "close"],
+        key_columns=["ts", "asset"],
+        **base_event,
+        function_name="_load_asset_frame",
+        phase_name="join",
+        parent_phase="diagnostics",
+    ) as scope:
+        merged = ohlcvt_frame.merge(
+            feature_frame,
+            on=["ts", "asset"],
+            how="left",
+            suffixes=("", "_feature"),
+        )
+        scope.set_output(merged, reason_code=("join_empty" if merged.empty else ""))
     if merged.columns.has_duplicates:
         merged = merged.loc[:, ~merged.columns.duplicated(keep="first")].copy()
     return merged.sort_values("ts").reset_index(drop=True)
@@ -243,8 +297,33 @@ def _origin_metrics(
     training_window_months: int,
     selected_feature_columns: Optional[Sequence[str]] = None,
     progress_label: Optional[str] = None,
+    telemetry_path: Optional[Path] = None,
+    model_key: str = "",
+    asset: str = "",
 ) -> Tuple[List[float], List[float], List[int]]:
-    labels, _ = compute_future_labels(frame.loc[:, ["high", "low", "close"]].reset_index(drop=True), int(horizon_minutes) // int(interval), future_direction_deadzone=0.0)
+    asset_name = str(asset or (frame["asset"].iloc[0] if not frame.empty and "asset" in frame.columns else ""))
+    base_event = {
+        "family": "Neural_Numeric",
+        "model": str(model_key),
+        "stage": "stage2",
+        "combo_key": f"{int(interval)}:{int(horizon_minutes)}:{str(task)}",
+        "interval_minutes": int(interval),
+        "horizon_minutes": int(horizon_minutes),
+        "task": str(task),
+        "asset": asset_name,
+        "module_name": __name__,
+    }
+    with telemetry_scope_for_path(
+        telemetry_path,
+        input_obj=frame,
+        required_columns=["high", "low", "close"],
+        **base_event,
+        function_name="compute_future_labels",
+        phase_name="label_build",
+        parent_phase="diagnostics",
+    ) as scope:
+        labels, _ = compute_future_labels(frame.loc[:, ["high", "low", "close"]].reset_index(drop=True), int(horizon_minutes) // int(interval), future_direction_deadzone=0.0)
+        scope.set_output(labels, reason_code=("labels_empty" if labels.empty else ""))
     label_col = NUMERIC_TASK_TO_TARGET_COLUMN[str(task)]
     merged = frame.reset_index(drop=True).copy()
     if label_col in merged.columns and label_col in labels.columns:
@@ -267,6 +346,19 @@ def _origin_metrics(
     if use_dynamic_features and feat_cols:
         feat_matrix = merged.loc[:, feat_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
     valid_target_idx = np.flatnonzero(np.isfinite(y_vec))
+    emit_event_for_path(
+        telemetry_path,
+        **base_event,
+        function_name="_origin_metrics",
+        phase_name="join",
+        parent_phase="diagnostics",
+        status="completed",
+        input_rows=len(frame),
+        output_rows=len(valid_target_idx),
+        input_columns_count=len(frame.columns),
+        output_columns_count=len(merged.columns),
+        reason_code=("labels_empty" if len(valid_target_idx) == 0 else ""),
+    )
     edge_ts = int(ts_vec[-1]) if len(ts_vec) else 0
     eval_start_ts = int(edge_ts - DEFAULT_FORECAST_DAYS * 86400)
     seq_len = _seq_len_for_interval(module, int(interval))
@@ -278,6 +370,10 @@ def _origin_metrics(
     eligible_origins = int(np.sum(ts_vec >= int(eval_start_ts)))
     started_at = time.monotonic()
     last_progress_at = started_at
+    predict_started = time.perf_counter()
+    attempted_origins = 0
+    failed_origins = 0
+    skipped_origins = 0
     if progress_label:
         progress_line(
             f"{progress_label}: start rows={int(len(ts_vec))} eligible_origins={int(eligible_origins)} "
@@ -289,6 +385,7 @@ def _origin_metrics(
             continue
         valid_pos = int(np.searchsorted(valid_target_idx, int(idx), side="right")) - 1
         if valid_pos < 63:
+            skipped_origins += 1
             continue
         hist_start = max(0, valid_pos - int(effective_history_bars) + 1)
         hist_idx = valid_target_idx[hist_start : valid_pos + 1]
@@ -297,15 +394,18 @@ def _origin_metrics(
         x_last = None
         if use_dynamic_features:
             if feat_matrix is None:
+                skipped_origins += 1
                 continue
             fmat = feat_matrix[hist_idx]
             if not np.isfinite(fmat).any():
+                skipped_origins += 1
                 continue
             med = np.nanmedian(fmat, axis=0)
             fmat = np.where(np.isfinite(fmat), fmat, med)
             x_hist = fmat
             x_last = fmat[-1]
         try:
+            attempted_origins += 1
             qvals, _meta = module.MODULE_SPEC.predict_fn(
                 y_hist=y_hist,
                 horizon_bars=int(horizon_minutes) // int(interval),
@@ -317,9 +417,11 @@ def _origin_metrics(
                 x_last=x_last,
             )
         except Exception:
+            failed_origins += 1
             continue
         y_true = y_vec[idx]
         if not math.isfinite(float(y_true)):
+            skipped_origins += 1
             continue
         preds.append(float(qvals.get(0.5, np.nan)))
         actuals.append(float(y_true))
@@ -335,6 +437,19 @@ def _origin_metrics(
         progress_line(
             f"{progress_label}: done predictions={int(len(preds))} elapsed_s={int(time.monotonic() - started_at)}"
         )
+    emit_event_for_path(
+        telemetry_path,
+        **base_event,
+        function_name="_origin_metrics",
+        phase_name="predict",
+        parent_phase="diagnostics",
+        status="completed",
+        reason_code=("predict_returned_empty" if not preds else ""),
+        elapsed_seconds=time.perf_counter() - predict_started,
+        input_rows=len(valid_target_idx),
+        output_rows=len(preds),
+        asset_count=1,
+    )
     return preds, actuals, pred_ts
 
 
@@ -439,10 +554,13 @@ def _score_combo_shard(payload: Dict[str, Any]) -> Dict[str, Any]:
     assets = [str(asset) for asset in payload.get("assets", ())]
     parquet_root = Path(payload.get("parquet_root") or _source_ohlcvt_root()).resolve()
     feature_root = Path(payload.get("feature_root") or _source_feature_root(fallback=parquet_root)).resolve()
+    telemetry_path = Path(str(payload["telemetry_path"])) if payload.get("telemetry_path") else None
     grouped_frame_cache: Dict[Tuple[str, Tuple[str, ...]], Dict[str, pd.DataFrame]] = {}
     base_ohlcvt_cache: Dict[str, pd.DataFrame] = {}
     accuracy_by_asset: Dict[str, Dict[str, Any]] = {}
     completed_combo_count = 0
+    started = time.perf_counter()
+    total_prediction_rows = 0
     shard_label = str(payload.get("shard_label") or "shard")
     progress_line(
         f"Stage 2 worker {shard_label}: start interval={int(interval)}m window={int(training_window_months)}m "
@@ -451,6 +569,7 @@ def _score_combo_shard(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     for task, horizon_minutes in payload.get("task_horizons", ()):
         completed_combo_count += 1
+        combo_key = f"{int(interval)}:{int(horizon_minutes)}:{str(task)}"
         combo_label = f"{shard_label} interval={int(interval)}m window={int(training_window_months)}m task={str(task)} horizon={int(horizon_minutes)}m"
         progress_line(f"Stage 2 worker {combo_label}: combo-start")
         combo_profile = (
@@ -499,10 +618,29 @@ def _score_combo_shard(payload: Dict[str, Any]) -> Dict[str, Any]:
                     feature_root=feature_root,
                     selected_feature_columns=selected_features,
                     base_ohlcvt_frame=base_ohlcvt_frame,
+                    telemetry_path=telemetry_path,
+                    model_key=str(payload["model_key"]),
                 )
             grouped_frame_cache[cache_key] = frames
         for asset, frame in frames.items():
             if frame.empty:
+                emit_event_for_path(
+                    telemetry_path,
+                    family="Neural_Numeric",
+                    model=str(payload["model_key"]),
+                    stage="stage2",
+                    combo_key=combo_key,
+                    interval_minutes=int(interval),
+                    horizon_minutes=int(horizon_minutes),
+                    task=str(task),
+                    asset=str(asset),
+                    function_name="_score_combo_shard",
+                    module_name=__name__,
+                    phase_name="source_read",
+                    status="skipped",
+                    reason_code="source_read_empty",
+                    output_rows=0,
+                )
                 progress_line(f"Stage 2 worker {combo_label} asset={str(asset)}: empty-frame")
                 continue
             preds, actuals, pred_ts = _origin_metrics(
@@ -514,10 +652,32 @@ def _score_combo_shard(payload: Dict[str, Any]) -> Dict[str, Any]:
                 training_window_months=int(training_window_months),
                 selected_feature_columns=selected_features,
                 progress_label=f"Stage 2 worker {combo_label} asset={str(asset)}",
+                telemetry_path=telemetry_path,
+                model_key=str(payload["model_key"]),
+                asset=str(asset),
             )
             if not preds:
+                emit_event_for_path(
+                    telemetry_path,
+                    family="Neural_Numeric",
+                    model=str(payload["model_key"]),
+                    stage="stage2",
+                    combo_key=combo_key,
+                    interval_minutes=int(interval),
+                    horizon_minutes=int(horizon_minutes),
+                    task=str(task),
+                    asset=str(asset),
+                    function_name="_score_combo_shard",
+                    module_name=__name__,
+                    phase_name="predict",
+                    status="completed",
+                    reason_code="predict_returned_empty",
+                    input_rows=len(frame),
+                    output_rows=0,
+                )
                 progress_line(f"Stage 2 worker {combo_label} asset={str(asset)}: no-predictions")
                 continue
+            total_prediction_rows += int(len(preds))
             pred = np.asarray(preds, dtype=float)
             act = np.asarray(actuals, dtype=float)
             mae = float(np.mean(np.abs(pred - act)))
@@ -541,6 +701,23 @@ def _score_combo_shard(payload: Dict[str, Any]) -> Dict[str, Any]:
     progress_line(
         f"Stage 2 worker {shard_label}: done completed_combos={int(completed_combo_count)} "
         f"assets_with_metrics={int(len(accuracy_by_asset))}"
+    )
+    emit_event_for_path(
+        telemetry_path,
+        family="Neural_Numeric",
+        model=str(payload["model_key"]),
+        stage="stage2",
+        interval_minutes=int(interval),
+        asset_count=len(assets),
+        function_name="_score_combo_shard",
+        module_name=__name__,
+        phase_name="predict",
+        parent_phase="diagnostics",
+        status="completed",
+        elapsed_seconds=time.perf_counter() - started,
+        input_rows=int(completed_combo_count) * int(len(assets)),
+        output_rows=total_prediction_rows,
+        reason_code=("predict_returned_empty" if total_prediction_rows == 0 else ""),
     )
     return {
         "accuracy_by_asset": accuracy_by_asset,
@@ -588,6 +765,32 @@ def run_stage_for_model(model_key: str) -> Path:
     resume_run_root = _discover_resume_run_root(output_dir, planned_relative_run_dirs)
     run_root = resume_run_root or (output_dir / f"run={run_id}")
     run_root.mkdir(parents=True, exist_ok=True)
+    emit_event_for_path(
+        run_root,
+        family="Neural_Numeric",
+        model=str(model_key),
+        stage="stage2",
+        function_name="run_stage_for_model",
+        module_name=__name__,
+        phase_name="source_root_resolution",
+        status="completed",
+        source_path=str(Path(args.parquet_root).resolve()),
+        artifact_profile_source=(str(feature_profile_json) if feature_profile_json else ""),
+    )
+    emit_event_for_path(
+        run_root,
+        family="Neural_Numeric",
+        model=str(model_key),
+        stage="stage2",
+        function_name="run_stage_for_model",
+        module_name=__name__,
+        phase_name="combo_planning",
+        status="completed",
+        asset_count=len(assets),
+        input_rows=len(requested_intervals) * len(requested_horizons) * len(requested_tasks),
+        output_rows=len(combos),
+        reason_code=("no_assets" if not assets or not combos else ""),
+    )
     progress_line(
         f"Neural Stage 2 {str(model_key)}: run_root={str(run_root)} intervals={','.join(str(int(v)) for v in sorted(set(int(c[0]) for c in combos)))} "
         f"assets={int(len(assets))} combos={int(len(combos))}"
@@ -674,6 +877,21 @@ def run_stage_for_model(model_key: str) -> Path:
                 }
                 run_summary = run_dir / "run_summary.json"
                 write_json_atomic(run_summary, summary)
+                emit_event_for_path(
+                    run_root,
+                    family="Neural_Numeric",
+                    model=str(model_key),
+                    stage="stage2",
+                    function_name="_sequence_history_profile",
+                    module_name=__name__,
+                    phase_name="maturity_planning",
+                    status="skipped",
+                    reason_code="insufficient_history",
+                    interval_minutes=int(interval),
+                    asset_count=len(assets),
+                    output_rows=0,
+                    output_path=str(run_summary),
+                )
                 progress_line(
                     f"Neural Stage 2 {str(model_key)}: window-ineligible interval={int(interval)}m window={int(training_window_months)}m "
                     f"status={str(quality['status'])} train_bars={int(sequence_history['training_window_bars'])} "
@@ -702,6 +920,7 @@ def run_stage_for_model(model_key: str) -> Path:
                         "parquet_root": str(Path(args.parquet_root).resolve()),
                         "feature_root": str(Path(feature_root).resolve()),
                         "model_threads": (max(1, int(args.model_threads)) if args.model_threads is not None else None),
+                        "telemetry_path": str(run_root),
                     }
                     for index, shard in enumerate(combo_shards)
                 ]
@@ -723,6 +942,7 @@ def run_stage_for_model(model_key: str) -> Path:
                             "parquet_root": str(Path(args.parquet_root).resolve()),
                             "feature_root": str(Path(feature_root).resolve()),
                             "model_threads": (max(1, int(args.model_threads)) if args.model_threads is not None else None),
+                            "telemetry_path": str(run_root),
                         }
                     )
                     for shard in combo_shards
@@ -765,6 +985,20 @@ def run_stage_for_model(model_key: str) -> Path:
             }
             run_summary = run_dir / "run_summary.json"
             write_json_atomic(run_summary, summary)
+            emit_event_for_path(
+                run_root,
+                family="Neural_Numeric",
+                model=str(model_key),
+                stage="stage2",
+                function_name="write_json_atomic",
+                module_name=__name__,
+                phase_name="write",
+                status="completed",
+                interval_minutes=int(interval),
+                output_rows=len(accuracy_by_asset),
+                asset_count=len(assets),
+                output_path=str(run_summary),
+            )
             progress_line(
                 f"Neural Stage 2 {str(model_key)}: window-complete interval={int(interval)}m window={int(training_window_months)}m "
                 f"assets_with_metrics={int(len(accuracy_by_asset))} run_summary={str(run_summary)}"
@@ -773,6 +1007,19 @@ def run_stage_for_model(model_key: str) -> Path:
     manifest = {"generated_utc": utc_now_iso(), "model_key": str(model_key), "feature_profile_json": (str(feature_profile_json) if feature_profile_json else None), "feature_profile_cohort_assets": list(assets), "selected_assets": list(assets), "runs": runs}
     manifest_path = run_root / "diagnostic_manifest.json"
     write_json_atomic(manifest_path, manifest)
+    emit_event_for_path(
+        run_root,
+        family="Neural_Numeric",
+        model=str(model_key),
+        stage="stage2",
+        function_name="write_json_atomic",
+        module_name=__name__,
+        phase_name="artifact_handoff",
+        status="completed",
+        output_rows=len(runs),
+        output_path=str(manifest_path),
+        artifact_profile_source=(str(feature_profile_json) if feature_profile_json else ""),
+    )
     if runs:
         analyze_manifest_for_model(str(model_key), manifest_path)
     return run_root

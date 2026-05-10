@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -18,6 +19,7 @@ from src.forecasting.stats.shared.stats_numeric_model_registry import (
     STATS_NUMERIC_FAMILY_ROOT_ENVS,
     STATS_NUMERIC_FAMILY_ROOT_NAMES,
 )
+from src.forecasting.ml.shared.test_branch_function_telemetry import emit_event_for_path
 
 STATS_MANIFEST_FILES = {
     "sarimax": "sarimax_run_manifest.json",
@@ -32,6 +34,15 @@ STATS_SKIPPED_FILES = {
     "egarch": "egarch_skipped.json",
     "quantreg": "quantreg_skipped.json",
 }
+
+STATS_NUMERIC_FAMILY_TAGS = {
+    "sarimax": "sarimax_forecaster",
+    "llt": "llt_state_space",
+    "egarch": "egarch_vol",
+    "quantreg": "linear_quantile_reg",
+}
+
+_TRUE_VALUES = {"1", "true", "yes", "on"}
 
 
 def utc_now_iso() -> str:
@@ -490,13 +501,23 @@ def _clear_stage_locks(branch_root: Path, model_key: str) -> None:
             continue
 
 
-def _stage_manifest_paths(branch_root: Path, model_key: str) -> tuple[Path, Path]:
+def _is_truthy(raw: str) -> bool:
+    return str(raw or "").strip().lower() in _TRUE_VALUES
+
+
+def _stage_manifest_paths(branch_root: Path, model_key: str, env: Optional[Dict[str, str]] = None) -> tuple[Path, Path]:
+    source_env = os.environ if env is None else env
+    if _is_truthy(str(source_env.get("PIPELINE_SANDBOX_MODE", ""))):
+        state_root_raw = str(source_env.get("PIPELINE_SANDBOX_STATE_ROOT", "") or "").strip()
+        if state_root_raw:
+            state_root = Path(state_root_raw).resolve() / "stats_numeric_runner" / STATS_NUMERIC_FAMILY_TAGS[str(model_key)]
+            return state_root / STATS_MANIFEST_FILES[str(model_key)], state_root / STATS_SKIPPED_FILES[str(model_key)]
     state_root = Path(branch_root) / STATS_NUMERIC_FAMILY_ROOT_NAMES[str(model_key)] / "state"
     return state_root / STATS_MANIFEST_FILES[str(model_key)], state_root / STATS_SKIPPED_FILES[str(model_key)]
 
 
-def _validate_stage_artifacts(branch_root: Path, model_key: str) -> Dict[str, Any]:
-    manifest_path, skipped_path = _stage_manifest_paths(branch_root, model_key)
+def _validate_stage_artifacts(branch_root: Path, model_key: str, env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    manifest_path, skipped_path = _stage_manifest_paths(branch_root, model_key, env=env)
     manifest = load_json_dict(manifest_path)
     skipped = load_json_dict(skipped_path)
     parts = list(manifest.get("parts") or []) if isinstance(manifest.get("parts"), list) else []
@@ -537,6 +558,19 @@ def run_stage_for_model(model_key: str, stage_name: str, argv: Optional[Sequence
     entrypoint = STATS_NUMERIC_ENTRYPOINTS[str(model_key)]
     branch_root = output_dir / "parquet" / str(model_key)
     feature_profile = _load_feature_profile(args.feature_profile_json)
+    emit_event_for_path(
+        output_dir,
+        family="Stats_Numeric",
+        model=str(model_key),
+        stage=str(stage_name),
+        function_name="_load_feature_profile",
+        module_name=__name__,
+        phase_name="artifact_handoff",
+        status="completed" if feature_profile else "skipped",
+        reason_code=("" if feature_profile else "profile_missing" if args.feature_profile_json is not None else ""),
+        output_rows=len(feature_profile.get("selections") or {}) if isinstance(feature_profile, dict) else 0,
+        artifact_profile_source=str(Path(args.feature_profile_json).resolve()) if args.feature_profile_json is not None else "",
+    )
     profile_combos = _combos_from_profile(feature_profile)
     effective_combo_list = _combo_list_arg(profile_combos) if bool(args.staged) and profile_combos else str(args.combo_list)
     profile_assets = [str(asset) for asset in list(feature_profile.get("cohort_assets") or []) if str(asset)]
@@ -575,12 +609,43 @@ def run_stage_for_model(model_key: str, stage_name: str, argv: Optional[Sequence
         env[name] = str(max(1, int(args.model_threads)))
     env["STATS_NUMERIC_MODEL_THREADS"] = str(max(1, int(args.model_threads)))
     log_path = output_dir / f"{stage_name}.log"
+    subprocess_started = time.perf_counter()
     with log_path.open("w", encoding="utf-8") as log_file:
         proc = subprocess.run(command, cwd=str(Path(args.project_root)), env=env, stdout=log_file, stderr=subprocess.STDOUT, check=False)
+    subprocess_elapsed = time.perf_counter() - subprocess_started
     artifact_summary = (
-        _validate_stage_artifacts(branch_root, str(model_key))
+        _validate_stage_artifacts(branch_root, str(model_key), env=env)
         if int(proc.returncode) == 0
         else {"artifact_status": "failed", "artifact_failure_reason": "subprocess_failed"}
+    )
+    emit_event_for_path(
+        output_dir,
+        family="Stats_Numeric",
+        model=str(model_key),
+        stage=str(stage_name),
+        function_name="subprocess.run",
+        module_name=entrypoint,
+        phase_name="fit" if str(stage_name) in {"stage1", "stage2"} else "predict",
+        parent_phase="stats_stage_runner",
+        status="completed" if int(proc.returncode) == 0 else "failed",
+        reason_code=("" if int(proc.returncode) == 0 else "exception"),
+        elapsed_seconds=subprocess_elapsed,
+        output_path=str(log_path),
+    )
+    emit_event_for_path(
+        output_dir,
+        family="Stats_Numeric",
+        model=str(model_key),
+        stage=str(stage_name),
+        function_name="_validate_stage_artifacts",
+        module_name=__name__,
+        phase_name="validation",
+        parent_phase="stats_stage_runner",
+        status="completed" if artifact_summary.get("artifact_status") == "passed" else "failed",
+        reason_code=("" if artifact_summary.get("artifact_status") == "passed" else "artifact_missing"),
+        input_rows=int(artifact_summary.get("unit_entries", 0) or 0),
+        output_rows=int(artifact_summary.get("forecast_rows", 0) or 0),
+        output_path=str(artifact_summary.get("manifest_path", "")),
     )
     status = "passed" if int(proc.returncode) == 0 and artifact_summary.get("artifact_status") == "passed" else "failed"
     summary = {
@@ -600,11 +665,46 @@ def run_stage_for_model(model_key: str, stage_name: str, argv: Optional[Sequence
         "finished_at": utc_now_iso(),
     }
     write_json_atomic(output_dir / f"{stage_name}_summary.json", summary)
+    emit_event_for_path(
+        output_dir,
+        family="Stats_Numeric",
+        model=str(model_key),
+        stage=str(stage_name),
+        function_name="write_json_atomic",
+        module_name=__name__,
+        phase_name="write",
+        status="completed",
+        output_path=str(output_dir / f"{stage_name}_summary.json"),
+    )
     if status == "passed":
         manifest = load_json_dict(Path(str(artifact_summary.get("manifest_path", ""))))
         if str(stage_name) == "stage1":
             _write_stage1_profile(output_dir, str(model_key), manifest, args)
+            emit_event_for_path(
+                output_dir,
+                family="Stats_Numeric",
+                model=str(model_key),
+                stage=str(stage_name),
+                function_name="_write_stage1_profile",
+                module_name=__name__,
+                phase_name="artifact_handoff",
+                status="completed",
+                output_path=str(output_dir / "feature_profile_selection.json"),
+            )
         if str(stage_name) == "stage2":
             _write_stage2_handoff(output_dir, str(model_key), manifest, summary, args)
+            emit_event_for_path(
+                output_dir,
+                family="Stats_Numeric",
+                model=str(model_key),
+                stage=str(stage_name),
+                function_name="_write_stage2_handoff",
+                module_name=__name__,
+                phase_name="artifact_handoff",
+                status="completed",
+                input_rows=int(artifact_summary.get("unit_entries", 0) or 0),
+                output_rows=int(artifact_summary.get("forecast_rows", 0) or 0),
+                output_path=str(output_dir / "stage3_survivor_handoff.json"),
+            )
     if int(proc.returncode) != 0 or status != "passed":
         raise SystemExit(int(proc.returncode) if int(proc.returncode) != 0 else 1)

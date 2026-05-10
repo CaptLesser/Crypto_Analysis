@@ -130,54 +130,6 @@ def bayes_stochastic_vol_predict(
     return q, {"log_mean": pred_log, "log_var": pred_var, "persistence": lam, "heavy_tail_df": heavy_tail_df}
 
 
-def bayes_regime_switch_predict(
-    y_hist: Sequence[float],
-    horizon_bars: int,
-    quantiles: Sequence[float],
-    seed: int = 42,
-) -> Tuple[Dict[float, float], Dict[str, Any]]:
-    y = _safe_arr(y_hist)
-    if y.size < 64:
-        raise RuntimeError("insufficient_history")
-
-    dy = np.diff(y)
-    rv = np.abs(dy)
-    thr = float(np.median(rv) + 0.5 * np.std(rv))
-    reg = (rv > thr).astype(int)
-    if reg.size < 8:
-        raise RuntimeError("insufficient_regimes")
-
-    p11 = float(np.mean((reg[:-1] == 1) & (reg[1:] == 1)))
-    p00 = float(np.mean((reg[:-1] == 0) & (reg[1:] == 0)))
-    p11 = min(0.98, max(0.02, p11))
-    p00 = min(0.98, max(0.02, p00))
-
-    low = dy[reg == 0]
-    high = dy[reg == 1]
-    low_mu, low_sd = float(np.mean(low)) if low.size else 0.0, float(np.std(low)) if low.size else 1e-4
-    high_mu, high_sd = float(np.mean(high)) if high.size else 0.0, float(np.std(high)) if high.size else 2e-4
-
-    cur = int(reg[-1])
-    h = max(1, int(horizon_bars))
-    means = []
-    sds = []
-    for _ in range(h):
-        if cur == 1:
-            means.append(high_mu)
-            sds.append(max(1e-6, high_sd))
-            cur = 1 if p11 >= 0.5 else 0
-        else:
-            means.append(low_mu)
-            sds.append(max(1e-6, low_sd))
-            cur = 0 if p00 >= 0.5 else 1
-
-    pred = float(y[-1] + np.sum(means))
-    sigma = float(np.sqrt(np.sum(np.square(sds))))
-    draws = _draw_normal(pred, sigma, n=640, seed=seed)
-    q = monotonic_quantiles(quantiles_from_samples(draws, quantiles), quantiles)
-    return q, {"threshold": thr, "p11": p11, "p00": p00}
-
-
 def _ridge_fit_predict(X: np.ndarray, y: np.ndarray, x_last: np.ndarray, lam: float) -> Tuple[float, np.ndarray]:
     beta = _solve_linear_beta(X, y, ridge=float(lam))
     pred = float(x_last @ beta)
@@ -369,20 +321,6 @@ def _esn_state_with_components(seq: np.ndarray, *, hidden: int, depth: int, W_in
         x = _esn_step(x, float(v), W_in=W_in, W=W, depth=depth, keep=keep)
         states.append(x.copy())
     return np.asarray(states, dtype=float)
-
-
-def _esn_state(seq: np.ndarray, hidden: int, seed: int, input_scale: float = 0.5, recurrent_scale: float = 0.2, depth: int = 1, dropout: float = 0.0) -> np.ndarray:
-    W_in, W, keep = _esn_components(hidden=hidden, seed=seed, input_scale=input_scale, recurrent_scale=recurrent_scale, dropout=dropout)
-    return _esn_state_with_components(seq, hidden=hidden, depth=depth, W_in=W_in, W=W, keep=keep)
-
-
-def _esn_last_state(seq: np.ndarray, hidden: int, seed: int, input_scale: float = 0.5, recurrent_scale: float = 0.2, depth: int = 1, dropout: float = 0.0) -> np.ndarray:
-    W_in, W, keep = _esn_components(hidden=hidden, seed=seed, input_scale=input_scale, recurrent_scale=recurrent_scale, dropout=dropout)
-    hidden = max(8, int(hidden))
-    x = np.zeros((hidden,), dtype=float)
-    for v in seq:
-        x = _esn_step(x, float(v), W_in=W_in, W=W, depth=depth, keep=keep)
-    return x
 
 
 def neural_lstm_surrogate_predict(

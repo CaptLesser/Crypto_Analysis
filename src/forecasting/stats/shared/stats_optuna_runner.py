@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ import pandas as pd
 
 from src.forecasting.common.io_atomic import atomic_replace, sibling_temp_path
 from src.forecasting.common.path_config import resolve_path, selected_profile
+from src.forecasting.ml.shared.test_branch_function_telemetry import emit_event_for_path
 
 try:
     import optuna  # type: ignore
@@ -359,6 +361,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def run_stats_optuna_policy(model_key: str, argv: Optional[Sequence[str]] = None) -> None:
+    started = time.perf_counter()
     raw_args = list(sys.argv[1:] if argv is None else argv)
     if "--model-key" not in raw_args:
         raw_args = ["--model-key", str(model_key), *raw_args]
@@ -370,7 +373,37 @@ def run_stats_optuna_policy(model_key: str, argv: Optional[Sequence[str]] = None
     output_dir.mkdir(parents=True, exist_ok=True)
     combos = resolve_combo_specs(args)
     stage2_metrics = _stage2_survivor_metrics(args)
+    emit_event_for_path(
+        output_dir,
+        family="Stats_Numeric",
+        model=str(model_key),
+        stage="stage3",
+        function_name="resolve_combo_specs",
+        module_name=__name__,
+        phase_name="artifact_handoff",
+        status="completed",
+        output_rows=len(combos),
+        reason_code=("profile_missing" if bool(getattr(args, "staged", False)) and not combos else ""),
+        artifact_profile_source=str(_resolve_stage2_survivor_json(args) or ""),
+    )
+    emit_event_for_path(
+        output_dir,
+        family="Stats_Numeric",
+        model=str(model_key),
+        stage="stage3",
+        function_name="run_stats_optuna_policy",
+        module_name=__name__,
+        phase_name="study_setup",
+        parent_phase="tuning",
+        status="completed",
+        input_rows=len(combos),
+        output_rows=max(1, int(args.trials_per_combo)) * len(combos),
+        trial_count=max(1, int(args.trials_per_combo)) * len(combos),
+        source_path=str(_resolve_stage2_survivor_json(args) or ""),
+        artifact_profile_source=str(_resolve_stage2_survivor_json(args) or ""),
+    )
     artifact_period = int(args.artifact_period_bars) if int(args.artifact_period_bars) > 1 else None
+    trial_started = time.perf_counter()
     rows = _trial_rows(
         model_key=str(model_key),
         combos=combos,
@@ -379,6 +412,38 @@ def run_stats_optuna_policy(model_key: str, argv: Optional[Sequence[str]] = None
         allow_quantile_tuning=bool(args.allow_quantile_tuning),
     )
     combo_rows = _combo_result_rows(rows, stage2_metrics=stage2_metrics)
+    emit_event_for_path(
+        output_dir,
+        family="Stats_Numeric",
+        model=str(model_key),
+        stage="stage3",
+        function_name="_trial_rows",
+        module_name=__name__,
+        phase_name="fit",
+        parent_phase="tuning",
+        status="completed",
+        elapsed_seconds=time.perf_counter() - trial_started,
+        input_rows=len(combos),
+        output_rows=len(rows),
+        trial_count=len(rows),
+        completed_count=len(rows),
+        reason_code=("train_frame_empty" if not rows else ""),
+    )
+    emit_event_for_path(
+        output_dir,
+        family="Stats_Numeric",
+        model=str(model_key),
+        stage="stage3",
+        function_name="_combo_result_rows",
+        module_name=__name__,
+        phase_name="metric_calculation",
+        parent_phase="tuning",
+        status="completed",
+        input_rows=len(rows),
+        output_rows=len(combo_rows),
+        reason_code=("best_trial_missing" if rows and not combo_rows else ""),
+        artifact_profile_source=str(_resolve_stage2_survivor_json(args) or ""),
+    )
     promotion_decision = (
         "promoted_from_stage2_quality_handoff"
         if bool(stage2_metrics) and all(str(row.get("promotion_decision")) == "promoted_from_stage2_quality_handoff" for row in combo_rows)
@@ -462,6 +527,20 @@ def run_stats_optuna_policy(model_key: str, argv: Optional[Sequence[str]] = None
                 for row in combo_rows
             ],
         },
+    )
+    emit_event_for_path(
+        output_dir,
+        family="Stats_Numeric",
+        model=str(model_key),
+        stage="stage3",
+        function_name="run_stats_optuna_policy",
+        module_name=__name__,
+        phase_name="artifact_handoff",
+        status="completed",
+        elapsed_seconds=time.perf_counter() - started,
+        input_rows=len(rows),
+        output_rows=len(combo_rows),
+        output_path=str(output_dir / "stage3_survivor_handoff.json"),
     )
     (output_dir / "summary.md").write_text(
         "\n".join(

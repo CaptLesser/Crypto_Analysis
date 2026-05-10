@@ -17,11 +17,14 @@ from src.forecasting.common.runtime_config import RUNTIME_CONFIG_PATH, load_runt
 from src.forecasting.ml.shared.stage0_profile_common import (
     candidate_key,
     dir_size_bytes,
+    emit_stage0_event,
+    emit_stage0_profile_artifacts,
     measure_branch_run as _shared_measure_branch_run,
     parse_int_csv as _parse_int_csv,
     process_tree_cpu_percent as _process_tree_cpu_percent,
     process_tree_rss_bytes as _process_tree_rss_bytes,
     process_tree_write_bytes as _process_tree_write_bytes,
+    stage0_telemetry_scope,
     timestamp_utc as _timestamp,
     write_candidate_csv as _shared_write_candidate_csv,
 )
@@ -122,7 +125,8 @@ def _run_candidate(*, args: argparse.Namespace, workers: int, threads: int, outp
     _set_candidate_runtime_profile(workers=int(workers), threads=int(threads))
     candidate_root = output_root / _candidate_key(workers, threads)
     candidate_root.mkdir(parents=True, exist_ok=True)
-    assets_csv = str(args.assets)
+    assets = [asset for asset in str(args.assets).split(",") if asset]
+    assets_csv = ",".join(assets)
     branch_results: List[Dict[str, Any]] = []
     candidate_start = time.perf_counter()
     peak_system_ram_pct = 0.0
@@ -149,14 +153,31 @@ def _run_candidate(*, args: argparse.Namespace, workers: int, threads: int, outp
         env = dict(os.environ)
         env["RUN_ID"] = _candidate_key(workers, threads)
         env[str(spec["root_env"])] = str(branch_parquet_root)
-        branch_metrics = _measure_branch_run(
-            command=command,
-            env=env,
-            cwd=Path(args.project_root),
-            log_path=candidate_root / "logs" / f"{spec['model_key']}.log",
-            output_dir=branch_parquet_root,
-            sample_seconds=float(args.sample_seconds),
-        )
+        with stage0_telemetry_scope(
+            candidate_root,
+            family="Tabular_Numeric",
+            model=str(spec["model_key"]),
+            function_name="_measure_branch_run",
+            module_name=__name__,
+            phase_name="profile_candidate_probe",
+            parent_phase="profile_creation",
+            combo_key=f"{int(args.interval)}:{int(args.horizon_minutes)}:{str(args.task)}",
+            interval_minutes=int(args.interval),
+            horizon_minutes=int(args.horizon_minutes),
+            task=str(args.task),
+            asset_count=len(assets),
+            source_path=str(args.parquet_root),
+            output_path=str(branch_parquet_root),
+        ) as telemetry:
+            branch_metrics = _measure_branch_run(
+                command=command,
+                env=env,
+                cwd=Path(args.project_root),
+                log_path=candidate_root / "logs" / f"{spec['model_key']}.log",
+                output_dir=branch_parquet_root,
+                sample_seconds=float(args.sample_seconds),
+            )
+            telemetry.update(output_rows=1)
         branch_metrics["model_key"] = str(spec["model_key"])
         branch_results.append(branch_metrics)
         peak_system_ram_pct = max(peak_system_ram_pct, float(branch_metrics["peak_system_ram_pct"]))
@@ -227,6 +248,24 @@ def run_stage0(args: argparse.Namespace) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     worker_values = _parse_int_csv(args.workers)
     thread_values = _parse_int_csv(args.threads)
+    assets = [asset for asset in str(args.assets).split(",") if asset]
+    emit_stage0_event(
+        output_dir,
+        family="Tabular_Numeric",
+        function_name="run_stage0",
+        module_name=__name__,
+        phase_name="profile_input_discovery",
+        status="completed" if assets else "skipped",
+        reason_code="" if assets else "no_assets",
+        input_rows=len(worker_values) * len(thread_values),
+        asset_count=len(assets),
+        combo_key=f"{int(args.interval)}:{int(args.horizon_minutes)}:{str(args.task)}",
+        interval_minutes=int(args.interval),
+        horizon_minutes=int(args.horizon_minutes),
+        task=str(args.task),
+        source_path=str(args.parquet_root),
+        output_path=str(output_dir),
+    )
     results: List[Dict[str, Any]] = []
 
     for workers in worker_values:
@@ -257,8 +296,20 @@ def run_stage0(args: argparse.Namespace) -> Path:
         },
         "runtime_config_path": str(RUNTIME_CONFIG_PATH),
     }
-    (output_dir / "tabular_numeric_stage0_profile.json").write_text(json.dumps(artifact, indent=2), encoding="utf-8")
-    _write_candidate_csv(output_dir / "tabular_numeric_stage0_candidates.csv", results)
+    profile_path = output_dir / "tabular_numeric_stage0_profile.json"
+    candidates_path = output_dir / "tabular_numeric_stage0_candidates.csv"
+    profile_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+    _write_candidate_csv(candidates_path, results)
+    emit_stage0_profile_artifacts(
+        output_dir,
+        family="Tabular_Numeric",
+        profile_path=profile_path,
+        candidates_path=candidates_path,
+        candidates=results,
+        selected_profile=dict(artifact.get("selected_profile") or {}),
+        asset_count=len(artifact.get("assets") or []),
+        combo_count=1,
+    )
     return output_dir
 
 

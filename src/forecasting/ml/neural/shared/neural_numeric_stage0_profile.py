@@ -17,6 +17,8 @@ from src.forecasting.common.runtime_config import RUNTIME_CONFIG_PATH, load_runt
 from src.forecasting.ml.shared.stage0_profile_common import (
     candidate_key,
     dir_size_bytes,
+    emit_stage0_event,
+    emit_stage0_profile_artifacts,
     measure_branch_run as _shared_measure_branch_run,
     parse_int_csv as _parse_int_csv,
     parse_str_csv as _parse_str_csv,
@@ -24,6 +26,7 @@ from src.forecasting.ml.shared.stage0_profile_common import (
     process_tree_rss_bytes as _process_tree_rss_bytes,
     process_tree_write_bytes as _process_tree_write_bytes,
     resolve_combo_list as _resolve_combo_list,
+    stage0_telemetry_scope,
     timestamp_utc as _timestamp,
     write_candidate_csv as _shared_write_candidate_csv,
 )
@@ -145,14 +148,28 @@ def _run_candidate(*, args: argparse.Namespace, workers: int, threads: int, outp
         env.update(neural_thread_env(int(threads)))
         env[NEURAL_NUMERIC_FAMILY_ROOT_ENVS[model_key]] = str(branch_parquet_root)
         env["RUN_ID"] = _candidate_key(workers, threads)
-        branch_metrics = _measure_branch_run(
-            command=command,
-            env=env,
-            cwd=Path(args.project_root),
-            log_path=candidate_root / "logs" / f"{model_key}.log",
-            output_dir=branch_output_dir,
-            sample_seconds=float(args.sample_seconds),
-        )
+        with stage0_telemetry_scope(
+            candidate_root,
+            family="Neural_Numeric",
+            model=str(model_key),
+            function_name="_measure_branch_run",
+            module_name=__name__,
+            phase_name="profile_candidate_probe",
+            parent_phase="profile_creation",
+            combo_key=combo_list_arg,
+            asset_count=len(resolved_assets),
+            source_path=str(args.parquet_root),
+            output_path=str(branch_output_dir),
+        ) as telemetry:
+            branch_metrics = _measure_branch_run(
+                command=command,
+                env=env,
+                cwd=Path(args.project_root),
+                log_path=candidate_root / "logs" / f"{model_key}.log",
+                output_dir=branch_output_dir,
+                sample_seconds=float(args.sample_seconds),
+            )
+            telemetry.update(output_rows=1)
         branch_metrics["model_key"] = str(model_key)
         branch_results.append(branch_metrics)
         peak_system_ram_pct = max(peak_system_ram_pct, float(branch_metrics["peak_system_ram_pct"]))
@@ -242,6 +259,22 @@ def run_stage0(args: argparse.Namespace) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     worker_values = _parse_int_csv(args.workers)
     thread_values = _parse_int_csv(args.threads)
+    combo_list = _resolve_combo_list(args)
+    explicit_assets = _parse_str_csv(str(args.assets))
+    emit_stage0_event(
+        output_dir,
+        family="Neural_Numeric",
+        function_name="run_stage0",
+        module_name=__name__,
+        phase_name="profile_input_discovery",
+        status="completed" if combo_list else "skipped",
+        reason_code="" if combo_list else "profile_missing",
+        input_rows=len(worker_values) * len(thread_values),
+        asset_count=len(explicit_assets),
+        output_rows=len(combo_list),
+        source_path=str(args.parquet_root),
+        output_path=str(output_dir),
+    )
     results: List[Dict[str, Any]] = []
 
     for workers in worker_values:
@@ -276,8 +309,20 @@ def run_stage0(args: argparse.Namespace) -> Path:
         },
         "runtime_config_path": str(RUNTIME_CONFIG_PATH),
     }
-    (output_dir / "neural_numeric_stage0_profile.json").write_text(json.dumps(artifact, indent=2), encoding="utf-8")
-    _write_candidate_csv(output_dir / "neural_numeric_stage0_candidates.csv", results)
+    profile_path = output_dir / "neural_numeric_stage0_profile.json"
+    candidates_path = output_dir / "neural_numeric_stage0_candidates.csv"
+    profile_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+    _write_candidate_csv(candidates_path, results)
+    emit_stage0_profile_artifacts(
+        output_dir,
+        family="Neural_Numeric",
+        profile_path=profile_path,
+        candidates_path=candidates_path,
+        candidates=results,
+        selected_profile=dict(artifact.get("selected_profile") or {}),
+        asset_count=len(artifact.get("assets") or []),
+        combo_count=int(artifact.get("combo_count") or 0),
+    )
     return output_dir
 
 

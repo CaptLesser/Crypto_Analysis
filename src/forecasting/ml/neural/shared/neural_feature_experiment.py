@@ -13,6 +13,7 @@ from src.forecasting.ml.shared.feature_profile_common import combo_selection_key
 from src.forecasting.ml.shared.stage1_dynamic_feature_selection import select_stage1_dynamic_feature_columns
 from src.forecasting.ml.neural.shared.neural_numeric_cohort import resolve_neural_cohort_assets
 from src.forecasting.ml.neural.shared.neural_numeric_model_registry import NEURAL_NUMERIC_BRANCHES
+from src.forecasting.ml.shared.test_branch_function_telemetry import emit_event_for_path
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,20 @@ def main_for_model(model_key: str) -> Path:
         parquet_root=Path(args.parquet_root),
         intervals=sorted({int(interval) for interval, _, _ in combos}),
     )
+    emit_event_for_path(
+        output_dir,
+        family="Neural_Numeric",
+        model=str(model_key),
+        stage="stage1",
+        function_name="_cohort_assets",
+        module_name=__name__,
+        phase_name="asset_planning",
+        status="completed",
+        asset_count=len(cohort_assets),
+        output_rows=len(cohort_assets),
+        reason_code=("no_assets" if not cohort_assets else ""),
+        source_path=str(args.parquet_root),
+    )
     generated_at = datetime.now(timezone.utc).isoformat()
 
     selections: Dict[str, Dict[str, Any]] = {}
@@ -189,6 +204,11 @@ def main_for_model(model_key: str) -> Path:
                 task=str(task),
                 training_window_months=int(args.train_window_months),
                 requested_feature_names=tuple(str(value) for value in getattr(module.MODULE_SPEC, "dynamic_feature_candidates", ())),
+                telemetry_path=output_dir,
+                family="Neural_Numeric",
+                model=str(model_key),
+                stage="stage1",
+                combo_key=combo_selection_key(int(interval_minutes), int(horizon_minutes), str(task)),
             )
             if selected_dynamic_feature_columns:
                 selected_features = list(selected_dynamic_feature_columns)
@@ -230,6 +250,19 @@ def main_for_model(model_key: str) -> Path:
         "selections": selections,
     }
     (output_dir / "feature_profile_selection.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    emit_event_for_path(
+        output_dir,
+        family="Neural_Numeric",
+        model=str(model_key),
+        stage="stage1",
+        function_name="write_feature_profile_selection",
+        module_name=__name__,
+        phase_name="artifact_handoff",
+        status="completed",
+        asset_count=len(cohort_assets),
+        output_rows=len(selections),
+        output_path=str(output_dir / "feature_profile_selection.json"),
+    )
 
     summary_csv_rows = [
         {
@@ -279,6 +312,18 @@ def main_for_model(model_key: str) -> Path:
         "generated_at": generated_at,
     }
     (output_dir / "feature_experiment_run_meta.json").write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
+    emit_event_for_path(
+        output_dir,
+        family="Neural_Numeric",
+        model=str(model_key),
+        stage="stage1",
+        function_name="write_feature_experiment_artifacts",
+        module_name=__name__,
+        phase_name="write",
+        status="completed",
+        output_rows=len(summary_rows),
+        output_path=str(output_dir),
+    )
     return output_dir
 
 

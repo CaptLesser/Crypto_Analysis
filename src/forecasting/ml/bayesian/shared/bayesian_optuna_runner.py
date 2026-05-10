@@ -4,6 +4,7 @@ import argparse
 import importlib
 import json
 import math
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +21,11 @@ from src.forecasting.common.stats_module_utils import NUMERIC_TASK_TO_TARGET_COL
 from src.forecasting.ml.bayesian.shared.bayesian_stage1_profile import resolve_execution_profile
 from src.forecasting.ml.bayesian.shared.bayesian_numeric_cohort import FIXED_BAYESIAN_NUMERIC_COHORT
 from src.forecasting.ml.shared.numeric_forecast_targets import compute_future_labels
+from src.forecasting.ml.shared.test_branch_function_telemetry import (
+    emit_event_for_path,
+    emit_stage3_study_summary_for_path,
+    telemetry_scope_for_path,
+)
 
 
 @dataclass(frozen=True)
@@ -280,99 +286,130 @@ def _build_factor_maps(frames: Dict[str, pd.DataFrame], combo: ComboSpec) -> Dic
     return factor_maps
 
 
-def build_datasets(combo: ComboSpec, assets: Sequence[str], args: argparse.Namespace) -> List[Dataset]:
-    edges = []
-    for asset in assets:
-        edge_ts, _min_ts = discover_edge_and_min(asset=str(asset), interval_minutes=int(combo.interval))
-        if edge_ts is not None:
-            edges.append(int(edge_ts))
-    if not edges:
-        raise RuntimeError(f"No edge timestamps available for combo={combo.tuple_label}")
-    common_edge = min(edges)
-    history_start_ts, eval_end_ts = _evaluate_window(common_edge, int(args.recent_eval_days), int(args.history_window_months))
-    eval_start_ts = int(common_edge) - int(args.recent_eval_days) * 86400
-    feature_profile_json = _resolve_stage1_feature_profile_json(args)
-    combo_profile = (
-        resolve_execution_profile(
-            feature_profile_json,
-            interval=int(combo.interval),
-            horizon=int(combo.horizon_minutes),
-            task=str(combo.task),
-            dynamic_feature_candidates=CURRENT_NUMERICS.MODULE_SPEC.dynamic_feature_candidates,
-            needs_dynamic_features=bool(CURRENT_NUMERICS.MODULE_SPEC.needs_dynamic_features),
-            use_seasonality=bool(CURRENT_NUMERICS.MODULE_SPEC.use_seasonality),
+def build_datasets(combo: ComboSpec, assets: Sequence[str], args: argparse.Namespace, telemetry_path: Optional[Path] = None) -> List[Dataset]:
+    with telemetry_scope_for_path(
+        telemetry_path,
+        family="Bayesian_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        stage="stage3",
+        function_name="build_datasets",
+        module_name=__name__,
+        phase_name="dataset_construction",
+        parent_phase="objective_setup",
+        combo_key=combo.tuple_label,
+        interval_minutes=int(combo.interval),
+        horizon_minutes=int(combo.horizon_minutes),
+        task=str(combo.task),
+        input_rows=len(assets),
+        asset_count=len(assets),
+    ) as scope:
+        edges = []
+        for asset in assets:
+            edge_ts, _min_ts = discover_edge_and_min(asset=str(asset), interval_minutes=int(combo.interval))
+            if edge_ts is not None:
+                edges.append(int(edge_ts))
+        if not edges:
+            scope.update(reason_code="objective_dataset_empty", output_rows=0)
+            raise RuntimeError(f"No edge timestamps available for combo={combo.tuple_label}")
+        common_edge = min(edges)
+        history_start_ts, eval_end_ts = _evaluate_window(common_edge, int(args.recent_eval_days), int(args.history_window_months))
+        eval_start_ts = int(common_edge) - int(args.recent_eval_days) * 86400
+        feature_profile_json = _resolve_stage1_feature_profile_json(args)
+        combo_profile = (
+            resolve_execution_profile(
+                feature_profile_json,
+                interval=int(combo.interval),
+                horizon=int(combo.horizon_minutes),
+                task=str(combo.task),
+                dynamic_feature_candidates=CURRENT_NUMERICS.MODULE_SPEC.dynamic_feature_candidates,
+                needs_dynamic_features=bool(CURRENT_NUMERICS.MODULE_SPEC.needs_dynamic_features),
+                use_seasonality=bool(CURRENT_NUMERICS.MODULE_SPEC.use_seasonality),
+            )
+            if feature_profile_json is not None
+            else None
         )
-        if feature_profile_json is not None
-        else None
-    )
-    frames: Dict[str, pd.DataFrame] = {}
-    for asset in assets:
-        frame = _load_asset_frame(
-            str(asset),
-            combo,
-            int(history_start_ts),
-            int(eval_end_ts),
-            selected_dynamic_feature_columns=(
-                tuple(str(value) for value in combo_profile.selected_dynamic_feature_columns)
-                if combo_profile is not None and combo_profile.use_dynamic_features
-                else ()
-            ) if combo_profile is not None else None,
-        )
-        if frame.empty:
-            continue
-        labels = _label_frame(frame, combo)
-        label_col = NUMERIC_TASK_TO_TARGET_COLUMN[str(combo.task)]
-        if label_col in frame.columns and label_col in labels.columns:
-            frame = frame.drop(columns=[label_col])
-        merged = pd.concat([frame.reset_index(drop=True), labels.reset_index(drop=True)], axis=1)
-        if merged.columns.has_duplicates:
-            merged = merged.loc[:, ~merged.columns.duplicated(keep="last")].copy()
-        frames[str(asset)] = merged
-    factor_maps = _build_factor_maps(frames, combo)
-    datasets: List[Dataset] = []
-    label_col = NUMERIC_TASK_TO_TARGET_COLUMN[str(combo.task)]
-    for asset, frame in frames.items():
-        label_values = frame[label_col]
-        if isinstance(label_values, pd.DataFrame):
-            label_values = label_values.iloc[:, -1]
-        valid = frame[np.isfinite(pd.to_numeric(label_values, errors="coerce"))].copy()
-        origins = _sample_origins(
-            valid["ts"].astype("int64").tolist(),
-            eval_start_ts=int(eval_start_ts),
-            eval_end_ts=int(eval_end_ts - int(combo.horizon_minutes) * 60),
-            max_eval_origins=int(args.max_eval_origins),
-        )
-        if not origins:
-            continue
-        datasets.append(
-            Dataset(
-                asset=str(asset),
-                combo=combo,
-                frame=frame,
-                target_col=str(label_col),
-                history_start_ts=int(history_start_ts),
-                eval_start_ts=int(eval_start_ts),
-                eval_end_ts=int(eval_end_ts),
-                origins=origins,
-                factor_map=factor_maps.get(str(asset), {}),
+        frames: Dict[str, pd.DataFrame] = {}
+        for asset in assets:
+            frame = _load_asset_frame(
+                str(asset),
+                combo,
+                int(history_start_ts),
+                int(eval_end_ts),
                 selected_dynamic_feature_columns=(
                     tuple(str(value) for value in combo_profile.selected_dynamic_feature_columns)
-                    if combo_profile is not None
-                    else tuple(str(value) for value in CURRENT_NUMERICS.MODULE_SPEC.dynamic_feature_candidates)
-                ),
-                use_dynamic_features=(
-                    bool(combo_profile.use_dynamic_features)
-                    if combo_profile is not None
-                    else bool(CURRENT_NUMERICS.MODULE_SPEC.needs_dynamic_features)
-                ),
-                use_seasonality=(
-                    bool(combo_profile.use_seasonality)
-                    if combo_profile is not None
-                    else bool(CURRENT_NUMERICS.MODULE_SPEC.use_seasonality)
-                ),
+                    if combo_profile is not None and combo_profile.use_dynamic_features
+                    else ()
+                ) if combo_profile is not None else None,
             )
+            if frame.empty:
+                continue
+            labels = _label_frame(frame, combo)
+            label_col = NUMERIC_TASK_TO_TARGET_COLUMN[str(combo.task)]
+            if label_col in frame.columns and label_col in labels.columns:
+                frame = frame.drop(columns=[label_col])
+            merged = pd.concat([frame.reset_index(drop=True), labels.reset_index(drop=True)], axis=1)
+            if merged.columns.has_duplicates:
+                merged = merged.loc[:, ~merged.columns.duplicated(keep="last")].copy()
+            frames[str(asset)] = merged
+        factor_maps = _build_factor_maps(frames, combo)
+        datasets: List[Dataset] = []
+        label_col = NUMERIC_TASK_TO_TARGET_COLUMN[str(combo.task)]
+        for asset, frame in frames.items():
+            label_values = frame[label_col]
+            if isinstance(label_values, pd.DataFrame):
+                label_values = label_values.iloc[:, -1]
+            valid = frame[np.isfinite(pd.to_numeric(label_values, errors="coerce"))].copy()
+            origins = _sample_origins(
+                valid["ts"].astype("int64").tolist(),
+                eval_start_ts=int(eval_start_ts),
+                eval_end_ts=int(eval_end_ts - int(combo.horizon_minutes) * 60),
+                max_eval_origins=int(args.max_eval_origins),
+            )
+            if not origins:
+                continue
+            datasets.append(
+                Dataset(
+                    asset=str(asset),
+                    combo=combo,
+                    frame=frame,
+                    target_col=str(label_col),
+                    history_start_ts=int(history_start_ts),
+                    eval_start_ts=int(eval_start_ts),
+                    eval_end_ts=int(eval_end_ts),
+                    origins=origins,
+                    factor_map=factor_maps.get(str(asset), {}),
+                    selected_dynamic_feature_columns=(
+                        tuple(str(value) for value in combo_profile.selected_dynamic_feature_columns)
+                        if combo_profile is not None
+                        else tuple(str(value) for value in CURRENT_NUMERICS.MODULE_SPEC.dynamic_feature_candidates)
+                    ),
+                    use_dynamic_features=(
+                        bool(combo_profile.use_dynamic_features)
+                        if combo_profile is not None
+                        else bool(CURRENT_NUMERICS.MODULE_SPEC.needs_dynamic_features)
+                    ),
+                    use_seasonality=(
+                        bool(combo_profile.use_seasonality)
+                        if combo_profile is not None
+                        else bool(CURRENT_NUMERICS.MODULE_SPEC.use_seasonality)
+                    ),
+                )
+            )
+        scope.update(
+            output_rows=sum(len(dataset.frame) for dataset in datasets),
+            reason_code="" if datasets else "objective_dataset_empty",
+            artifact_profile_source=str(feature_profile_json or ""),
         )
-    return datasets
+        return datasets
+
+
+def _build_datasets_with_telemetry(combo: ComboSpec, assets: Sequence[str], args: argparse.Namespace, telemetry_path: Optional[Path]) -> List[Dataset]:
+    try:
+        return build_datasets(combo, assets, args, telemetry_path=telemetry_path)
+    except TypeError as exc:
+        if "telemetry_path" not in str(exc):
+            raise
+        return build_datasets(combo, assets, args)
 
 
 def evaluate_dataset(dataset: Dataset, params: Dict[str, Any], params_label: str) -> MetricResult:
@@ -470,11 +507,46 @@ def finalize_model_params(params: Dict[str, Any], combo: ComboSpec) -> Dict[str,
     return dict(params)
 
 
-def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials_per_combo: int, sampler_seed: int, storage: Optional[str], study_name_prefix: str, resume_study: bool, model_threads: int) -> Tuple[Dict[str, Any], List[MetricResult], List[MetricResult], List[Dict[str, Any]]]:
+def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials_per_combo: int, sampler_seed: int, storage: Optional[str], study_name_prefix: str, resume_study: bool, model_threads: int, telemetry_path: Optional[Path] = None) -> Tuple[Dict[str, Any], List[MetricResult], List[MetricResult], List[Dict[str, Any]]]:
     baseline_params = finalize_model_params(baseline_params_with_threads(combo, model_threads), combo)
-    baseline_metrics = [evaluate_dataset(dataset, baseline_params, "baseline") for dataset in datasets]
+    with telemetry_scope_for_path(
+        telemetry_path,
+        family="Bayesian_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        stage="stage3",
+        function_name="evaluate_dataset",
+        module_name=__name__,
+        phase_name="fit",
+        parent_phase="baseline_evaluation",
+        combo_key=combo.tuple_label,
+        interval_minutes=int(combo.interval),
+        horizon_minutes=int(combo.horizon_minutes),
+        task=str(combo.task),
+        input_rows=sum(len(dataset.frame) for dataset in datasets),
+        asset_count=len(datasets),
+    ) as baseline_scope:
+        baseline_metrics = [evaluate_dataset(dataset, baseline_params, "baseline") for dataset in datasets]
+        baseline_scope.update(output_rows=sum(int(metric.rows) for metric in baseline_metrics))
     baseline_summary = summarize_metrics(baseline_metrics)
     if int(baseline_summary.get("rows", 0) or 0) <= 0:
+        emit_event_for_path(
+            telemetry_path,
+            family="Bayesian_Numeric",
+            model=str(CURRENT_MODEL_SPEC.model_key),
+            stage="stage3",
+            function_name="run_study_for_combo",
+            module_name=__name__,
+            phase_name="metric_calculation",
+            parent_phase="baseline_evaluation",
+            status="skipped",
+            reason_code="objective_dataset_empty",
+            combo_key=combo.tuple_label,
+            interval_minutes=int(combo.interval),
+            horizon_minutes=int(combo.horizon_minutes),
+            task=str(combo.task),
+            input_rows=len(datasets),
+            output_rows=0,
+        )
         combo_row = {
             "combo": combo.tuple_label,
             "interval": int(combo.interval),
@@ -541,19 +613,54 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         )
         return objective_value
     storage_url = (str(storage).strip() if storage is not None else "")
-    study = optuna.create_study(
-        direction="minimize",
-        sampler=optuna.samplers.TPESampler(seed=int(sampler_seed)),
-        pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=int(pruner_startup_trials),
-            n_warmup_steps=int(pruner_warmup_steps),
-        ),
-        study_name=f"{study_name_prefix}_{combo.interval}_{combo.horizon_minutes}_{combo.task}",
-        storage=(storage_url or None),
-        load_if_exists=bool(resume_study or storage_url),
-    )
+    with telemetry_scope_for_path(
+        telemetry_path,
+        family="Bayesian_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        stage="stage3",
+        function_name="optuna.create_study",
+        module_name=__name__,
+        phase_name="study_setup",
+        parent_phase="tuning",
+        combo_key=combo.tuple_label,
+        interval_minutes=int(combo.interval),
+        horizon_minutes=int(combo.horizon_minutes),
+        task=str(combo.task),
+        source_path=str(storage_url or ""),
+    ) as study_scope:
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=int(sampler_seed)),
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=int(pruner_startup_trials),
+                n_warmup_steps=int(pruner_warmup_steps),
+            ),
+            study_name=f"{study_name_prefix}_{combo.interval}_{combo.horizon_minutes}_{combo.task}",
+            storage=(storage_url or None),
+            load_if_exists=bool(resume_study or storage_url),
+        )
+        study_scope.update(output_rows=len(study.trials))
+    study_started = time.perf_counter()
     if int(trials_per_combo) > 0:
-        study.optimize(objective, n_trials=int(trials_per_combo), show_progress_bar=False)
+        with telemetry_scope_for_path(
+            telemetry_path,
+            family="Bayesian_Numeric",
+            model=str(CURRENT_MODEL_SPEC.model_key),
+            stage="stage3",
+            function_name="study.optimize",
+            module_name=__name__,
+            phase_name="fit",
+            parent_phase="tuning",
+            combo_key=combo.tuple_label,
+            interval_minutes=int(combo.interval),
+            horizon_minutes=int(combo.horizon_minutes),
+            task=str(combo.task),
+            input_rows=int(trials_per_combo),
+            asset_count=len(datasets),
+        ) as optimize_scope:
+            study.optimize(objective, n_trials=int(trials_per_combo), show_progress_bar=False)
+            optimize_scope.update(output_rows=len(trial_rows))
+    study_elapsed_s = time.perf_counter() - study_started
     best_params = dict(baseline_params)
     complete_trials = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
     if complete_trials:
@@ -563,8 +670,65 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         )
         best_params.update(dict(best_trial.params))
     best_params = finalize_model_params(best_params, combo)
-    tuned_metrics = [evaluate_dataset(dataset, best_params, "tuned") for dataset in datasets]
+    with telemetry_scope_for_path(
+        telemetry_path,
+        family="Bayesian_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        stage="stage3",
+        function_name="evaluate_dataset",
+        module_name=__name__,
+        phase_name="predict",
+        parent_phase="best_trial_evaluation",
+        combo_key=combo.tuple_label,
+        interval_minutes=int(combo.interval),
+        horizon_minutes=int(combo.horizon_minutes),
+        task=str(combo.task),
+        input_rows=sum(len(dataset.frame) for dataset in datasets),
+        asset_count=len(datasets),
+    ) as tuned_scope:
+        tuned_metrics = [evaluate_dataset(dataset, best_params, "tuned") for dataset in datasets]
+        tuned_scope.update(output_rows=sum(int(metric.rows) for metric in tuned_metrics))
     tuned_summary = summarize_metrics(tuned_metrics)
+    emit_event_for_path(
+        telemetry_path,
+        family="Bayesian_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        stage="stage3",
+        function_name="summarize_metrics",
+        module_name=__name__,
+        phase_name="metric_calculation",
+        parent_phase="best_trial_evaluation",
+        status="completed" if int(tuned_summary.get("rows", 0) or 0) > 0 else "skipped",
+        reason_code="" if int(tuned_summary.get("rows", 0) or 0) > 0 else "predict_returned_empty",
+        combo_key=combo.tuple_label,
+        interval_minutes=int(combo.interval),
+        horizon_minutes=int(combo.horizon_minutes),
+        task=str(combo.task),
+        input_rows=len(tuned_metrics),
+        output_rows=int(tuned_summary.get("rows", 0) or 0),
+    )
+    emit_stage3_study_summary_for_path(
+        telemetry_path,
+        family="Bayesian_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        function_name="run_study_for_combo",
+        module_name=__name__,
+        combo_key=combo.tuple_label,
+        interval_minutes=int(combo.interval),
+        horizon_minutes=int(combo.horizon_minutes),
+        task=str(combo.task),
+        elapsed_seconds=float(study_elapsed_s),
+        trial_rows=trial_rows,
+        study_trials=list(study.trials),
+        best_value=(
+            min(float(trial.value) for trial in complete_trials if trial.value is not None)
+            if complete_trials
+            else None
+        ),
+        input_rows=int(trials_per_combo),
+        output_rows=sum(int(metric.rows) for metric in tuned_metrics),
+        source_path=str(storage_url or ""),
+    )
     combo_row = {
         "combo": combo.tuple_label,
         "interval": int(combo.interval),
@@ -599,6 +763,20 @@ def write_outputs(output_dir: Path, sample_rows: Sequence[Dict[str, Any]], combo
     pd.DataFrame([asdict(metric) for metric in metric_rows]).to_csv(output_dir / "unit_metrics.csv", index=False)
     pd.DataFrame(list(trial_rows)).to_json(output_dir / "optuna_trials.json", orient="records", indent=2)
     pd.DataFrame(list(combo_rows)).to_csv(output_dir / "runtime_summary.csv", index=False)
+    emit_event_for_path(
+        output_dir,
+        family="Bayesian_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        stage="stage3",
+        function_name="write_outputs",
+        module_name=__name__,
+        phase_name="artifact_handoff",
+        status="completed",
+        input_rows=len(metric_rows),
+        output_rows=len(combo_rows),
+        output_path=str(output_dir),
+        reason_code=("predict_returned_empty" if not metric_rows else ""),
+    )
     lines = [f"# {CURRENT_MODEL_SPEC.display_name} Bayesian Stage 3", "", "Objective: minimize validation RMSE on a recent evaluation slice.", ""]
     for row in combo_rows:
         if str(row.get("status", "")).strip() == "ineligible":
@@ -617,12 +795,25 @@ def main_for_model(model_spec: BayesianOptunaModelSpec) -> None:
     combos = resolve_combo_specs(args)
     assets = requested_assets(args.assets, args)
     output_dir = _output_dir(args)
+    emit_event_for_path(
+        output_dir,
+        family="Bayesian_Numeric",
+        model=str(model_spec.model_key),
+        stage="stage3",
+        function_name="main_for_model",
+        module_name=__name__,
+        phase_name="combo_planning",
+        status="completed",
+        asset_count=len(assets),
+        output_rows=len(combos),
+        artifact_profile_source=str(_resolve_stage2_survivor_json(args) or _resolve_stage1_feature_profile_json(args) or ""),
+    )
     sample_rows: List[Dict[str, Any]] = []
     combo_rows: List[Dict[str, Any]] = []
     metric_rows: List[MetricResult] = []
     trial_rows: List[Dict[str, Any]] = []
     for combo in combos:
-        datasets = build_datasets(combo, assets, args)
+        datasets = _build_datasets_with_telemetry(combo, assets, args, output_dir)
         if not datasets:
             combo_rows.append(
                 {
@@ -641,7 +832,7 @@ def main_for_model(model_spec: BayesianOptunaModelSpec) -> None:
             continue
         for dataset in datasets:
             sample_rows.append({"combo": combo.tuple_label, "asset": dataset.asset, "eval_start_ts": int(dataset.eval_start_ts), "eval_end_ts": int(dataset.eval_end_ts), "rows": int(len(dataset.frame)), "origin_count": int(len(dataset.origins))})
-        combo_row, baseline_metrics, tuned_metrics, combo_trials = run_study_for_combo(combo, datasets, trials_per_combo=int(args.trials_per_combo), sampler_seed=int(args.sampler_seed), storage=(str(args.storage).strip() or None), study_name_prefix=str(args.study_name_prefix), resume_study=bool(args.resume_study), model_threads=int(args.model_threads))
+        combo_row, baseline_metrics, tuned_metrics, combo_trials = run_study_for_combo(combo, datasets, trials_per_combo=int(args.trials_per_combo), sampler_seed=int(args.sampler_seed), storage=(str(args.storage).strip() or None), study_name_prefix=str(args.study_name_prefix), resume_study=bool(args.resume_study), model_threads=int(args.model_threads), telemetry_path=output_dir)
         combo_rows.append(combo_row)
         metric_rows.extend(list(baseline_metrics))
         metric_rows.extend(list(tuned_metrics))

@@ -19,6 +19,10 @@ from src.forecasting.common.sandbox_paths import (
     sandbox_env_for_subprocess,
 )
 from src.forecasting.ml.shared.numeric_runner_diagnostics import summarize_diagnostics
+from src.forecasting.ml.shared.test_branch_function_telemetry import (
+    FUNCTION_EVENTS_JSONL,
+    write_rollups as write_function_telemetry_rollups,
+)
 
 
 def utc_now_iso() -> str:
@@ -305,6 +309,126 @@ def _sandbox_roots_from_child_env(env: Dict[str, str]) -> SandboxOutputRoots:
 
 def collect_stage3_outputs(paths: Any, required_stage3_files: Sequence[str]) -> Dict[str, str]:
     return {name: str((paths.stage3_dir / name).resolve()) for name in required_stage3_files if (paths.stage3_dir / name).exists()}
+
+
+def canonical_profile_model_dir(args: Any, *, diagnostics_root_name: str, model_key: str) -> Path:
+    roots = resolve_sandbox_output_roots(args)
+    if roots.enabled:
+        root = roots.diagnostics_root
+    else:
+        project_root = Path(getattr(args, "project_root", Path.cwd())).resolve()
+        root = project_root / "logs" / "diagnostics"
+    return (root / str(diagnostics_root_name) / str(model_key)).resolve()
+
+
+def _copy_file_atomic(source: Path, destination: Path) -> None:
+    assert_write_allowed(destination, "canonical test branch profile")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp = sibling_temp_path(destination)
+    assert_write_allowed(tmp, "canonical test branch profile temp")
+    shutil.copy2(source, tmp)
+    atomic_replace(tmp, destination)
+
+
+def publish_canonical_model_profile(
+    args: Any,
+    *,
+    diagnostics_root_name: str,
+    model_key: str,
+    paths: Any,
+    required_stage3_files: Sequence[str],
+    stage2_survivor_json: Optional[Path],
+    run_root: Path,
+    family: str,
+) -> Dict[str, Any]:
+    if not stage1_complete(paths) or not stage3_complete(paths, required_stage3_files):
+        return {}
+    survivor_source = Path(stage2_survivor_json).resolve() if stage2_survivor_json is not None else None
+    if survivor_source is None or not survivor_source.exists():
+        return {}
+
+    model_root = canonical_profile_model_dir(args, diagnostics_root_name=diagnostics_root_name, model_key=model_key)
+    stage1_root = model_root / "stage1"
+    stage2_root = model_root / "stage2"
+    stage3_root = model_root / "stage3"
+
+    source_feature_profile = stage1_selection_path(paths).resolve()
+    canonical_feature_profile = stage1_root / "feature_profile_selection.json"
+    _copy_file_atomic(source_feature_profile, canonical_feature_profile)
+    if stage1_meta_path(paths).exists():
+        _copy_file_atomic(stage1_meta_path(paths).resolve(), stage1_root / "feature_experiment_run_meta.json")
+
+    survivor_payload = load_json_dict(survivor_source)
+    survivor_payload["feature_profile_json"] = str(canonical_feature_profile.resolve())
+    survivor_payload["source_handoff_json"] = str(survivor_source)
+    survivor_payload["source_run_root"] = str(Path(run_root).resolve())
+    write_json_atomic(stage2_root / "stage3_survivor_handoff.json", survivor_payload)
+
+    stage3_artifacts: Dict[str, str] = {}
+    for name in required_stage3_files:
+        source = (paths.stage3_dir / str(name)).resolve()
+        if source.exists():
+            destination = stage3_root / str(name)
+            _copy_file_atomic(source, destination)
+            stage3_artifacts[str(name)] = str(destination.resolve())
+
+    manifest = {
+        "generated_utc": utc_now_iso(),
+        "family": str(family),
+        "model_key": str(model_key),
+        "source_run_root": str(Path(run_root).resolve()),
+        "canonical_root": str(model_root),
+        "stage1": {
+            "feature_profile_json": str(canonical_feature_profile.resolve()),
+            "source_feature_profile_json": str(source_feature_profile),
+        },
+        "stage2": {
+            "stage3_survivor_handoff_json": str((stage2_root / "stage3_survivor_handoff.json").resolve()),
+            "source_stage3_survivor_handoff_json": str(survivor_source),
+        },
+        "stage3": {
+            "output_dir": str(stage3_root.resolve()),
+            "artifacts": stage3_artifacts,
+        },
+    }
+    write_json_atomic(model_root / "current_profile_manifest.json", manifest)
+    return manifest
+
+
+def publish_canonical_family_profiles(
+    args: Any,
+    *,
+    run_root: Path,
+    diagnostics_root_name: str,
+    model_order: Sequence[str],
+    model_paths_fn: Callable[[Path, str], Any],
+    required_stage3_files: Sequence[str],
+    family: str,
+) -> Dict[str, Any]:
+    published: Dict[str, Any] = {}
+    for model_key in model_order:
+        paths = model_paths_fn(Path(run_root), str(model_key))
+        stage2_root = getattr(paths, "stage2_root", getattr(paths, "stage2_dir", None))
+        if stage2_root is None:
+            continue
+        stage2_path = Path(stage2_root)
+        manifest = discover_latest_stage2_manifest(stage2_path)
+        if manifest is None and (stage2_path / "diagnostic_manifest.json").exists():
+            manifest = (stage2_path / "diagnostic_manifest.json").resolve()
+        survivor = stage2_survivor_json_from_manifest(manifest)
+        model_manifest = publish_canonical_model_profile(
+            args,
+            diagnostics_root_name=diagnostics_root_name,
+            model_key=str(model_key),
+            paths=paths,
+            required_stage3_files=required_stage3_files,
+            stage2_survivor_json=survivor,
+            run_root=Path(run_root),
+            family=str(family),
+        )
+        if model_manifest:
+            published[str(model_key)] = model_manifest
+    return published
 
 
 HEALTH_REPORT_FILE = "test_branch_health.json"
@@ -842,5 +966,16 @@ def collect_test_branch_health(*, run_root: Path, family: str, stage0_status: Di
 
 def write_test_branch_health(run_root: Path, *, family: str, stage0_status: Dict[str, Any], models: Dict[str, Any]) -> Dict[str, Any]:
     health = collect_test_branch_health(run_root=Path(run_root), family=str(family), stage0_status=stage0_status, models=models)
+    try:
+        telemetry_rollups = write_function_telemetry_rollups(Path(run_root))
+    except Exception as exc:
+        telemetry_rollups = {
+            "event_count": 0,
+            "warning": f"{type(exc).__name__}: {str(exc)[:240]}",
+        }
+    health["function_telemetry"] = {
+        "events_jsonl": str((Path(run_root) / FUNCTION_EVENTS_JSONL).resolve()),
+        **telemetry_rollups,
+    }
     write_json_atomic(Path(run_root) / HEALTH_REPORT_FILE, health)
     return health

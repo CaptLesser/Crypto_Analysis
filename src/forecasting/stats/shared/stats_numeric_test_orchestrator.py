@@ -31,10 +31,12 @@ from src.forecasting.ml.shared.test_orchestrator_common import (
     add_sandbox_output_args,
     assert_test_branch_sandbox_launch,
     finalize_sandbox_output_args,
+    publish_canonical_family_profiles,
     test_branch_child_env,
     test_branch_stage_tmp_root,
     write_test_branch_health,
 )
+from src.forecasting.ml.shared.test_branch_function_telemetry import emit_event, emit_subprocess_event
 from src.forecasting.stats.shared.stats_numeric_model_registry import (
     STATS_NUMERIC_BRANCHES,
     STATS_STAGE0_ENTRYPOINT,
@@ -531,8 +533,25 @@ def run_logged_subprocess(command: Sequence[str], *, cwd: Path, env: Dict[str, s
     if int(returncode) != 0:
         error = f"Command failed with exit code {returncode}: {' '.join(str(part) for part in command)}"
         write_process_meta(meta_path, status="failed", command=command, cwd=cwd, env=env, log_path=log_path, pid=int(proc.pid), started_utc=started_utc, finished_utc=utc_now_iso(), returncode=returncode, error=error)
-        raise RuntimeError(error)
+        exc = RuntimeError(error)
+        emit_subprocess_event(
+            log_path=log_path,
+            command=command,
+            status="failed",
+            family="Stats_Frequentist",
+            elapsed_seconds=time.perf_counter() - started,
+            reason_code="exception",
+            exception=exc,
+        )
+        raise exc
     write_process_meta(meta_path, status="completed", command=command, cwd=cwd, env=env, log_path=log_path, pid=int(proc.pid), started_utc=started_utc, finished_utc=utc_now_iso(), returncode=returncode)
+    emit_subprocess_event(
+        log_path=log_path,
+        command=command,
+        status="completed",
+        family="Stats_Frequentist",
+        elapsed_seconds=time.perf_counter() - started,
+    )
 
 
 def run_with_retries(
@@ -625,6 +644,7 @@ def _run_stage0(args: argparse.Namespace, run_root: Path, env: Dict[str, str]) -
     )
     if not stage0_complete(run_root):
         raise RuntimeError("Stage 0 did not leave complete profile artifacts for stats family")
+    emit_event(run_root, run_id=run_root.name, family="Stats_Frequentist", model="family", stage="stage0", function_name="_run_stage0", module_name=STATS_STAGE0_ENTRYPOINT, phase_name="artifact_handoff", status="completed", output_path=str(stage0_profile_path(run_root)), artifact_profile_source=str(stage0_profile_path(run_root)))
 
 
 def _stage_command(
@@ -734,11 +754,13 @@ def _run_model_stage(args: argparse.Namespace, run_root: Path, model_key: str, s
     )
     complete_fn = {"stage1": stage1_complete, "stage2": stage2_complete, "stage3": stage3_complete}[str(stage_name)]
     if not complete_fn(model_paths(run_root, model_key)):
+        emit_event(run_root, run_id=run_root.name, family="Stats_Frequentist", model=model_key, stage=stage_name, function_name="_run_model_stage", module_name=module, phase_name="artifact_handoff", status="failed", reason_code="stage_artifact_missing", output_path=str(actual_output_dir))
         raise RuntimeError(f"{MODEL_SPECS[model_key].display_name} {stage_name.title()} did not produce complete stage artifacts")
+    emit_event(run_root, run_id=run_root.name, family="Stats_Frequentist", model=model_key, stage=stage_name, function_name="_run_model_stage", module_name=module, phase_name="artifact_handoff", status="completed", output_path=str(actual_output_dir))
     progress_line(f"{MODEL_SPECS[model_key].display_name} {stage_name.title()}: success")
 
 
-def write_state(run_root: Path) -> None:
+def write_state(run_root: Path, args: argparse.Namespace | None = None) -> None:
     stage0_status = {
         "complete": stage0_complete(run_root),
         "profile_path": str(stage0_profile_path(run_root)),
@@ -793,6 +815,16 @@ def write_state(run_root: Path) -> None:
         },
         "updated_at": utc_now_iso(),
     }
+    if bool(payload["complete"]) and args is not None:
+        payload["canonical_profiles"] = publish_canonical_family_profiles(
+            args,
+            run_root=run_root,
+            diagnostics_root_name=DEFAULT_OUTPUT_DIR.name,
+            model_order=MODEL_ORDER,
+            model_paths_fn=model_paths,
+            required_stage3_files=REQUIRED_STAGE3_FILES,
+            family="Stats_Frequentist",
+        )
     write_json_atomic(Path(run_root) / RUN_STATE_FILE, payload)
 
 
@@ -836,9 +868,10 @@ def run_orchestrator(args: argparse.Namespace) -> Path:
 
     if stage0_complete(run_root):
         progress_line("Stats Family Stage 0: already complete, skipping")
+        emit_event(run_root, run_id=run_root.name, family="Stats_Frequentist", model="family", stage="stage0", function_name="_run_stage0", module_name=STATS_STAGE0_ENTRYPOINT, phase_name="artifact_handoff", status="skipped", reason_code="stage_already_complete", output_path=str(stage0_profile_path(run_root)), artifact_profile_source=str(stage0_profile_path(run_root)))
     else:
         _run_stage0(args, run_root, env)
-    write_state(run_root)
+    write_state(run_root, args)
 
     for idx, model_key in enumerate(MODEL_ORDER, start=1):
         spec = MODEL_SPECS[model_key]
@@ -846,22 +879,25 @@ def run_orchestrator(args: argparse.Namespace) -> Path:
         progress_line(f"[{idx}/{len(MODEL_ORDER)}] {spec.display_name}: entering family partition")
         if stage1_complete(paths):
             progress_line(f"{spec.display_name} Stage 1: already complete, skipping")
+            emit_event(run_root, run_id=run_root.name, family="Stats_Frequentist", model=model_key, stage="stage1", function_name="_run_model_stage", module_name=spec.stage1_module, phase_name="artifact_handoff", status="skipped", reason_code="stage_already_complete", output_path=str(paths.stage1_dir))
         else:
             _run_model_stage(args, run_root, model_key, "stage1", spec.stage1_module, paths.stage1_dir, paths.stage1_log, env)
         write_state(run_root)
         if stage2_complete(paths):
             progress_line(f"{spec.display_name} Stage 2: already complete, skipping")
+            emit_event(run_root, run_id=run_root.name, family="Stats_Frequentist", model=model_key, stage="stage2", function_name="_run_model_stage", module_name=spec.stage2_module, phase_name="artifact_handoff", status="skipped", reason_code="stage_already_complete", output_path=str(stage2_survivor_path(paths)), artifact_profile_source=str(stage2_manifest_path(paths)))
         else:
             _run_model_stage(args, run_root, model_key, "stage2", spec.stage2_module, paths.stage2_dir, paths.stage2_log, env)
         write_state(run_root)
         if stage3_complete(paths):
             progress_line(f"{spec.display_name} Stage 3: already complete, skipping")
+            emit_event(run_root, run_id=run_root.name, family="Stats_Frequentist", model=model_key, stage="stage3", function_name="_run_model_stage", module_name=spec.stage3_module, phase_name="artifact_handoff", status="skipped", reason_code="stage_already_complete", output_path=str(paths.stage3_dir))
         else:
             _run_model_stage(args, run_root, model_key, "stage3", spec.stage3_module, paths.stage3_dir, paths.stage3_log, env)
         write_state(run_root)
 
     write_summary(run_root)
-    write_state(run_root)
+    write_state(run_root, args)
     progress_line("Stats orchestrator run complete")
     return run_root.resolve()
 

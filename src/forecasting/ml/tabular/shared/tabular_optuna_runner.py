@@ -22,6 +22,11 @@ import pandas as pd
 import importlib
 
 from src.forecasting.ml.shared.numeric_float_policy import DEFAULT_FLOAT_DTYPE
+from src.forecasting.ml.shared.test_branch_function_telemetry import (
+    emit_event_for_path,
+    emit_stage3_study_summary_for_path,
+    telemetry_scope_for_path,
+)
 
 
 CLAMP_START_YEAR = 2025
@@ -859,11 +864,29 @@ def run_study_for_combo(
     pruner_warmup_steps: int,
     timeout_seconds: int,
     quiet_progress: bool,
+    telemetry_path: Optional[Path] = None,
 ) -> Tuple[Dict[str, Any], List[MetricResult], List[MetricResult], List[Dict[str, Any]]]:
     trial_lock = threading.Lock()
     baseline_params = baseline_params_with_threads(combo, int(model_threads))
     t_baseline = time.monotonic()
-    baseline_metrics = [evaluate_dataset(dataset, baseline_params, "baseline", quiet_progress) for dataset in datasets]
+    with telemetry_scope_for_path(
+        telemetry_path,
+        family="Tabular_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        stage="stage3",
+        function_name="evaluate_dataset",
+        module_name=__name__,
+        phase_name="fit",
+        parent_phase="baseline_evaluation",
+        combo_key=combo.tuple_label,
+        interval_minutes=int(combo.interval),
+        horizon_minutes=int(combo.horizon_minutes),
+        task=str(combo.task),
+        input_rows=sum(len(dataset.df) for dataset in datasets),
+        asset_count=len(datasets),
+    ) as baseline_scope:
+        baseline_metrics = [evaluate_dataset(dataset, baseline_params, "baseline", quiet_progress) for dataset in datasets]
+        baseline_scope.update(output_rows=sum(int(metric.rows) for metric in baseline_metrics))
     baseline_eval_s = time.monotonic() - t_baseline
     baseline_summary = summarize_metrics(baseline_metrics)
     trial_rows: List[Dict[str, Any]] = []
@@ -915,35 +938,122 @@ def run_study_for_combo(
             )
         return objective_value
 
-    study = optuna.create_study(
-        direction="minimize",
-        sampler=optuna.samplers.TPESampler(seed=int(sampler_seed)),
-        pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=int(pruner_startup_trials),
-            n_warmup_steps=int(pruner_warmup_steps),
-        ),
-        study_name=f"{study_name_prefix}_{combo.interval}_{combo.horizon_minutes}_{combo.task}",
-        storage=task_storage_for(storage, combo),
-        load_if_exists=bool(resume_study or storage),
-    )
+    storage_url = task_storage_for(storage, combo)
+    with telemetry_scope_for_path(
+        telemetry_path,
+        family="Tabular_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        stage="stage3",
+        function_name="optuna.create_study",
+        module_name=__name__,
+        phase_name="study_setup",
+        parent_phase="tuning",
+        combo_key=combo.tuple_label,
+        interval_minutes=int(combo.interval),
+        horizon_minutes=int(combo.horizon_minutes),
+        task=str(combo.task),
+        source_path=str(storage_url or ""),
+    ) as study_scope:
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=int(sampler_seed)),
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=int(pruner_startup_trials),
+                n_warmup_steps=int(pruner_warmup_steps),
+            ),
+            study_name=f"{study_name_prefix}_{combo.interval}_{combo.horizon_minutes}_{combo.task}",
+            storage=storage_url,
+            load_if_exists=bool(resume_study or storage),
+        )
+        study_scope.update(output_rows=len(study.trials))
     t_study = time.monotonic()
     if int(trials_per_combo) > 0:
-        study.optimize(
-            objective,
-            n_trials=int(trials_per_combo),
-            timeout=(int(timeout_seconds) if int(timeout_seconds) > 0 else None),
-            show_progress_bar=False,
-            n_jobs=int(trial_workers),
-        )
+        with telemetry_scope_for_path(
+            telemetry_path,
+            family="Tabular_Numeric",
+            model=str(CURRENT_MODEL_SPEC.model_key),
+            stage="stage3",
+            function_name="study.optimize",
+            module_name=__name__,
+            phase_name="fit",
+            parent_phase="tuning",
+            combo_key=combo.tuple_label,
+            interval_minutes=int(combo.interval),
+            horizon_minutes=int(combo.horizon_minutes),
+            task=str(combo.task),
+            input_rows=int(trials_per_combo),
+            asset_count=len(datasets),
+        ) as optimize_scope:
+            study.optimize(
+                objective,
+                n_trials=int(trials_per_combo),
+                timeout=(int(timeout_seconds) if int(timeout_seconds) > 0 else None),
+                show_progress_bar=False,
+                n_jobs=int(trial_workers),
+            )
+            optimize_scope.update(output_rows=len(trial_rows))
     study_elapsed_s = time.monotonic() - t_study
     best_params = baseline_params_with_threads(combo, int(model_threads))
     if study.trials:
         best_params.update(dict(study.best_trial.params))
     best_params = finalize_model_params(best_params, combo)
     t_tuned = time.monotonic()
-    tuned_metrics = [evaluate_dataset(dataset, best_params, "tuned", quiet_progress) for dataset in datasets]
+    with telemetry_scope_for_path(
+        telemetry_path,
+        family="Tabular_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        stage="stage3",
+        function_name="evaluate_dataset",
+        module_name=__name__,
+        phase_name="predict",
+        parent_phase="best_trial_evaluation",
+        combo_key=combo.tuple_label,
+        interval_minutes=int(combo.interval),
+        horizon_minutes=int(combo.horizon_minutes),
+        task=str(combo.task),
+        input_rows=sum(len(dataset.df) for dataset in datasets),
+        asset_count=len(datasets),
+    ) as tuned_scope:
+        tuned_metrics = [evaluate_dataset(dataset, best_params, "tuned", quiet_progress) for dataset in datasets]
+        tuned_scope.update(output_rows=sum(int(metric.rows) for metric in tuned_metrics))
     tuned_eval_s = time.monotonic() - t_tuned
     tuned_summary = summarize_metrics(tuned_metrics)
+    emit_event_for_path(
+        telemetry_path,
+        family="Tabular_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        stage="stage3",
+        function_name="summarize_metrics",
+        module_name=__name__,
+        phase_name="metric_calculation",
+        parent_phase="best_trial_evaluation",
+        status="completed" if int(tuned_summary.get("rows", 0) or 0) > 0 else "skipped",
+        reason_code="" if int(tuned_summary.get("rows", 0) or 0) > 0 else "predict_returned_empty",
+        combo_key=combo.tuple_label,
+        interval_minutes=int(combo.interval),
+        horizon_minutes=int(combo.horizon_minutes),
+        task=str(combo.task),
+        input_rows=len(tuned_metrics),
+        output_rows=int(tuned_summary.get("rows", 0) or 0),
+    )
+    emit_stage3_study_summary_for_path(
+        telemetry_path,
+        family="Tabular_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        function_name="run_study_for_combo",
+        module_name=__name__,
+        combo_key=combo.tuple_label,
+        interval_minutes=int(combo.interval),
+        horizon_minutes=int(combo.horizon_minutes),
+        task=str(combo.task),
+        elapsed_seconds=float(study_elapsed_s),
+        trial_rows=trial_rows,
+        study_trials=list(study.trials),
+        best_value=(float(study.best_value) if study.trials else None),
+        input_rows=int(trials_per_combo),
+        output_rows=sum(int(metric.rows) for metric in tuned_metrics),
+        source_path=str(storage_url or ""),
+    )
     combo_row = {
         "combo": combo.tuple_label,
         "interval": int(combo.interval),
@@ -992,6 +1102,20 @@ def write_outputs(
     pd.DataFrame(list(trial_rows)).to_json(output_dir / "optuna_trials.json", orient="records", indent=2)
     if runtime_rows:
         pd.DataFrame(list(runtime_rows)).to_csv(output_dir / "runtime_summary.csv", index=False)
+    emit_event_for_path(
+        output_dir,
+        family="Tabular_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        stage="stage3",
+        function_name="write_outputs",
+        module_name=__name__,
+        phase_name="artifact_handoff",
+        status="completed",
+        input_rows=len(metric_rows),
+        output_rows=len(combo_rows),
+        output_path=str(output_dir),
+        reason_code=("predict_returned_empty" if not metric_rows else ""),
+    )
     lines = [
         f"# {CURRENT_MODEL_SPEC.display_name} Combo-Level Optuna Tuning",
         "",
@@ -1015,6 +1139,7 @@ def write_outputs(
 def run_single_combo(combo: ComboSpec, args_dict: Dict[str, Any], model_spec: TabularOptunaModelSpec) -> Dict[str, Any]:
     configure_for_model(model_spec)
     repository = DatasetRepository()
+    telemetry_path = Path(str(args_dict["telemetry_path"])) if str(args_dict.get("telemetry_path") or "").strip() else None
 
     def _run_once() -> Dict[str, Any]:
         explicit_assets = list(args_dict.get('explicit_assets', []))
@@ -1044,20 +1169,40 @@ def run_single_combo(combo: ComboSpec, args_dict: Dict[str, Any], model_spec: Ta
             )
         combo_datasets: List[Dataset] = []
         sample_rows: List[Dict[str, Any]] = []
-        for asset in assets:
-            dataset = repository.build_dataset(asset, combo, int(seed_ts), int(accuracy_end_ts))
-            combo_datasets.append(dataset)
-            sample_rows.append(
-                {
-                    'combo': combo.tuple_label,
-                    'asset': asset,
-                    'seed_ts': int(seed_ts),
-                    'accuracy_end_ts': int(accuracy_end_ts),
-                    'source_start_ts': int(dataset.source_start_ts),
-                    'source_end_ts': int(dataset.source_end_ts),
-                    'rows': int(len(dataset.df)),
-                    'diagnostic_month': f"{final_month.year:04d}-{final_month.month:02d}",
-                }
+        with telemetry_scope_for_path(
+            telemetry_path,
+            family="Tabular_Numeric",
+            model=str(CURRENT_MODEL_SPEC.model_key),
+            stage="stage3",
+            function_name="DatasetRepository.build_dataset",
+            module_name=__name__,
+            phase_name="dataset_construction",
+            parent_phase="objective_setup",
+            combo_key=combo.tuple_label,
+            interval_minutes=int(combo.interval),
+            horizon_minutes=int(combo.horizon_minutes),
+            task=str(combo.task),
+            input_rows=len(assets),
+            asset_count=len(assets),
+        ) as dataset_scope:
+            for asset in assets:
+                dataset = repository.build_dataset(asset, combo, int(seed_ts), int(accuracy_end_ts))
+                combo_datasets.append(dataset)
+                sample_rows.append(
+                    {
+                        'combo': combo.tuple_label,
+                        'asset': asset,
+                        'seed_ts': int(seed_ts),
+                        'accuracy_end_ts': int(accuracy_end_ts),
+                        'source_start_ts': int(dataset.source_start_ts),
+                        'source_end_ts': int(dataset.source_end_ts),
+                        'rows': int(len(dataset.df)),
+                        'diagnostic_month': f"{final_month.year:04d}-{final_month.month:02d}",
+                    }
+                )
+            dataset_scope.update(
+                output_rows=sum(int(len(dataset.df)) for dataset in combo_datasets),
+                reason_code="" if combo_datasets else "objective_dataset_empty",
             )
         combo_row, baseline_metrics, tuned_metrics, combo_trials = run_study_for_combo(
             combo=combo,
@@ -1073,6 +1218,7 @@ def run_single_combo(combo: ComboSpec, args_dict: Dict[str, Any], model_spec: Ta
             pruner_warmup_steps=int(args_dict['pruner_warmup_steps']),
             timeout_seconds=int(args_dict['timeout_seconds']),
             quiet_progress=bool(args_dict['quiet_progress']),
+            telemetry_path=telemetry_path,
         )
         return {
             'sample_rows': sample_rows,
@@ -1115,6 +1261,18 @@ def main_for_model(model_spec: TabularOptunaModelSpec) -> None:
         db_path = Path(storage.replace('sqlite:///', '', 1))
         db_path.parent.mkdir(parents=True, exist_ok=True)
     output_dir = args.output_dir.resolve() if args.output_dir else (CURRENT_MODEL_SPEC.output_root / f"run={utc_now_stamp()}").resolve()
+    emit_event_for_path(
+        output_dir,
+        family="Tabular_Numeric",
+        model=str(model_spec.model_key),
+        stage="stage3",
+        function_name="main_for_model",
+        module_name=__name__,
+        phase_name="combo_planning",
+        status="completed",
+        output_rows=len(combos),
+        artifact_profile_source=(str(stage2_manifest) if stage2_manifest is not None else ""),
+    )
     sample_rows: List[Dict[str, Any]] = []
     combo_rows: List[Dict[str, Any]] = []
     metric_rows: List[Dict[str, Any]] = []
@@ -1139,6 +1297,7 @@ def main_for_model(model_spec: TabularOptunaModelSpec) -> None:
         'search_back_months': int(args.search_back_months),
         'staged': bool(args.staged),
         'stage2_contexts': stage2_contexts,
+        'telemetry_path': str(output_dir),
     }
     if int(plan.combo_workers) <= 1:
         for combo in combos:

@@ -5,7 +5,9 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
+
+from src.forecasting.ml.shared.test_branch_function_telemetry import emit_event_for_path, telemetry_scope_for_path
 
 
 def parse_int_csv(raw: str) -> List[int]:
@@ -171,3 +173,108 @@ def write_candidate_csv(path: Path, results: Sequence[Dict[str, Any]], *, fieldn
         for result in results:
             writer.writerow({name: result.get(name) for name in fieldnames})
 
+
+def emit_stage0_event(
+    output_dir: Path,
+    *,
+    family: str,
+    function_name: str,
+    phase_name: str,
+    model: str = "family",
+    status: str = "completed",
+    reason_code: str = "",
+    **payload: Any,
+) -> None:
+    emit_event_for_path(
+        Path(output_dir),
+        family=str(family),
+        model=str(model),
+        stage="stage0",
+        function_name=str(function_name),
+        module_name=payload.pop("module_name", ""),
+        phase_name=str(phase_name),
+        status=str(status),
+        reason_code=str(reason_code or ""),
+        **payload,
+    )
+
+
+def stage0_telemetry_scope(
+    output_dir: Path,
+    *,
+    family: str,
+    function_name: str,
+    phase_name: str,
+    model: str = "family",
+    status: str = "completed",
+    reason_code: str = "",
+    **payload: Any,
+) -> Iterator[Any]:
+    return telemetry_scope_for_path(
+        Path(output_dir),
+        family=str(family),
+        model=str(model),
+        stage="stage0",
+        function_name=str(function_name),
+        module_name=str(payload.pop("module_name", "")),
+        phase_name=str(phase_name),
+        status=str(status),
+        reason_code=str(reason_code or ""),
+        **payload,
+    )
+
+
+def emit_stage0_profile_artifacts(
+    output_dir: Path,
+    *,
+    family: str,
+    profile_path: Path,
+    candidates_path: Path,
+    candidates: Sequence[Dict[str, Any]],
+    selected_profile: Optional[Dict[str, Any]],
+    asset_count: int,
+    combo_count: int = 1,
+) -> None:
+    profile_exists = Path(profile_path).exists()
+    candidates_exists = Path(candidates_path).exists()
+    valid = bool(selected_profile) and bool(candidates) and profile_exists and candidates_exists
+    emit_stage0_event(
+        output_dir,
+        family=family,
+        function_name="validate_stage0_profile",
+        module_name=__name__,
+        phase_name="profile_validation",
+        status="completed" if valid else "failed",
+        reason_code="" if valid else "profile_validation_failed",
+        input_rows=len(candidates),
+        output_rows=1 if valid else 0,
+        asset_count=int(asset_count),
+        output_path=str(profile_path),
+    )
+    emit_stage0_event(
+        output_dir,
+        family=family,
+        function_name="write_stage0_profile",
+        module_name=__name__,
+        phase_name="write",
+        status="completed" if profile_exists else "failed",
+        reason_code="" if profile_exists else "profile_write_failed",
+        input_rows=len(candidates),
+        output_rows=1 if profile_exists else 0,
+        asset_count=int(asset_count),
+        output_path=str(profile_path),
+    )
+    emit_stage0_event(
+        output_dir,
+        family=family,
+        function_name="run_stage0",
+        module_name=__name__,
+        phase_name="artifact_handoff",
+        status="completed" if valid else "failed",
+        reason_code="" if valid else "profile_validation_failed",
+        input_rows=len(candidates),
+        output_rows=int(combo_count),
+        asset_count=int(asset_count),
+        output_path=str(profile_path),
+        artifact_profile_source=str(profile_path),
+    )

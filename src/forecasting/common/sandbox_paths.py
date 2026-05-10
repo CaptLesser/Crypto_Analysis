@@ -118,25 +118,40 @@ def is_relative_to(path: Path, root: Path) -> bool:
 def default_production_roots(env: Optional[Mapping[str, str]] = None) -> tuple[Path, ...]:
     source_env = env if env is not None else os.environ
     roots: set[Path] = set()
+    active_sandbox_root: Optional[Path] = None
+    if _is_truthy(_env_value(source_env, SANDBOX_ENV_MODE)):
+        raw_sandbox_root = _env_value(source_env, SANDBOX_ENV_OUTPUT_ROOT)
+        if raw_sandbox_root:
+            active_sandbox_root = _resolve(Path(raw_sandbox_root))
+
+    def add_root(path: Path) -> None:
+        resolved = _resolve(Path(path))
+        if active_sandbox_root is not None and (
+            resolved == active_sandbox_root or is_relative_to(resolved, active_sandbox_root)
+        ):
+            return
+        roots.add(resolved)
+
+    roots.add(_resolve(Path("D:/pipeline")))
+
     raw_pipeline_root = _env_value(source_env, "PIPELINE_ROOT")
     if raw_pipeline_root:
         pipeline_root = _resolve(Path(raw_pipeline_root))
-        roots.update(
-            {
-                pipeline_root,
-                _resolve(Path(_env_value(source_env, "PIPELINE_PARQUET_ROOT") or pipeline_root / "parquet")),
-                _resolve(Path(_env_value(source_env, "PIPELINE_PARQUET_FEATURES_ROOT") or pipeline_root / "parquet")),
-                _resolve(Path(_env_value(source_env, "PIPELINE_PARQUET_REGIME_ROOT") or pipeline_root / "parquet")),
-                _resolve(Path(_env_value(source_env, "PIPELINE_REGIME_DEFINITION_ROOT") or pipeline_root / "regime_definitions")),
-                _resolve(pipeline_root / "logs"),
-                _resolve(pipeline_root / "model_states"),
-                _resolve(pipeline_root / "tmp"),
-            }
-        )
+        for path in (
+            pipeline_root,
+            Path(_env_value(source_env, "PIPELINE_PARQUET_ROOT") or pipeline_root / "parquet"),
+            Path(_env_value(source_env, "PIPELINE_PARQUET_FEATURES_ROOT") or pipeline_root / "parquet"),
+            Path(_env_value(source_env, "PIPELINE_PARQUET_REGIME_ROOT") or pipeline_root / "parquet"),
+            Path(_env_value(source_env, "PIPELINE_REGIME_DEFINITION_ROOT") or pipeline_root / "regime_definitions"),
+            pipeline_root / "logs",
+            pipeline_root / "model_states",
+            pipeline_root / "tmp",
+        ):
+            add_root(Path(path))
     for key in _PRODUCTION_ARTIFACT_ROOT_ENVS:
         raw = _env_value(source_env, key)
         if raw:
-            roots.add(_resolve(Path(raw)))
+            add_root(Path(raw))
     return tuple(sorted(roots, key=lambda item: str(item).lower()))
 
 
@@ -249,10 +264,10 @@ def assert_sandbox_write_path(path: Path, kind: str) -> None:
 
 def _source_root_defaults(env: Mapping[str, str]) -> dict[str, str]:
     pipeline_root = _resolve(Path(_env_value(env, "PIPELINE_ROOT") or "."))
-    parquet_root = _resolve(Path(_env_value(env, "PIPELINE_SOURCE_PARQUET_ROOT") or _env_value(env, "PIPELINE_PARQUET_ROOT") or pipeline_root / "parquet"))
+    parquet_root = _resolve(Path(_env_value(env, "PIPELINE_PARQUET_ROOT") or _env_value(env, "PIPELINE_SOURCE_PARQUET_ROOT") or pipeline_root / "parquet"))
     ohlcvt_root = _resolve(Path(_env_value(env, "PIPELINE_SOURCE_OHLCVT_ROOT") or parquet_root))
-    features_root = _resolve(Path(_env_value(env, "PIPELINE_SOURCE_FEATURES_ROOT") or _env_value(env, "PIPELINE_PARQUET_FEATURES_ROOT") or parquet_root))
-    regime_root = _resolve(Path(_env_value(env, "PIPELINE_SOURCE_REGIME_ROOT") or _env_value(env, "PIPELINE_PARQUET_REGIME_ROOT") or parquet_root))
+    features_root = _resolve(Path(_env_value(env, "PIPELINE_PARQUET_FEATURES_ROOT") or _env_value(env, "PIPELINE_SOURCE_FEATURES_ROOT") or parquet_root))
+    regime_root = _resolve(Path(_env_value(env, "PIPELINE_PARQUET_REGIME_ROOT") or _env_value(env, "PIPELINE_SOURCE_REGIME_ROOT") or parquet_root))
     return {
         "PIPELINE_SOURCE_PARQUET_ROOT": str(parquet_root),
         "PIPELINE_SOURCE_OHLCVT_ROOT": str(ohlcvt_root),
@@ -286,6 +301,9 @@ def sandbox_env_for_subprocess(
             "PIPELINE_SANDBOX_REGIME_DEFINITION_ROOT": str(roots.regime_definition_root),
             "PIPELINE_SANDBOX_RUNTIME_ARTIFACT_ROOT": str(roots.runtime_artifact_root),
             "PIPELINE_ROOT": str(roots.root),
+            "PIPELINE_LOG_ROOT": str(roots.log_root),
+            "PIPELINE_STATE_ROOT": str(roots.state_root),
+            "PIPELINE_TMP_ROOT": str(roots.tmp_root),
             "CATBOOST_TRAIN_DIR": str(roots.catboost_train_dir),
             "TMP": str(roots.tmp_root),
             "TEMP": str(roots.tmp_root),
