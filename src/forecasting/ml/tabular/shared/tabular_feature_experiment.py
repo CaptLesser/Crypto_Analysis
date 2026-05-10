@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 import os
 import random
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,6 +37,7 @@ from src.forecasting.ml.tabular.shared.tabular_numeric_model_registry import (
     get_tabular_numeric_model_spec,
     load_model_task_metadata,
 )
+from src.forecasting.ml.shared.test_branch_function_telemetry import emit_event_for_path, telemetry_scope_for_path
 
 DEFAULT_MODEL_KEY = "xgboost"
 STAGE1_DEFAULT_INTERVALS: Tuple[int, ...] = (15, 30, 60, 240, 720, 1440)
@@ -278,9 +280,40 @@ def predict_stage1_model(model: Any, x_val: pd.DataFrame) -> np.ndarray:
     return np.asarray(model.predict(x_val), dtype=float)
 
 
-def fit_and_predict(module: Any, task: str, x_train: pd.DataFrame, y_train: np.ndarray, x_val: pd.DataFrame, model_threads: int) -> Tuple[np.ndarray, Any]:
-    model = fit_stage1_model(module, task, x_train, y_train, model_threads)
-    pred = predict_stage1_model(model, x_val)
+def fit_and_predict(
+    module: Any,
+    task: str,
+    x_train: pd.DataFrame,
+    y_train: np.ndarray,
+    x_val: pd.DataFrame,
+    model_threads: int,
+    *,
+    telemetry_path: Optional[Path] = None,
+    telemetry_base: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, Any]:
+    base = dict(telemetry_base or {})
+    with telemetry_scope_for_path(
+        telemetry_path,
+        input_obj=x_train,
+        **base,
+        function_name="fit_stage1_model",
+        module_name=__name__,
+        phase_name="fit",
+        parent_phase="feature_selection",
+    ) as scope:
+        model = fit_stage1_model(module, task, x_train, y_train, model_threads)
+        scope.set_output(output_rows=len(y_train), output_columns_count=x_train.shape[1])
+    with telemetry_scope_for_path(
+        telemetry_path,
+        input_obj=x_val,
+        **base,
+        function_name="predict_stage1_model",
+        module_name=__name__,
+        phase_name="predict",
+        parent_phase="feature_selection",
+    ) as scope:
+        pred = predict_stage1_model(model, x_val)
+        scope.set_output(output_rows=len(pred), reason_code=("predict_returned_empty" if len(pred) == 0 else ""))
     return np.asarray(pred, dtype=float), model
 
 
@@ -308,23 +341,75 @@ def permutation_scores(model: Any, x_val: pd.DataFrame, y_val: np.ndarray, base_
     return {col: float(np.mean(vals)) for col, vals in scores.items() if vals}
 
 
-def build_labeled_frame(module: Any, asset: str, interval_minutes: int, horizon_minutes: int, task: str, training_window_months: int, max_rows: int) -> Tuple[pd.DataFrame, List[str]]:
+def build_labeled_frame(
+    module: Any,
+    asset: str,
+    interval_minutes: int,
+    horizon_minutes: int,
+    task: str,
+    training_window_months: int,
+    max_rows: int,
+    *,
+    telemetry_path: Optional[Path] = None,
+    model_key: str = "",
+    combo_key: Optional[str] = None,
+) -> Tuple[pd.DataFrame, List[str]]:
+    base_event = {
+        "family": "Tabular_Numeric",
+        "model": str(model_key),
+        "stage": "stage1",
+        "combo_key": combo_key,
+        "interval_minutes": int(interval_minutes),
+        "horizon_minutes": int(horizon_minutes),
+        "task": str(task),
+        "asset": str(asset),
+        "module_name": __name__,
+    }
     horizon_bars = int(module.horizon_bars_from_minutes(horizon_minutes, interval_minutes))
     train_bars = int(module.training_window_bars_from_months(training_window_months, interval_minutes))
     stop_ts = int(module._get_stop_ts(asset, interval_minutes))
     start_ts = int(stop_ts - ((train_bars + horizon_bars + 32) * int(interval_minutes) * 60))
-    feature_df, _stats = module._load_unit_feature_frame(asset, interval_minutes, start_ts, stop_ts)
+    with telemetry_scope_for_path(
+        telemetry_path,
+        **base_event,
+        function_name="_load_unit_feature_frame",
+        phase_name="feature_load",
+        parent_phase="feature_selection",
+    ) as scope:
+        feature_df, _stats = module._load_unit_feature_frame(asset, interval_minutes, start_ts, stop_ts)
+        scope.set_output(feature_df, reason_code=("feature_load_empty" if feature_df.empty else ""))
     if feature_df.empty:
         return pd.DataFrame(), []
-    label_df, _label_stats = module._compute_future_labels(feature_df.loc[:, ['high', 'low', 'close']], horizon_bars)
+    with telemetry_scope_for_path(
+        telemetry_path,
+        input_obj=feature_df,
+        required_columns=["high", "low", "close"],
+        **base_event,
+        function_name="_compute_future_labels",
+        phase_name="label_build",
+        parent_phase="feature_selection",
+    ) as scope:
+        label_df, _label_stats = module._compute_future_labels(feature_df.loc[:, ['high', 'low', 'close']], horizon_bars)
+        scope.set_output(label_df, reason_code=("labels_empty" if label_df.empty else ""))
     task_label = getattr(module, 'TASK_LABEL')[str(task)]
     y_col = str(task_label)
     frame = pd.concat([feature_df.reset_index(drop=True), label_df.reset_index(drop=True)], axis=1)
     x_cols = list(select_numeric_feature_columns(frame.columns, extra_exclude={y_col, 'future_direction'}))
     needed = [col for col in x_cols if col in frame.columns] + [y_col]
-    df = frame.loc[:, needed].replace([np.inf, -np.inf], np.nan).dropna(axis=0, how='any').reset_index(drop=True)
-    if max_rows > 0 and len(df) > max_rows:
-        df = df.iloc[-int(max_rows):].reset_index(drop=True)
+    with telemetry_scope_for_path(
+        telemetry_path,
+        input_obj=frame,
+        required_columns=[y_col],
+        key_columns=[y_col],
+        **base_event,
+        function_name="build_labeled_frame",
+        phase_name="join",
+        parent_phase="feature_selection",
+    ) as scope:
+        df = frame.loc[:, needed].replace([np.inf, -np.inf], np.nan).dropna(axis=0, how='any').reset_index(drop=True)
+        if max_rows > 0 and len(df) > max_rows:
+            df = df.iloc[-int(max_rows):].reset_index(drop=True)
+        scope.set_output(df, reason_code=("train_frame_empty" if df.empty else ""))
     return df, [col for col in x_cols if col in df.columns]
 
 
@@ -337,7 +422,18 @@ def rank_candidate_columns(importances: Dict[str, float], mi_map: Dict[str, floa
     return [col for _, col in ranked[: max(1, int(top_k))]]
 
 
-def run_fold(module: Any, spec: ComboSpec, asset: str, df: pd.DataFrame, x_cols: Sequence[str], args: argparse.Namespace, model_threads: int) -> Tuple[List[FoldResult], Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+def run_fold(
+    module: Any,
+    spec: ComboSpec,
+    asset: str,
+    df: pd.DataFrame,
+    x_cols: Sequence[str],
+    args: argparse.Namespace,
+    model_threads: int,
+    *,
+    telemetry_path: Optional[Path] = None,
+    model_key: str = "",
+) -> Tuple[List[FoldResult], Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     rows: List[FoldResult] = []
     top_feature_stats: Counter[str] = Counter()
     family_rows: List[Dict[str, Any]] = []
@@ -350,17 +446,94 @@ def run_fold(module: Any, spec: ComboSpec, asset: str, df: pd.DataFrame, x_cols:
         train = df.iloc[train_idx].reset_index(drop=True)
         val = df.iloc[val_idx].reset_index(drop=True)
         if len(train) < int(min_train_rows) or len(val) < int(min_val_rows):
+            emit_event_for_path(
+                telemetry_path,
+                family="Tabular_Numeric",
+                model=str(model_key),
+                stage="stage1",
+                combo_key=spec.key,
+                interval_minutes=int(spec.interval_minutes),
+                horizon_minutes=int(spec.horizon_minutes),
+                task=str(spec.task),
+                asset=str(asset),
+                function_name="TimeSeriesSplit",
+                module_name=__name__,
+                phase_name="split",
+                parent_phase="feature_selection",
+                status="skipped",
+                reason_code="insufficient_history",
+                input_rows=len(df),
+                output_rows=len(train) + len(val),
+            )
             continue
+        emit_event_for_path(
+            telemetry_path,
+            family="Tabular_Numeric",
+            model=str(model_key),
+            stage="stage1",
+            combo_key=spec.key,
+            interval_minutes=int(spec.interval_minutes),
+            horizon_minutes=int(spec.horizon_minutes),
+            task=str(spec.task),
+            asset=str(asset),
+            function_name="TimeSeriesSplit",
+            module_name=__name__,
+            phase_name="split",
+            parent_phase="feature_selection",
+            status="completed",
+            input_rows=len(df),
+            output_rows=len(train) + len(val),
+        )
         x_train_raw = train.loc[:, x_cols]
         x_val_raw = val.loc[:, x_cols]
         selector = VarianceThreshold(threshold=float(args.variance_threshold))
         x_train_screen = pd.DataFrame(selector.fit_transform(x_train_raw), columns=x_train_raw.columns[selector.get_support()].tolist())
         x_val_screen = pd.DataFrame(selector.transform(x_val_raw), columns=x_train_screen.columns.tolist())
         if x_train_screen.empty:
+            emit_event_for_path(
+                telemetry_path,
+                family="Tabular_Numeric",
+                model=str(model_key),
+                stage="stage1",
+                combo_key=spec.key,
+                interval_minutes=int(spec.interval_minutes),
+                horizon_minutes=int(spec.horizon_minutes),
+                task=str(spec.task),
+                asset=str(asset),
+                function_name="VarianceThreshold.fit_transform",
+                module_name=__name__,
+                phase_name="feature_selection",
+                parent_phase="feature_selection",
+                status="skipped",
+                reason_code="required_columns_missing",
+                input_rows=len(train),
+                output_rows=0,
+                input_columns_count=len(x_cols),
+                output_columns_count=0,
+            )
             continue
         y_train = pd.to_numeric(train[y_col], errors='coerce').to_numpy(dtype=float)
         y_val = pd.to_numeric(val[y_col], errors='coerce').to_numpy(dtype=float)
-        full_pred, full_model = fit_and_predict(module, spec.task, x_train_screen, y_train, x_val_screen, model_threads)
+        telemetry_base = {
+            "family": "Tabular_Numeric",
+            "model": str(model_key),
+            "stage": "stage1",
+            "combo_key": spec.key,
+            "interval_minutes": int(spec.interval_minutes),
+            "horizon_minutes": int(spec.horizon_minutes),
+            "task": str(spec.task),
+            "asset": str(asset),
+        }
+        full_pred, full_model = fit_and_predict(
+            module,
+            spec.task,
+            x_train_screen,
+            y_train,
+            x_val_screen,
+            model_threads,
+            telemetry_path=telemetry_path,
+            telemetry_base=telemetry_base,
+        )
         full_rmse = float(np.sqrt(np.mean((full_pred - y_val) ** 2)))
         base_rmse = baseline_rmse(y_train, y_val)
         full_skill = float(1.0 - (full_rmse / base_rmse)) if base_rmse not in (None, 0.0) else None
@@ -373,7 +546,16 @@ def run_fold(module: Any, spec: ComboSpec, asset: str, df: pd.DataFrame, x_cols:
         if not selected_cols:
             selected_cols = candidate_cols[: max(1, int(args.top_k_features))]
         selected_cols = selected_cols[: max(1, int(args.top_k_features))]
-        subset_pred, _subset_model = fit_and_predict(module, spec.task, x_train_screen.loc[:, selected_cols], y_train, x_val_screen.loc[:, selected_cols], model_threads)
+        subset_pred, _subset_model = fit_and_predict(
+            module,
+            spec.task,
+            x_train_screen.loc[:, selected_cols],
+            y_train,
+            x_val_screen.loc[:, selected_cols],
+            model_threads,
+            telemetry_path=telemetry_path,
+            telemetry_base=telemetry_base,
+        )
         subset_rmse = float(np.sqrt(np.mean((subset_pred - y_val) ** 2)))
         subset_skill = float(1.0 - (subset_rmse / base_rmse)) if base_rmse not in (None, 0.0) else None
         top_feature_stats.update(selected_cols)
@@ -456,7 +638,27 @@ def parse_args() -> argparse.Namespace:
 
 def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int, horizon_minutes: int, task: str, cohort_assets: Sequence[str]) -> Optional[Dict[str, Any]]:
     assets = [str(asset) for asset in cohort_assets]
+    telemetry_path = Path(args.output_dir).resolve() if getattr(args, "output_dir", None) is not None else None
+    model_key = str(getattr(args, "model_key", ""))
+    combo_key = combo_selection_key(int(interval_minutes), int(horizon_minutes), str(task))
     if not assets:
+        emit_event_for_path(
+            telemetry_path,
+            family="Tabular_Numeric",
+            model=model_key,
+            stage="stage1",
+            combo_key=combo_key,
+            interval_minutes=int(interval_minutes),
+            horizon_minutes=int(horizon_minutes),
+            task=str(task),
+            function_name="run_combo_spec",
+            module_name=__name__,
+            phase_name="asset_planning",
+            status="skipped",
+            reason_code="no_assets",
+            output_rows=0,
+            asset_count=0,
+        )
         return None
     training_window_months = stage1_training_window_months(int(args.train_window_months), int(interval_minutes), int(horizon_minutes))
     combo_spec = ComboSpec(
@@ -470,16 +672,57 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
     feature_votes: Counter[str] = Counter()
     family_rows_all: List[Dict[str, Any]] = []
     fold_rows_all: List[Dict[str, Any]] = []
+    started = time.perf_counter()
     for asset in assets:
-        df, x_cols = build_labeled_frame(module, asset, int(interval_minutes), int(horizon_minutes), str(task), int(training_window_months), int(args.max_rows))
+        df, x_cols = build_labeled_frame(
+            module,
+            asset,
+            int(interval_minutes),
+            int(horizon_minutes),
+            str(task),
+            int(training_window_months),
+            int(args.max_rows),
+            telemetry_path=telemetry_path,
+            model_key=model_key,
+            combo_key=combo_spec.key,
+        )
         if df.empty or len(x_cols) < 2:
             continue
-        fold_results, feature_stats, family_rows, fold_rows = run_fold(module, combo_spec, asset, df, x_cols, args, int(args.model_threads))
+        fold_results, feature_stats, family_rows, fold_rows = run_fold(
+            module,
+            combo_spec,
+            asset,
+            df,
+            x_cols,
+            args,
+            int(args.model_threads),
+            telemetry_path=telemetry_path,
+            model_key=model_key,
+        )
         all_fold_results.extend(fold_results)
         feature_votes.update(feature_stats)
         family_rows_all.extend(family_rows)
         fold_rows_all.extend(fold_rows)
     if not all_fold_results:
+        emit_event_for_path(
+            telemetry_path,
+            family="Tabular_Numeric",
+            model=model_key,
+            stage="stage1",
+            combo_key=combo_spec.key,
+            interval_minutes=int(interval_minutes),
+            horizon_minutes=int(horizon_minutes),
+            task=str(task),
+            function_name="run_combo_spec",
+            module_name=__name__,
+            phase_name="feature_selection",
+            status="completed",
+            reason_code="train_frame_empty",
+            elapsed_seconds=time.perf_counter() - started,
+            input_rows=len(assets),
+            output_rows=0,
+            asset_count=len(assets),
+        )
         return None
     top_features = [name for name, _count in feature_votes.most_common(int(args.top_k_features))]
     top_family_counts = Counter(family_for_column(col) for col in top_features)
@@ -509,6 +752,25 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
         'training_window_months': int(training_window_months),
         'asset_count_used': int(len(assets)),
     }
+    emit_event_for_path(
+        telemetry_path,
+        family="Tabular_Numeric",
+        model=model_key,
+        stage="stage1",
+        combo_key=combo_spec.key,
+        interval_minutes=int(interval_minutes),
+        horizon_minutes=int(horizon_minutes),
+        task=str(task),
+        function_name="run_combo_spec",
+        module_name=__name__,
+        phase_name="feature_selection",
+        status="completed",
+        elapsed_seconds=time.perf_counter() - started,
+        input_rows=len(assets),
+        output_rows=len(all_fold_results),
+        asset_count=len(assets),
+        output_columns_count=len(top_features),
+    )
     return {
         'combo_key': combo_spec.key,
         'summary_row': summary_row,
@@ -581,6 +843,7 @@ def write_progress_payload(
 
 def main_for_model(model_key: str = DEFAULT_MODEL_KEY) -> None:
     args = parse_args()
+    setattr(args, "model_key", str(model_key))
     if args.parquet_root:
         os.environ.setdefault('PIPELINE_PARQUET_ROOT', str(args.parquet_root.resolve()))
         os.environ.setdefault('PIPELINE_PARQUET_FEATURES_ROOT', str(args.parquet_root.resolve()))
@@ -608,6 +871,20 @@ def main_for_model(model_key: str = DEFAULT_MODEL_KEY) -> None:
     progress_path = output_dir / 'feature_experiment_progress.json'
     meta_path = output_dir / 'feature_experiment_run_meta.json'
     cohort_assets, cohort_asset_aliases = resolve_stage1_cohort_assets(args, combos)
+    emit_event_for_path(
+        output_dir,
+        family="Tabular_Numeric",
+        model=str(model_key),
+        stage="stage1",
+        function_name="resolve_stage1_cohort_assets",
+        module_name=__name__,
+        phase_name="asset_planning",
+        status="completed",
+        asset_count=len(cohort_assets),
+        output_rows=len(cohort_assets),
+        reason_code=("no_assets" if not cohort_assets else ""),
+        source_path=str(args.parquet_root),
+    )
     summary_rows: List[Dict[str, Any]] = []
     family_rows_all: List[Dict[str, Any]] = []
     fold_rows_all: List[Dict[str, Any]] = []
@@ -667,6 +944,18 @@ def main_for_model(model_key: str = DEFAULT_MODEL_KEY) -> None:
     family_df.to_csv(family_path, index=False)
     fold_df.to_csv(folds_path, index=False)
     write_selection_payload(selection_path, model_key=str(model_key), selections=selections, cohort_assets=cohort_assets, cohort_asset_aliases=cohort_asset_aliases)
+    emit_event_for_path(
+        output_dir,
+        family="Tabular_Numeric",
+        model=str(model_key),
+        stage="stage1",
+        function_name="write_selection_payload",
+        module_name=__name__,
+        phase_name="artifact_handoff",
+        status="completed",
+        output_rows=len(selections),
+        output_path=str(selection_path),
+    )
     write_progress_payload(
         progress_path,
         model_key=str(model_key),
@@ -681,6 +970,18 @@ def main_for_model(model_key: str = DEFAULT_MODEL_KEY) -> None:
     expected_combo_keys = [combo_selection_key(int(interval), int(horizon), str(task)) for interval, horizon, task in combos]
     missing_combo_keys = [key for key in expected_combo_keys if key not in selections]
     meta_path.write_text(json.dumps({'model_key': str(model_key), 'generated_utc': utc_now_iso(), 'args': {key: (str(value) if isinstance(value, Path) else value) for key, value in vars(args).items()}, 'cohort_assets': list(cohort_assets), 'cohort_asset_aliases': dict(cohort_asset_aliases), 'outputs': {'summary_csv': str(summary_path), 'family_ablations_csv': str(family_path), 'fold_scores_csv': str(folds_path), 'selection_json': str(selection_path), 'progress_json': str(progress_path)}, 'expected_combo_count': int(len(expected_combo_keys)), 'completed_combo_count': int(len(selections)), 'missing_combo_keys': missing_combo_keys}, indent=2), encoding='utf-8')
+    emit_event_for_path(
+        output_dir,
+        family="Tabular_Numeric",
+        model=str(model_key),
+        stage="stage1",
+        function_name="write_feature_experiment_artifacts",
+        module_name=__name__,
+        phase_name="write",
+        status="completed",
+        output_rows=len(summary_rows),
+        output_path=str(output_dir),
+    )
     if missing_combo_keys:
         raise RuntimeError(f'Feature experiment completed with missing combo profiles: {len(missing_combo_keys)} missing')
     print(summary_path)

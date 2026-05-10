@@ -43,6 +43,22 @@ from src.forecasting.common.ml_module_utils import (
     select_regime_feature_columns,
     write_ml_state,
 )
+from src.forecasting.ml.shared.regime_forecast_io import read_regime_labels
+from src.forecasting.ml.shared.regime_targets import (
+    append_axis_label_columns,
+    axis_label_available_column,
+    axis_label_id_column,
+    future_axis_targets,
+)
+from src.regimes.contracts import (
+    REGIME_AXIS_ORDER,
+    REGIME_DEFAULT_FORECAST_INTERVALS,
+    RegimeAxisTarget,
+    axis_id_to_label,
+    axis_target,
+    forecast_ceiling_interval,
+    forecast_output_columns,
+)
 from src.forecasting.common.runtime_config import cap_model_threads, get_model_threads, get_workers, log_resolved_runtime
 
 try:
@@ -83,7 +99,7 @@ FAMILY = "LightGBM"
 DOMAIN = "Regimes"
 TASK = "future_regime_state"
 
-DEFAULT_INTERVALS = [1, 5, 15, 30, 60, 240, 720, 1440]
+DEFAULT_INTERVALS = list(REGIME_DEFAULT_FORECAST_INTERVALS)
 DEFAULT_HORIZON_MINUTES = [30, 240, 720]
 # Candidate Training Windows / Selection:
 # TRAIN_WINDOWS is ordered in bars. At time T, feasible windows are those with
@@ -186,6 +202,8 @@ def _unit_meta(horizon_minutes: int, horizon_bars: int, asset: str, interval: in
         "horizon_bars": int(horizon_bars),
         "asset": str(asset),
         "interval": int(interval),
+        "requested_interval": int(interval),
+        "resolved_regime_ceiling_interval": int(forecast_ceiling_interval(interval)),
     }
 
 
@@ -263,10 +281,14 @@ def _read_monthly_filtered(
 
     frames: List[pd.DataFrame] = []
     for y, m in iter_months_between(start_ts, end_ts):
-        month_dir = base_dir / table_dir / f"year={y}" / f"month={m:02d}"
-        if not month_dir.exists():
-            continue
-        files = sorted(month_dir.glob("*.parquet"))
+        month_dirs = [
+            base_dir / table_dir / f"asset={asset}" / f"year={y}" / f"month={m:02d}",
+            base_dir / table_dir / f"year={y}" / f"month={m:02d}",
+        ]
+        files: List[Path] = []
+        for month_dir in month_dirs:
+            if month_dir.exists():
+                files.extend(sorted(month_dir.glob("*.parquet")))
         for p in files:
             try:
                 df = pd.read_parquet(p, columns=columns)
@@ -305,12 +327,14 @@ def _infer_regime3(df: pd.DataFrame) -> pd.Series:
     if "trend_label" in df.columns:
         s = df["trend_label"].astype(str).str.lower().str.strip()
         mapping = {
+            "down": 0,
             "mr": 0,
             "mean_reversion": 0,
             "low": 0,
             "neutral": 1,
             "flat": 1,
             "unknown": 1,
+            "up": 2,
             "cont": 2,
             "trend": 2,
             "high": 2,
@@ -366,9 +390,9 @@ def _load_unit_frame(asset: str, interval: int, stop_ts: int) -> pd.DataFrame:
             scalars[c] = pd.to_numeric(scalars[c], errors="coerce")
         scalars = scalars.sort_values("ts").drop_duplicates(subset=["asset", "ts"], keep="last")
 
-    regimes = _read_monthly_filtered(
+    regimes = read_regime_labels(
         base_dir=REGIME_ROOT,
-        table_dir=f"regimes_{interval}",
+        ceiling_interval=int(forecast_ceiling_interval(interval)),
         start_ts=int(effective_start_ts),
         end_ts=int(stop_ts),
         asset=asset,
@@ -378,14 +402,28 @@ def _load_unit_frame(asset: str, interval: int, stop_ts: int) -> pd.DataFrame:
     if regimes.empty:
         reg = base[["ts", "asset"]].copy()
         reg["regime_3_idx"] = NEUTRAL_CLASS
+        reg = append_axis_label_columns(reg)
     else:
         reg = regimes[["ts", "asset"]].copy()
         reg["regime_3_idx"] = _infer_regime3(regimes).fillna(NEUTRAL_CLASS).astype("int64")
+        for axis in REGIME_AXIS_ORDER:
+            label_col = axis_target(axis).label_column
+            if label_col in regimes.columns:
+                reg[label_col] = regimes[label_col]
+        reg = append_axis_label_columns(reg)
         reg = reg.sort_values("ts").drop_duplicates(subset=["asset", "ts"], keep="last")
 
     out = base.merge(scalars[["ts", "asset"] + scalar_cols], on=["ts", "asset"], how="left")
-    out = out.merge(reg[["ts", "asset", "regime_3_idx"]], on=["ts", "asset"], how="left")
+    regime_cols = ["regime_3_idx"]
+    for axis in REGIME_AXIS_ORDER:
+        regime_cols.extend([axis_label_id_column(axis), axis_label_available_column(axis)])
+    out = out.merge(reg[["ts", "asset"] + regime_cols], on=["ts", "asset"], how="left")
     out["regime_3_idx"] = pd.to_numeric(out["regime_3_idx"], errors="coerce").fillna(NEUTRAL_CLASS).astype("int64")
+    for axis in REGIME_AXIS_ORDER:
+        id_col = axis_label_id_column(axis)
+        available_col = axis_label_available_column(axis)
+        out[id_col] = pd.to_numeric(out[id_col], errors="coerce").fillna(axis_target(axis).unknown_id).astype("int64")
+        out[available_col] = out[available_col].fillna(False).astype(bool)
     out = out.sort_values("ts").reset_index(drop=True)
     out[scalar_cols] = out[scalar_cols].ffill().fillna(0.0)
     return out
@@ -423,9 +461,29 @@ def _fit_classifier(x: np.ndarray, y: np.ndarray) -> Any:
     return model
 
 
+def _aligned_probability_vector(model: Any, proba: np.ndarray) -> np.ndarray:
+    raw = np.asarray(proba, dtype=float).reshape(-1)
+    if raw.size == len(CLASS_LABELS):
+        return raw
+    out = np.zeros((len(CLASS_LABELS),), dtype=float)
+    classes = getattr(model, "classes_", None)
+    if classes is not None:
+        for klass, value in zip(np.asarray(classes).reshape(-1).tolist(), raw.tolist()):
+            try:
+                idx = int(klass)
+            except Exception:
+                continue
+            if 0 <= idx < len(out):
+                out[idx] = float(value)
+    elif raw.size:
+        out[: min(len(out), raw.size)] = raw[: len(out)]
+    total = float(out.sum())
+    return out / total if total > 0.0 else out
+
+
 def _predict_one(model: Any, x_row: np.ndarray) -> Tuple[int, np.ndarray]:
-    pred = int(model.predict(x_row.reshape(1, -1))[0])
-    proba = np.asarray(model.predict_proba(x_row.reshape(1, -1)), dtype=float)[0]
+    proba = _aligned_probability_vector(model, np.asarray(model.predict_proba(x_row.reshape(1, -1)), dtype=float)[0])
+    pred = int(np.argmax(proba)) if float(proba.sum()) > 0.0 else int(model.predict(x_row.reshape(1, -1))[0])
     return pred, proba
 
 
@@ -440,6 +498,7 @@ class WindowSelection:
 def _evaluate_window_candidates(
     x: np.ndarray,
     y_future: np.ndarray,
+    future_available: np.ndarray,
     eligible_end: int,
     feasible_windows: Sequence[int],
     selection_ts: int,
@@ -455,8 +514,12 @@ def _evaluate_window_candidates(
         end = eligible_end
         if start < 0 or end <= start:
             continue
-        xw = x[start:end]
-        yw = y_future[start:end]
+        valid_idx = np.flatnonzero(np.asarray(future_available[start:end], dtype=bool)) + start
+        if len(valid_idx) < int(w):
+            continue
+        valid_idx = valid_idx[-int(w):]
+        xw = x[valid_idx]
+        yw = y_future[valid_idx]
         if len(xw) < 10:
             continue
         split = int(len(xw) * 0.8)
@@ -514,25 +577,28 @@ def _is_better_window(
     return (float(cand_acc) - float(curr_acc)) > float(WINDOW_SWITCH_EPS)
 
 
-def _walk_forward_predict(
+def _walk_forward_predict_axis(
     df: pd.DataFrame,
     horizon_bars: int,
+    target: RegimeAxisTarget,
     prior_selected_window: Optional[int] = None,
     prior_selection_timestamp: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, List[int], Dict[str, Any]]:
     if df.empty:
         return pd.DataFrame(columns=["ts", "asset"]), [], {}
-    x_cols = select_regime_feature_columns(df.columns, label_source_columns={"regime_3", "regime_3_idx", "trend_label", "vol_label"})
+    label_source_columns = {"regime_3", "regime_3_idx"}
+    for axis in REGIME_AXIS_ORDER:
+        label_source_columns.add(axis_label_id_column(axis))
+        label_source_columns.add(axis_label_available_column(axis))
+    x_cols = select_regime_feature_columns(df.columns, label_source_columns=label_source_columns)
     x = df[x_cols].to_numpy(dtype=float)
     ts = df["ts"].to_numpy(dtype=np.int64)
-    y_now = df["regime_3_idx"].to_numpy(dtype=np.int64)
 
     n = len(df)
-    y_future = np.full((n,), NEUTRAL_CLASS, dtype=np.int64)
-    for i in range(n):
-        j = i + horizon_bars
-        if j < n:
-            y_future[i] = int(y_now[j])
+    future = future_axis_targets(df, target, horizon_bars)
+    y_future = future.label_ids
+    future_available = future.available
+    tail_pending = future.tail_pending
 
     selected_w = int(prior_selected_window) if prior_selected_window is not None else None
     selection_timestamp = int(prior_selection_timestamp) if prior_selection_timestamp is not None else None
@@ -556,7 +622,7 @@ def _walk_forward_predict(
     last_refit_ts: Optional[int] = None
 
     for i in range(n):
-        tail_insufficient = is_tail_index(i=i, n_rows=n, horizon_bars=horizon_bars)
+        tail_insufficient = bool(tail_pending[i]) or is_tail_index(i=i, n_rows=n, horizon_bars=horizon_bars)
         if tail_insufficient:
             if i > 0:
                 pred[i] = pred[i - 1]
@@ -566,7 +632,8 @@ def _walk_forward_predict(
             continue
 
         eligible_end = i - horizon_bars + 1
-        eligible_count = eligible_end
+        eligible_valid_idx = np.flatnonzero(np.asarray(future_available[:max(0, eligible_end)], dtype=bool))
+        eligible_count = int(len(eligible_valid_idx))
         day = datetime.fromtimestamp(int(ts[i]), tz=timezone.utc).date().isoformat()
 
         feasible = [w for w in TRAIN_WINDOWS if eligible_count >= int(w)]
@@ -588,6 +655,7 @@ def _walk_forward_predict(
                 eval_sel = _evaluate_window_candidates(
                     x=x,
                     y_future=y_future,
+                    future_available=future_available,
                     eligible_end=eligible_end,
                     feasible_windows=feasible,
                     selection_ts=int(ts[i]),
@@ -614,9 +682,8 @@ def _walk_forward_predict(
                             model = None
 
         if model is None and selected_w is not None and eligible_count >= int(selected_w):
-            start = eligible_end - int(selected_w)
-            end = eligible_end
-            model = _fit_classifier(x[start:end], y_future[start:end])
+            train_idx = eligible_valid_idx[-int(selected_w):]
+            model = _fit_classifier(x[train_idx], y_future[train_idx])
 
         if model is None:
             kind[i] = "head_fill"
@@ -632,7 +699,7 @@ def _walk_forward_predict(
             first_real_idx = i
 
         matured_idx = i - horizon_bars
-        if matured_idx >= 0 and kind[matured_idx] == "real":
+        if matured_idx >= 0 and kind[matured_idx] == "real" and bool(future_available[matured_idx]):
             y_t = int(y_future[matured_idx])
             eval_window.append((y_t, np.asarray(probs[matured_idx], dtype=float)))
 
@@ -650,17 +717,18 @@ def _walk_forward_predict(
                 bad = (acc + REFIT_ACC_MARGIN < b_acc) or (ll > (b_ll + REFIT_LOGLOSS_MARGIN))
                 day_flags.append(bool(bad))
                 if _should_refit(day_flags) and selected_w is not None and eligible_count >= int(selected_w):
-                    start = eligible_end - int(selected_w)
-                    end = eligible_end
-                    model = _fit_classifier(x[start:end], y_future[start:end])
+                    train_idx = eligible_valid_idx[-int(selected_w):]
+                    model = _fit_classifier(x[train_idx], y_future[train_idx])
                     last_refit_ts = int(ts[i])
                     day_flags.clear()
 
     out = df[["ts", "asset"]].copy()
     out["pred"] = pred.astype(np.int64)
-    out["prob_low"] = probs[:, 0].astype(float)
-    out["prob_neutral"] = probs[:, 1].astype(float)
-    out["prob_high"] = probs[:, 2].astype(float)
+    out["prob_0"] = probs[:, 0].astype(float)
+    out["prob_1"] = probs[:, 1].astype(float)
+    out["prob_2"] = probs[:, 2].astype(float)
+    out["target_available"] = future_available.astype(bool)
+    out["kind"] = kind.astype(str)
     meta = {
         "selected_window_bars": selected_w,
         "selection_timestamp": int(selection_timestamp) if selection_timestamp is not None else None,
@@ -670,8 +738,80 @@ def _walk_forward_predict(
         "first_real_prediction_ts": int(ts[first_real_idx]) if first_real_idx is not None else None,
         "last_refit_ts": last_refit_ts,
         "x_cols": x_cols,
+        "axis": target.axis,
+        "target_available_count": int(np.asarray(future_available, dtype=bool).sum()),
+        "target_unknown_count": int((~np.asarray(future_available, dtype=bool) & ~np.asarray(tail_pending, dtype=bool)).sum()),
+        "tail_pending_count": int(np.asarray(tail_pending, dtype=bool).sum()),
     }
     return out, sorted(set(int(t) for t in pending_ts)), meta
+
+
+def _walk_forward_predict(
+    df: pd.DataFrame,
+    horizon_bars: int,
+    horizon_minutes: int,
+    prior_selected_window: Optional[int] = None,
+    prior_selection_timestamp: Optional[int] = None,
+) -> Tuple[pd.DataFrame, List[int], Dict[str, Any]]:
+    if df.empty:
+        return pd.DataFrame(columns=["ts", "asset"]), [], {}
+
+    out = df[["ts", "asset"]].copy()
+    pending_ts: set[int] = set()
+    axis_meta: Dict[str, Any] = {}
+    compatibility_trend: Optional[pd.DataFrame] = None
+
+    for axis in REGIME_AXIS_ORDER:
+        target = axis_target(axis)
+        axis_df, axis_pending, meta = _walk_forward_predict_axis(
+            df=df,
+            horizon_bars=int(horizon_bars),
+            target=target,
+            prior_selected_window=prior_selected_window,
+            prior_selection_timestamp=prior_selection_timestamp,
+        )
+        pending_ts.update(int(t) for t in axis_pending)
+        axis_meta[axis] = meta
+
+        pred_ids = pd.to_numeric(axis_df["pred"], errors="coerce").fillna(target.unknown_id).astype("int64")
+        out[target.prediction_id_column("lgb", horizon_minutes)] = pred_ids
+        out[target.prediction_column("lgb", horizon_minutes)] = [
+            axis_id_to_label(axis, int(label_id), unknown_label=target.unknown_label) for label_id in pred_ids.tolist()
+        ]
+        for idx, prob_col in enumerate(target.probability_columns("lgb", horizon_minutes)):
+            out[prob_col] = pd.to_numeric(axis_df[f"prob_{idx}"], errors="coerce").fillna(0.0).astype(float)
+        future = future_axis_targets(df, target, horizon_bars)
+        out[target.target_available_column("lgb", horizon_minutes)] = future.available.astype(bool)
+        out[target.prediction_kind_column("lgb", horizon_minutes)] = axis_df["kind"].astype(str)
+
+        if axis == "trend":
+            compatibility_trend = axis_df
+
+    if compatibility_trend is not None:
+        out[f"lgb_pred_regime3_{horizon_minutes}m"] = pd.to_numeric(
+            compatibility_trend["pred"], errors="coerce"
+        ).fillna(NEUTRAL_CLASS).astype("int64")
+        out[f"lgb_prob_regime3_low_{horizon_minutes}m"] = pd.to_numeric(
+            compatibility_trend["prob_0"], errors="coerce"
+        ).fillna(0.0).astype(float)
+        out[f"lgb_prob_regime3_neutral_{horizon_minutes}m"] = pd.to_numeric(
+            compatibility_trend["prob_1"], errors="coerce"
+        ).fillna(0.0).astype(float)
+        out[f"lgb_prob_regime3_high_{horizon_minutes}m"] = pd.to_numeric(
+            compatibility_trend["prob_2"], errors="coerce"
+        ).fillna(0.0).astype(float)
+
+    trend_meta = axis_meta.get("trend", {}) if isinstance(axis_meta.get("trend", {}), dict) else {}
+    meta = {
+        "selected_window_bars": trend_meta.get("selected_window_bars"),
+        "selection_timestamp": trend_meta.get("selection_timestamp"),
+        "selected_window_best_accuracy": trend_meta.get("selected_window_best_accuracy"),
+        "selected_window_best_logloss": trend_meta.get("selected_window_best_logloss"),
+        "window_upgrade_count": trend_meta.get("window_upgrade_count"),
+        "last_refit_ts": trend_meta.get("last_refit_ts"),
+        "axis_meta": axis_meta,
+    }
+    return out, sorted(pending_ts), meta
 
 
 def _output_file_path(interval: int, year: int, month: int, run_id: str, horizon_minutes: int) -> Path:
@@ -693,7 +833,7 @@ def _write_month_parts(
 ) -> List[dict]:
     if not month_frames:
         return []
-    out_cols = [
+    out_cols = list(forecast_output_columns("lgb", horizon_minutes)) + [
         f"lgb_pred_regime3_{horizon_minutes}m",
         f"lgb_prob_regime3_low_{horizon_minutes}m",
         f"lgb_prob_regime3_neutral_{horizon_minutes}m",
@@ -757,8 +897,8 @@ def _get_stop_ts(asset: str, interval: int) -> Optional[int]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Walk-forward LightGBM regime forecasting from regime_3 labels.")
-    parser.add_argument("--intervals", type=str, default="1,5,15,30,60,240,720,1440")
+    parser = argparse.ArgumentParser(description="Walk-forward LightGBM regime forecasting from canonical axis labels.")
+    parser.add_argument("--intervals", type=str, default=",".join(str(x) for x in DEFAULT_INTERVALS))
     parser.add_argument("--assets", type=str, default="", help="Comma-delimited assets")
     parser.add_argument("--horizon-minutes", type=str, default="30,240,720", help="Comma-delimited horizons in minutes")
     parser.add_argument("--mode", type=str, default="incremental", choices=["incremental", "backfill"])
@@ -882,18 +1022,10 @@ def main() -> None:
             pred_df, next_pending_ts, meta = _walk_forward_predict(
                 df=df,
                 horizon_bars=int(horizon_bars),
+                horizon_minutes=int(horizon_minutes),
                 prior_selected_window=prior_sel_w_i,
                 prior_selection_timestamp=prior_sel_ts_i,
             )
-            pred_col = f"lgb_pred_regime3_{horizon_minutes}m"
-            prob_low_col = f"lgb_prob_regime3_low_{horizon_minutes}m"
-            prob_neu_col = f"lgb_prob_regime3_neutral_{horizon_minutes}m"
-            prob_hi_col = f"lgb_prob_regime3_high_{horizon_minutes}m"
-            pred_df[pred_col] = pred_df["pred"].astype("int64")
-            pred_df[prob_low_col] = pred_df["prob_low"].astype(float)
-            pred_df[prob_neu_col] = pred_df["prob_neutral"].astype(float)
-            pred_df[prob_hi_col] = pred_df["prob_high"].astype(float)
-            pred_df = pred_df.drop(columns=["pred", "prob_low", "prob_neutral", "prob_high"])
 
             if args.mode == "backfill" or prior_wm_i is None:
                 to_write = pred_df.copy()
@@ -1005,7 +1137,8 @@ def main() -> None:
         "family": FAMILY,
         "domain": DOMAIN,
         "task": TASK,
-        "intervals": sorted(set(int(k) for (_, k, _) in tasks)),
+        "intervals": sorted(set(int(k) for (_, k, _, _) in tasks)),
+        "resolved_regime_ceiling_intervals": sorted(set(int(forecast_ceiling_interval(k)) for (_, k, _, _) in tasks)),
         "horizon_minutes": sorted(set(int(hm) for (_, _, hm, _hb) in tasks)),
         "horizon_bars": sorted(set(int(hb) for (_, _, _hm, hb) in tasks)),
         "assets": sorted(set(a for (a, _, _, _) in tasks)),

@@ -116,7 +116,12 @@ def discover_tabular_tested_production_artifact_scope(
 ) -> Optional[TabularTestedProductionArtifactScope]:
     root = (project_root or _project_root()).resolve()
     model_key = module_model_key(module_slug)
-    handoff_paths = sorted((root / "logs" / "diagnostics" / "tabular_numeric_family_test_orchestrator").glob(f"run=*/{model_key}/stage2/run=*/stage3_survivor_handoff.json"))
+    raw_profile_root = str(os.getenv("PIPELINE_TEST_BRANCH_PROFILE_ROOT") or os.getenv("PIPELINE_SANDBOX_DIAGNOSTICS_ROOT") or "").strip()
+    diagnostics_root = (Path(raw_profile_root) if raw_profile_root else root / "logs" / "diagnostics") / "tabular_numeric_family_test_orchestrator"
+    canonical_handoff = diagnostics_root / model_key / "stage2" / "stage3_survivor_handoff.json"
+    handoff_paths = [canonical_handoff] if canonical_handoff.is_file() else []
+    if not handoff_paths:
+        handoff_paths = sorted((root / "logs" / "diagnostics" / "tabular_numeric_family_test_orchestrator").glob(f"run=*/{model_key}/stage2/run=*/stage3_survivor_handoff.json"))
     if not handoff_paths:
         return None
     handoff_path = handoff_paths[-1].resolve()

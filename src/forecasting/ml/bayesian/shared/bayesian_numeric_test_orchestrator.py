@@ -23,6 +23,7 @@ from src.forecasting.ml.shared.test_orchestrator_common import (
     finalize_sandbox_output_args,
     latest_incomplete_run as _shared_latest_incomplete_run,
     load_json_dict,
+    publish_canonical_family_profiles,
     remove_tree,
     resolve_run_root as _shared_resolve_run_root,
     run_complete as _shared_run_complete,
@@ -45,6 +46,7 @@ from src.forecasting.ml.shared.test_orchestrator_common import (
     write_test_branch_health,
     HEALTH_REPORT_FILE,
 )
+from src.forecasting.ml.shared.test_branch_function_telemetry import emit_event, emit_subprocess_event
 from src.forecasting.ml.bayesian.shared.bayesian_numeric_model_registry import (
     BAYESIAN_NUMERIC_BRANCHES,
     BAYESIAN_STAGE0_ENTRYPOINT,
@@ -334,6 +336,7 @@ def run_logged_subprocess(command: Sequence[str], *, cwd: Path, env: Dict[str, s
     log_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path = process_meta_path(log_path)
     started_utc = utc_now_iso()
+    started = time.perf_counter()
     with log_path.open("a", encoding="utf-8") as logf:
         logf.write(f"[{utc_now_iso()}] RUN {' '.join(command)}\n")
         logf.flush()
@@ -353,6 +356,7 @@ def run_logged_subprocess(command: Sequence[str], *, cwd: Path, env: Dict[str, s
         logf.write(f"[{finished_utc}] EXIT {returncode}\n")
         logf.flush()
         if returncode != 0:
+            error = RuntimeError(f"Command failed with exit code {returncode}: {' '.join(command)}")
             write_process_meta(
                 meta_path,
                 status="failed",
@@ -364,9 +368,18 @@ def run_logged_subprocess(command: Sequence[str], *, cwd: Path, env: Dict[str, s
                 started_utc=started_utc,
                 finished_utc=finished_utc,
                 returncode=returncode,
-                error=f"Command failed with exit code {returncode}: {' '.join(command)}",
+                error=str(error),
             )
-            raise RuntimeError(f"Command failed with exit code {returncode}: {' '.join(command)}")
+            emit_subprocess_event(
+                log_path=log_path,
+                command=command,
+                status="failed",
+                family="Bayesian_Numeric",
+                elapsed_seconds=time.perf_counter() - started,
+                reason_code="exception",
+                exception=error,
+            )
+            raise error
         write_process_meta(
             meta_path,
             status="completed",
@@ -379,6 +392,13 @@ def run_logged_subprocess(command: Sequence[str], *, cwd: Path, env: Dict[str, s
             finished_utc=finished_utc,
             returncode=returncode,
         )
+    emit_subprocess_event(
+        log_path=log_path,
+        command=command,
+        status="completed",
+        family="Bayesian_Numeric",
+        elapsed_seconds=time.perf_counter() - started,
+    )
 
 
 def run_with_retries(command: Sequence[str], *, cwd: Path, env: Dict[str, str], log_path: Path, max_attempts: int, retry_delay_seconds: float, cleanup_paths: Optional[Sequence[Path]] = None, progress_name: str) -> None:
@@ -562,6 +582,18 @@ def write_run_state(run_root: Path, args: argparse.Namespace, *, active_model: O
             "health_report_json": str((run_root / HEALTH_REPORT_FILE).resolve()),
         },
     }
+    canonical_profiles: Dict[str, Any] = {}
+    if bool(payload["complete"]):
+        canonical_profiles = publish_canonical_family_profiles(
+            args,
+            run_root=run_root,
+            diagnostics_root_name=DEFAULT_OUTPUT_DIR.name,
+            model_order=MODEL_ORDER,
+            model_paths_fn=model_paths,
+            required_stage3_files=REQUIRED_STAGE3_FILES,
+            family="Bayesian_Numeric",
+        )
+        payload["canonical_profiles"] = canonical_profiles
     write_json_atomic(run_root / RUN_STATE_FILE, payload)
     summary_payload = {
         "generated_utc": payload["generated_utc"],
@@ -569,6 +601,7 @@ def write_run_state(run_root: Path, args: argparse.Namespace, *, active_model: O
         "complete": payload["complete"],
         "stage0_profile": payload["stage0"]["selected_profile"],
         "health": payload["health"],
+        "canonical_profiles": canonical_profiles,
         "stage3_outputs": {model_key: payload["models"][model_key]["stage3"]["artifacts"] for model_key in MODEL_ORDER if payload["models"][model_key]["stage3"]["artifacts"]},
     }
     write_json_atomic(run_root / RUN_SUMMARY_FILE, summary_payload)
@@ -579,6 +612,7 @@ def run_stage0(args: argparse.Namespace, run_root: Path, env: Dict[str, str]) ->
     progress_name = "Bayesian Family Stage 0"
     if stage0_complete(run_root):
         progress_line(f"{progress_name}: already complete, skipping")
+        emit_event(run_root, run_id=run_root.name, family="Bayesian_Numeric", model="family", stage="stage0", function_name="run_stage0", module_name=BAYESIAN_STAGE0_ENTRYPOINT, phase_name="artifact_handoff", status="skipped", reason_code="stage_already_complete", output_path=str(stage0_profile_path(run_root)), artifact_profile_source=str(stage0_profile_path(run_root)))
         return
     progress_line(f"{progress_name}: starting")
     if stage0_dir(run_root).exists():
@@ -609,6 +643,7 @@ def run_stage0(args: argparse.Namespace, run_root: Path, env: Dict[str, str]) ->
     )
     if not stage0_complete(run_root):
         raise RuntimeError("Stage 0 did not leave complete profile artifacts for bayesian family")
+    emit_event(run_root, run_id=run_root.name, family="Bayesian_Numeric", model="family", stage="stage0", function_name="run_stage0", module_name=BAYESIAN_STAGE0_ENTRYPOINT, phase_name="artifact_handoff", status="completed", output_path=str(stage0_profile_path(run_root)), artifact_profile_source=str(stage0_profile_path(run_root)))
 
 
 def run_stage1(spec: BayesianNumericTestModuleSpec, args: argparse.Namespace, run_root: Path, env: Dict[str, str]) -> None:
@@ -616,6 +651,7 @@ def run_stage1(spec: BayesianNumericTestModuleSpec, args: argparse.Namespace, ru
     progress_name = f"{spec.display_name} Stage 1"
     if stage1_complete(paths):
         progress_line(f"{progress_name}: already complete, skipping")
+        emit_event(run_root, run_id=run_root.name, family="Bayesian_Numeric", model=spec.model_key, stage="stage1", function_name="run_stage1", module_name=spec.stage1_module, phase_name="artifact_handoff", status="skipped", reason_code="stage_already_complete", output_path=str(stage1_selection_path(paths)), artifact_profile_source=str(stage1_selection_path(paths)))
         return
     progress_line(f"{progress_name}: starting")
     if paths.stage1_dir.exists():
@@ -629,6 +665,7 @@ def run_stage1(spec: BayesianNumericTestModuleSpec, args: argparse.Namespace, ru
     run_with_retries(command, cwd=args.project_root.resolve(), env=stage_env, log_path=paths.stage1_log, max_attempts=args.max_attempts, retry_delay_seconds=args.retry_delay_seconds, cleanup_paths=[paths.stage1_dir], progress_name=progress_name)
     if not stage1_complete(paths):
         raise RuntimeError(f"Stage 1 did not leave complete artifacts for {spec.model_key}")
+    emit_event(run_root, run_id=run_root.name, family="Bayesian_Numeric", model=spec.model_key, stage="stage1", function_name="run_stage1", module_name=spec.stage1_module, phase_name="artifact_handoff", status="completed", output_path=str(stage1_selection_path(paths)), artifact_profile_source=str(stage1_selection_path(paths)))
 
 
 def run_stage2(spec: BayesianNumericTestModuleSpec, args: argparse.Namespace, run_root: Path, env: Dict[str, str]) -> Path:
@@ -638,6 +675,7 @@ def run_stage2(spec: BayesianNumericTestModuleSpec, args: argparse.Namespace, ru
     survivor_path = stage2_survivor_json_from_manifest(manifest_path)
     if manifest_path is not None and survivor_path is not None:
         progress_line(f"{progress_name}: already complete, skipping")
+        emit_event(run_root, run_id=run_root.name, family="Bayesian_Numeric", model=spec.model_key, stage="stage2", function_name="run_stage2", module_name=spec.stage2_module, phase_name="artifact_handoff", status="skipped", reason_code="stage_already_complete", output_path=str(survivor_path), artifact_profile_source=str(manifest_path))
         return manifest_path
     progress_line(f"{progress_name}: starting")
     write_run_state(run_root, args, active_model=spec.model_key, active_stage="stage2")
@@ -650,7 +688,9 @@ def run_stage2(spec: BayesianNumericTestModuleSpec, args: argparse.Namespace, ru
     manifest_path = discover_latest_stage2_manifest(paths.stage2_root)
     survivor_path = stage2_survivor_json_from_manifest(manifest_path)
     if manifest_path is None or survivor_path is None:
+        emit_event(run_root, run_id=run_root.name, family="Bayesian_Numeric", model=spec.model_key, stage="stage2", function_name="run_stage2", module_name=spec.stage2_module, phase_name="artifact_handoff", status="failed", reason_code="artifact_missing", output_path=str(paths.stage2_root))
         raise RuntimeError(f"Stage 2 did not leave complete staged handoff artifacts for {spec.model_key}")
+    emit_event(run_root, run_id=run_root.name, family="Bayesian_Numeric", model=spec.model_key, stage="stage2", function_name="run_stage2", module_name=spec.stage2_module, phase_name="artifact_handoff", status="completed", output_path=str(survivor_path), artifact_profile_source=str(manifest_path))
     return manifest_path
 
 
@@ -659,6 +699,7 @@ def run_stage3(spec: BayesianNumericTestModuleSpec, args: argparse.Namespace, ru
     progress_name = f"{spec.display_name} Stage 3"
     if stage3_complete(paths):
         progress_line(f"{progress_name}: already complete, skipping")
+        emit_event(run_root, run_id=run_root.name, family="Bayesian_Numeric", model=spec.model_key, stage="stage3", function_name="run_stage3", module_name=spec.stage3_module, phase_name="artifact_handoff", status="skipped", reason_code="stage_already_complete", output_path=str(paths.stage3_dir))
         return
     survivor_json = stage2_survivor_json_from_manifest(stage2_manifest)
     if survivor_json is None:
@@ -675,7 +716,9 @@ def run_stage3(spec: BayesianNumericTestModuleSpec, args: argparse.Namespace, ru
         stage_env.update(bayesian_thread_env(selected_threads))
     run_with_retries(command, cwd=args.project_root.resolve(), env=stage_env, log_path=paths.stage3_log, max_attempts=args.max_attempts, retry_delay_seconds=args.retry_delay_seconds, cleanup_paths=[paths.stage3_dir], progress_name=progress_name)
     if not stage3_complete(paths):
+        emit_event(run_root, run_id=run_root.name, family="Bayesian_Numeric", model=spec.model_key, stage="stage3", function_name="run_stage3", module_name=spec.stage3_module, phase_name="artifact_handoff", status="failed", reason_code="stage_artifact_missing", output_path=str(paths.stage3_dir))
         raise RuntimeError(f"Stage 3 did not leave complete artifacts for {spec.model_key}")
+    emit_event(run_root, run_id=run_root.name, family="Bayesian_Numeric", model=spec.model_key, stage="stage3", function_name="run_stage3", module_name=spec.stage3_module, phase_name="artifact_handoff", status="completed", output_path=str(paths.stage3_dir))
 
 
 def run_orchestrator(args: argparse.Namespace) -> Path:

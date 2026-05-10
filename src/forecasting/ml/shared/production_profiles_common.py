@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -22,15 +23,23 @@ def fallback_combo_specs(default_intervals: Sequence[int], default_horizons: Seq
 
 
 def diagnostics_root(*, diagnostics_root_name: str, model_key: str) -> Path:
-    return (Path.cwd() / "logs" / "diagnostics" / str(diagnostics_root_name) / str(model_key)).resolve()
+    raw_root = str(os.getenv("PIPELINE_TEST_BRANCH_PROFILE_ROOT") or os.getenv("PIPELINE_SANDBOX_DIAGNOSTICS_ROOT") or "").strip()
+    root = Path(raw_root) if raw_root else Path.cwd() / "logs" / "diagnostics"
+    return (root / str(diagnostics_root_name) / str(model_key)).resolve()
 
 
 def latest_combo_results_path(*, diagnostics_root_name: str, model_key: str) -> Optional[Path]:
     direct_root = diagnostics_root(diagnostics_root_name=diagnostics_root_name, model_key=model_key)
     orchestrator_root = (Path.cwd() / "logs" / "diagnostics" / str(diagnostics_root_name)).resolve()
     candidates: List[Path] = []
+    canonical_combo = direct_root / "stage3" / "combo_results.csv"
+    if canonical_combo.is_file():
+        return canonical_combo.resolve()
     if direct_root.exists():
         candidates.extend(path for path in direct_root.rglob("combo_results.csv") if path.is_file())
+    cwd_direct_root = (orchestrator_root / str(model_key)).resolve()
+    if cwd_direct_root != direct_root and cwd_direct_root.exists():
+        candidates.extend(path for path in cwd_direct_root.rglob("combo_results.csv") if path.is_file())
     if orchestrator_root.exists():
         candidates.extend(
             path

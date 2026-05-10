@@ -43,6 +43,7 @@ from src.forecasting.ml.tabular.shared.tabular_numeric_model_registry import (
     resolve_default_tasks,
     write_runtime_config_for_model,
 )
+from src.forecasting.ml.shared.test_branch_function_telemetry import emit_event_for_path
 
 
 DEFAULT_MODEL_KEY = "xgboost"
@@ -1213,6 +1214,89 @@ def write_unit_artifacts(output_dir: Path, stage_result: dict) -> int:
     return count
 
 
+def emit_stage_function_telemetry(output_dir: Path, model_key: str, stage_result: dict) -> None:
+    config = stage_result.get("config") or {}
+    unit_diag = stage_result.get("unit_diag") or {}
+    by_asset_pair = ((stage_result.get("accuracy") or {}).get("by_asset_target_horizon") or {})
+    stage_name = f"stage{int(stage_result.get('stage_index', 0) or 0)}"
+    interval_raw = str(config.get("interval") or "0m").rstrip("m")
+    try:
+        interval_minutes = int(interval_raw)
+    except Exception:
+        interval_minutes = None
+    asset_count = len(config.get("assets") or [])
+    forecast_rows = 0
+    for combo_payloads in by_asset_pair.values():
+        for metrics in (combo_payloads or {}).values():
+            forecast_rows += int((metrics or {}).get("forecast_count", 0) or 0)
+    selected_window_rows = sum(int((diag or {}).get("selected_window_bars", 0) or 0) for diag in unit_diag.values())
+    for phase_name, seconds_key, function_name in (
+        ("source_read", "load_s", "load_module_inputs"),
+        ("label_build", "future_label_s", "compute_future_labels"),
+        ("fit", "fit_s", "fit_models"),
+        ("predict", "predict_s", "predict_outputs"),
+        ("write", "write_s", "write_outputs"),
+    ):
+        total_seconds = sum(float((diag or {}).get(seconds_key, 0.0) or 0.0) for diag in unit_diag.values())
+        emit_event_for_path(
+            output_dir,
+            family="Tabular_Numeric",
+            model=str(model_key),
+            stage=stage_name,
+            interval_minutes=interval_minutes,
+            asset_count=asset_count,
+            function_name=function_name,
+            module_name=__name__,
+            phase_name=phase_name,
+            parent_phase="diagnostics",
+            status="completed",
+            elapsed_seconds=total_seconds,
+            input_rows=(selected_window_rows if phase_name in {"fit", "predict"} else len(unit_diag)),
+            output_rows=(forecast_rows if phase_name in {"predict", "write"} else len(unit_diag)),
+            reason_code=("predict_returned_empty" if phase_name == "predict" and forecast_rows == 0 else ""),
+            output_path=str((stage_result.get("paths") or {}).get("run_summary", "")),
+        )
+    verification = stage_result.get("output_verification") or {}
+    failures = list(verification.get("failures") or [])[:20]
+    emit_event_for_path(
+        output_dir,
+        family="Tabular_Numeric",
+        model=str(model_key),
+        stage=stage_name,
+        interval_minutes=interval_minutes,
+        asset_count=asset_count,
+        function_name="verify_full_month_outputs",
+        module_name=__name__,
+        phase_name="validation",
+        parent_phase="diagnostics",
+        status="completed",
+        reason_code=("validation_dropped_all_rows" if failures else ""),
+        input_rows=len(unit_diag),
+        output_rows=max(0, len(unit_diag) - len(failures)),
+        output_path=str((stage_result.get("paths") or {}).get("run_summary", "")),
+    )
+    for failure in failures:
+        emit_event_for_path(
+            output_dir,
+            family="Tabular_Numeric",
+            model=str(model_key),
+            stage=stage_name,
+            combo_key=f"{interval_minutes}:{int(failure.get('horizon_minutes', 0) or 0)}:{failure.get('task')}",
+            interval_minutes=interval_minutes,
+            horizon_minutes=int(failure.get("horizon_minutes", 0) or 0),
+            task=str(failure.get("task") or ""),
+            asset=str(failure.get("asset") or ""),
+            function_name="verify_full_month_outputs",
+            module_name=__name__,
+            phase_name="validation",
+            parent_phase="diagnostics",
+            status="completed",
+            reason_code="validation_dropped_all_rows",
+            input_rows=int(failure.get("expected_rows", 0) or 0),
+            output_rows=int(failure.get("forecast_rows", 0) or 0),
+        )
+
+
 def stage_run_dir(output_dir: Path, interval_minutes: int, workers: int, model_threads: int, train_window_months: Optional[int]) -> Path:
     runtime_profile = runtime_profile_name(int(workers), int(model_threads))
     training_window_label = month_label(train_window_months)
@@ -1787,6 +1871,7 @@ def run_stage(
     (run_dir / "run_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     result["artifact_count"] = int(write_unit_artifacts(output_dir, result))
     (run_dir / "run_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    emit_stage_function_telemetry(output_dir, CURRENT_MODEL_SPEC.model_key, result)
     if return_code != 0:
         raise RuntimeError(
             "Diagnostic stage failed: "

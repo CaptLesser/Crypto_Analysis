@@ -2291,7 +2291,12 @@ def discover_tested_production_artifact_payload(
     artifact_model_key: str,
     error_prefix: str,
 ) -> Optional[Dict[str, Any]]:
-    handoff_paths = sorted((project_root / "logs" / "diagnostics" / diagnostics_root_name).glob(f"run=*/{artifact_model_key}/stage2/run=*/stage3_survivor_handoff.json"))
+    raw_profile_root = str(os.getenv("PIPELINE_TEST_BRANCH_PROFILE_ROOT") or os.getenv("PIPELINE_SANDBOX_DIAGNOSTICS_ROOT") or "").strip()
+    diagnostics_root = (Path(raw_profile_root) if raw_profile_root else project_root / "logs" / "diagnostics") / diagnostics_root_name
+    canonical_handoff = diagnostics_root / artifact_model_key / "stage2" / "stage3_survivor_handoff.json"
+    handoff_paths = [canonical_handoff] if canonical_handoff.is_file() else []
+    if not handoff_paths:
+        handoff_paths = sorted((project_root / "logs" / "diagnostics" / diagnostics_root_name).glob(f"run=*/{artifact_model_key}/stage2/run=*/stage3_survivor_handoff.json"))
     if not handoff_paths:
         return None
     handoff_path = handoff_paths[-1].resolve()
@@ -2318,7 +2323,10 @@ def discover_tested_production_artifact_payload(
         )
     )
     cohort_assets = tuple(sorted({str(asset) for asset in (payload.get("cohort_assets") or []) if str(asset).strip()}))
-    stage3_combo_results_path = (handoff_path.parents[2] / "stage3" / "combo_results.csv").resolve()
+    if handoff_path.name == "stage3_survivor_handoff.json" and handoff_path.parent.name == "stage2":
+        stage3_combo_results_path = (handoff_path.parents[1] / "stage3" / "combo_results.csv").resolve()
+    else:
+        stage3_combo_results_path = (handoff_path.parents[2] / "stage3" / "combo_results.csv").resolve()
     stage3_combo_specs, tuned_params_by_combo = load_stage3_combo_results(stage3_combo_results_path)
     return {
         "handoff_path": handoff_path,

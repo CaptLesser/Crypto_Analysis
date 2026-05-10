@@ -14,9 +14,12 @@ from src.forecasting.common.io_atomic import atomic_replace, sibling_temp_path
 from src.forecasting.common.path_config import resolve_path, selected_profile
 from src.forecasting.ml.shared.stage0_profile_common import (
     candidate_key,
+    emit_stage0_event,
+    emit_stage0_profile_artifacts,
     measure_branch_run,
     parse_int_csv,
     parse_str_csv,
+    stage0_telemetry_scope,
     timestamp_utc,
     write_candidate_csv,
 )
@@ -207,6 +210,21 @@ def _run_candidate(
             branch_combos = [(int(interval), int(horizon), sorted(supported_tasks)[0])]
         if not branch_combos:
             _progress(f"Stats Stage 0 candidate={candidate} branch={model_key} skipped no compatible probe combos")
+            emit_stage0_event(
+                candidate_root,
+                family="Stats_Numeric",
+                model=str(model_key),
+                function_name="_run_candidate",
+                module_name=__name__,
+                phase_name="combo_planning",
+                parent_phase="profile_creation",
+                status="skipped",
+                reason_code="profile_missing",
+                input_rows=len(combos),
+                output_rows=0,
+                asset_count=len(assets),
+                output_path=str(candidate_root),
+            )
             continue
         branch_parquet_root = candidate_root / "parquet" / str(model_key)
         branch_output_dir = branch_parquet_root / STATS_NUMERIC_FAMILY_ROOT_NAMES[str(model_key)]
@@ -240,15 +258,29 @@ def _run_candidate(
             f"workers={int(workers)} threads={int(threads)} combos={len(branch_combos)} assets={len(assets)}"
         )
         branch_started = time.perf_counter()
-        metrics = measure_branch_run(
-            command=command,
-            env=env,
-            cwd=Path(args.project_root),
-            log_path=candidate_root / "logs" / f"{model_key}.log",
-            output_dir=branch_output_dir,
-            sample_seconds=float(args.sample_seconds),
-            psutil_module=psutil,
-        )
+        with stage0_telemetry_scope(
+            candidate_root,
+            family="Stats_Numeric",
+            model=str(model_key),
+            function_name="measure_branch_run",
+            module_name=__name__,
+            phase_name="profile_candidate_probe",
+            parent_phase="profile_creation",
+            combo_key=branch_combo_list_arg,
+            asset_count=len(assets),
+            source_path=str(args.parquet_root),
+            output_path=str(branch_output_dir),
+        ) as telemetry:
+            metrics = measure_branch_run(
+                command=command,
+                env=env,
+                cwd=Path(args.project_root),
+                log_path=candidate_root / "logs" / f"{model_key}.log",
+                output_dir=branch_output_dir,
+                sample_seconds=float(args.sample_seconds),
+                psutil_module=psutil,
+            )
+            telemetry.update(output_rows=1)
         metrics["model_key"] = str(model_key)
         metrics["combo_count"] = int(len(branch_combos))
         _progress(
@@ -319,9 +351,36 @@ def run_stage0(args: argparse.Namespace) -> Path:
     output_dir = Path(args.output_dir) if args.output_dir is not None else _default_output_dir(Path(args.project_root))
     output_dir.mkdir(parents=True, exist_ok=True)
     combos = _parse_combo_list(str(args.combo_list))
+    emit_stage0_event(
+        output_dir,
+        family="Stats_Numeric",
+        function_name="run_stage0",
+        module_name=__name__,
+        phase_name="combo_planning",
+        status="completed" if combos else "skipped",
+        reason_code="" if combos else "profile_missing",
+        input_rows=1,
+        output_rows=len(combos),
+        source_path=str(args.parquet_root),
+        output_path=str(output_dir),
+    )
     if not combos:
         raise SystemExit("Stats Stage 0 requires at least one combo in --combo-list")
     assets = _resolve_assets(args, combos)
+    emit_stage0_event(
+        output_dir,
+        family="Stats_Numeric",
+        function_name="_resolve_assets",
+        module_name=__name__,
+        phase_name="asset_cohort_selection",
+        status="completed" if assets else "skipped",
+        reason_code="" if assets else "no_assets",
+        input_rows=len(combos),
+        output_rows=len(assets),
+        asset_count=len(assets),
+        source_path=str(args.parquet_root),
+        output_path=str(output_dir),
+    )
     if not assets:
         raise SystemExit("Stats Stage 0 could not resolve any assets for the probe run")
 
@@ -384,8 +443,20 @@ def run_stage0(args: argparse.Namespace) -> Path:
         "ram_cap_pct": float(args.ram_cap_pct),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
-    _write_json(output_dir / "stats_numeric_stage0_profile.json", payload)
-    _write_candidates(output_dir / "stats_numeric_stage0_candidates.csv", results)
+    profile_path = output_dir / "stats_numeric_stage0_profile.json"
+    candidates_path = output_dir / "stats_numeric_stage0_candidates.csv"
+    _write_json(profile_path, payload)
+    _write_candidates(candidates_path, results)
+    emit_stage0_profile_artifacts(
+        output_dir,
+        family="Stats_Numeric",
+        profile_path=profile_path,
+        candidates_path=candidates_path,
+        candidates=results,
+        selected_profile=dict(payload.get("selected_profile") or {}),
+        asset_count=len(payload.get("assets") or []),
+        combo_count=len(combos),
+    )
     return output_dir
 
 

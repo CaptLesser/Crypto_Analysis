@@ -26,8 +26,21 @@ DEFAULT_MODEL_OUTPUT_PREFIXES: Tuple[str, ...] = (
 DEFAULT_REGIME_LABEL_COLUMNS: Tuple[str, ...] = (
     "regime_3",
     "regime_3_idx",
+    "band",
+    "ceiling_interval_min",
+    "feature_schema_hash",
+    "trend_cluster_id",
     "trend_label",
+    "trend_confidence_pct",
+    "trend_intensity_pct",
+    "vol_cluster_id",
     "vol_label",
+    "vol_confidence_pct",
+    "vol_intensity_pct",
+    "activity_cluster_id",
+    "activity_label",
+    "activity_confidence_pct",
+    "activity_intensity_pct",
 )
 
 _LOGGER_CACHE: Dict[str, logging.Logger] = {}
