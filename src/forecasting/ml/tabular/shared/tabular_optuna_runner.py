@@ -13,7 +13,7 @@ from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import optuna
@@ -677,6 +677,24 @@ def baseline_params_with_threads(spec: ComboSpec, model_threads: int) -> Dict[st
     return dict(CURRENT_OPTUNA_PROFILE.resolve_baseline_params(task=spec.task, model_threads=int(model_threads), combo=spec))
 
 
+def _cost_param_telemetry(params: Mapping[str, Any]) -> Dict[str, Any]:
+    def pick(*names: str) -> Any:
+        for name in names:
+            if name in params:
+                return params.get(name)
+        return None
+
+    return {
+        "model_iterations": pick("iterations", "n_estimators", "num_boost_round"),
+        "model_depth": pick("depth", "max_depth"),
+        "learning_rate": pick("learning_rate", "eta"),
+        "bootstrap_type": pick("bootstrap_type"),
+        "subsample": pick("subsample", "bagging_fraction", "rsm"),
+        "thread_count": pick("thread_count", "thread_count_", "nthread", "n_jobs"),
+        "early_stopping_rounds": pick("early_stopping_rounds", "od_wait"),
+    }
+
+
 def trial_params(trial: optuna.Trial, spec: ComboSpec) -> Dict[str, Any]:
     return dict(CURRENT_OPTUNA_PROFILE.suggest_trial_params(trial, spec))
 
@@ -890,6 +908,8 @@ def run_study_for_combo(
     baseline_eval_s = time.monotonic() - t_baseline
     baseline_summary = summarize_metrics(baseline_metrics)
     trial_rows: List[Dict[str, Any]] = []
+    combo_input_rows = sum(len(dataset.df) for dataset in datasets)
+    combo_feature_count = max((len(dataset.x_cols) for dataset in datasets), default=0)
 
     def objective(trial: optuna.Trial) -> float:
         params = baseline_params_with_threads(combo, int(model_threads))
@@ -908,6 +928,7 @@ def run_study_for_combo(
             interim_rmse = float(rmse_num / rows) if rows > 0 else float("inf")
             trial.report(interim_rmse, step=step_idx)
             if trial.should_prune():
+                elapsed_s = float(time.monotonic() - started)
                 with trial_lock:
                     trial_rows.append(
                         {
@@ -917,12 +938,49 @@ def run_study_for_combo(
                             "objective_rmse": (None if not math.isfinite(interim_rmse) else float(interim_rmse)),
                             "weighted_mae": (float(mae_num / rows) if rows > 0 else None),
                             "rows": int(rows),
-                            "elapsed_s": float(time.monotonic() - started),
+                            "elapsed_s": elapsed_s,
                             "params": dict(params),
                         }
                     )
+                emit_event_for_path(
+                    telemetry_path,
+                    family="Tabular_Numeric",
+                    model=str(CURRENT_MODEL_SPEC.model_key),
+                    stage="stage3",
+                    function_name="optuna.trial",
+                    module_name=__name__,
+                    phase_name="trial",
+                    parent_phase="tuning",
+                    event_type="trial",
+                    status="pruned",
+                    reason_code="trial_pruned",
+                    combo_key=combo.tuple_label,
+                    interval_minutes=int(combo.interval),
+                    horizon_minutes=int(combo.horizon_minutes),
+                    training_window_months=int(combo.training_window_months),
+                    task=str(combo.task),
+                    trial_number=int(trial.number),
+                    trial_state="PRUNED",
+                    elapsed_seconds=elapsed_s,
+                    eval_elapsed_seconds=elapsed_s,
+                    input_rows=int(combo_input_rows),
+                    output_rows=int(rows),
+                    eval_rows=int(rows),
+                    asset_count=len(datasets),
+                    selected_feature_count=int(combo_feature_count),
+                    baseline_metric=baseline_summary.get("weighted_rmse"),
+                    trial_metric=(None if not math.isfinite(interim_rmse) else float(interim_rmse)),
+                    metric_delta=(
+                        float(interim_rmse) - float(baseline_summary["weighted_rmse"])
+                        if math.isfinite(interim_rmse) and baseline_summary.get("weighted_rmse") is not None
+                        else None
+                    ),
+                    objective_direction="minimize",
+                    **_cost_param_telemetry(params),
+                )
                 raise optuna.TrialPruned()
         objective_value = float(rmse_num / rows) if rows > 0 else float("inf")
+        elapsed_s = float(time.monotonic() - started)
         with trial_lock:
             trial_rows.append(
                 {
@@ -932,10 +990,46 @@ def run_study_for_combo(
                     "objective_rmse": (None if not math.isfinite(objective_value) else float(objective_value)),
                     "weighted_mae": (float(mae_num / rows) if rows > 0 else None),
                     "rows": int(rows),
-                    "elapsed_s": float(time.monotonic() - started),
+                    "elapsed_s": elapsed_s,
                     "params": dict(params),
                 }
             )
+        emit_event_for_path(
+            telemetry_path,
+            family="Tabular_Numeric",
+            model=str(CURRENT_MODEL_SPEC.model_key),
+            stage="stage3",
+            function_name="optuna.trial",
+            module_name=__name__,
+            phase_name="trial",
+            parent_phase="tuning",
+            event_type="trial",
+            status="completed" if rows > 0 else "skipped",
+            reason_code="" if rows > 0 else "predict_returned_empty",
+            combo_key=combo.tuple_label,
+            interval_minutes=int(combo.interval),
+            horizon_minutes=int(combo.horizon_minutes),
+            training_window_months=int(combo.training_window_months),
+            task=str(combo.task),
+            trial_number=int(trial.number),
+            trial_state="COMPLETE",
+            elapsed_seconds=elapsed_s,
+            eval_elapsed_seconds=elapsed_s,
+            input_rows=int(combo_input_rows),
+            output_rows=int(rows),
+            eval_rows=int(rows),
+            asset_count=len(datasets),
+            selected_feature_count=int(combo_feature_count),
+            baseline_metric=baseline_summary.get("weighted_rmse"),
+            trial_metric=(None if not math.isfinite(objective_value) else float(objective_value)),
+            metric_delta=(
+                float(objective_value) - float(baseline_summary["weighted_rmse"])
+                if math.isfinite(objective_value) and baseline_summary.get("weighted_rmse") is not None
+                else None
+            ),
+            objective_direction="minimize",
+            **_cost_param_telemetry(params),
+        )
         return objective_value
 
     storage_url = task_storage_for(storage, combo)
@@ -948,6 +1042,9 @@ def run_study_for_combo(
         module_name=__name__,
         phase_name="study_setup",
         parent_phase="tuning",
+        event_type="setup_control",
+        setup_control=True,
+        row_producing=False,
         combo_key=combo.tuple_label,
         interval_minutes=int(combo.interval),
         horizon_minutes=int(combo.horizon_minutes),
@@ -991,7 +1088,16 @@ def run_study_for_combo(
                 show_progress_bar=False,
                 n_jobs=int(trial_workers),
             )
-            optimize_scope.update(output_rows=len(trial_rows))
+            optimize_scope.update(
+                output_rows=len(trial_rows),
+                trial_count=len(trial_rows),
+                completed_count=sum(1 for row in trial_rows if str(row.get("state")) == "COMPLETE"),
+                pruned_count=sum(1 for row in trial_rows if str(row.get("state")) == "PRUNED"),
+                failed_count=sum(1 for row in trial_rows if str(row.get("state")) == "FAIL"),
+                asset_count=len(datasets),
+                selected_feature_count=int(combo_feature_count),
+                thread_count=int(model_threads),
+            )
     study_elapsed_s = time.monotonic() - t_study
     best_params = baseline_params_with_threads(combo, int(model_threads))
     if study.trials:
@@ -1036,6 +1142,50 @@ def run_study_for_combo(
         input_rows=len(tuned_metrics),
         output_rows=int(tuned_summary.get("rows", 0) or 0),
     )
+    completed_trials = sum(1 for row in trial_rows if str(row.get("state")) == "COMPLETE")
+    pruned_trials = sum(1 for row in trial_rows if str(row.get("state")) == "PRUNED")
+    failed_trials = sum(1 for row in trial_rows if str(row.get("state")) == "FAIL")
+    rmse_delta = (
+        float(tuned_summary["weighted_rmse"]) - float(baseline_summary["weighted_rmse"])
+        if baseline_summary.get("weighted_rmse") is not None and tuned_summary.get("weighted_rmse") is not None
+        else None
+    )
+    emit_event_for_path(
+        telemetry_path,
+        family="Tabular_Numeric",
+        model=str(CURRENT_MODEL_SPEC.model_key),
+        stage="stage3",
+        function_name="run_study_for_combo",
+        module_name=__name__,
+        phase_name="combo_summary",
+        parent_phase="tuning",
+        event_type="combo_summary",
+        status="completed" if int(tuned_summary.get("rows", 0) or 0) > 0 else "skipped",
+        reason_code="" if int(tuned_summary.get("rows", 0) or 0) > 0 else "predict_returned_empty",
+        combo_key=combo.tuple_label,
+        interval_minutes=int(combo.interval),
+        horizon_minutes=int(combo.horizon_minutes),
+        training_window_months=int(combo.training_window_months),
+        task=str(combo.task),
+        elapsed_seconds=float(study_elapsed_s + tuned_eval_s + baseline_eval_s),
+        fit_elapsed_seconds=float(study_elapsed_s),
+        eval_elapsed_seconds=float(tuned_eval_s),
+        input_rows=int(combo_input_rows),
+        output_rows=int(tuned_summary.get("rows", 0) or 0),
+        eval_rows=int(tuned_summary.get("rows", 0) or 0),
+        asset_count=len(datasets),
+        selected_feature_count=int(combo_feature_count),
+        trial_count=len(trial_rows),
+        completed_count=int(completed_trials),
+        pruned_count=int(pruned_trials),
+        failed_count=int(failed_trials),
+        baseline_metric=baseline_summary.get("weighted_rmse"),
+        tuned_metric=tuned_summary.get("weighted_rmse"),
+        metric_delta=rmse_delta,
+        best_value=(float(study.best_value) if study.trials else None),
+        objective_direction="minimize",
+        **_cost_param_telemetry(best_params),
+    )
     emit_stage3_study_summary_for_path(
         telemetry_path,
         family="Tabular_Numeric",
@@ -1067,11 +1217,7 @@ def run_study_for_combo(
         "tuned_mae": tuned_summary.get("weighted_mae"),
         "baseline_rows": baseline_summary.get("rows"),
         "tuned_rows": tuned_summary.get("rows"),
-        "rmse_delta": (
-            float(tuned_summary["weighted_rmse"]) - float(baseline_summary["weighted_rmse"])
-            if baseline_summary.get("weighted_rmse") is not None and tuned_summary.get("weighted_rmse") is not None
-            else None
-        ),
+        "rmse_delta": rmse_delta,
         "mae_delta": (
             float(tuned_summary["weighted_mae"]) - float(baseline_summary["weighted_mae"])
             if baseline_summary.get("weighted_mae") is not None and tuned_summary.get("weighted_mae") is not None

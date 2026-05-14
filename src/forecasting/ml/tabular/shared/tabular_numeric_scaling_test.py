@@ -432,6 +432,17 @@ def validate_seeded_forecast_edge(
     return sorted({f"{task}:{int(horizon)}m" for task, horizon, _ in requested}), missing_by_asset
 
 
+def apply_nested_module_sandbox_roots(env: Dict[str, str], module_root: Path) -> None:
+    if str(env.get("PIPELINE_SANDBOX_MODE", "") or "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    env["PIPELINE_SANDBOX_OUTPUT_ROOT"] = str(module_root)
+    env["PIPELINE_SANDBOX_PARQUET_ROOT"] = str(module_root / "parquet")
+    env["PIPELINE_SANDBOX_LOG_ROOT"] = str(module_root / "logs")
+    env["PIPELINE_SANDBOX_STATE_ROOT"] = str(module_root / "model_states")
+    env["PIPELINE_SANDBOX_TMP_ROOT"] = str(module_root / "tmp")
+    env["PIPELINE_SANDBOX_CATBOOST_TRAIN_DIR"] = str(module_root / "tmp" / "catboost_train")
+
+
 def parse_log_ts(line: str) -> Optional[float]:
     match = re.match(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC\]", line)
     if not match:
@@ -1503,6 +1514,7 @@ def run_stage(
     env["PIPELINE_PARQUET_ROOT"] = str(parquet_root)
     env["PIPELINE_PARQUET_FEATURES_ROOT"] = str(parquet_root)
     env[CURRENT_MODEL_SPEC.parquet_root_env] = str(module_root / "parquet")
+    apply_nested_module_sandbox_roots(env, module_root)
     env[CURRENT_MODEL_SPEC.train_windows_env] = str(int(train_window_bars))
     env[CURRENT_MODEL_SPEC.progress_seconds_env] = "600"
     max_horizon_bars = max(max(1, int(h) // int(interval_minutes)) for h in requested_horizons) if requested_horizons else 1

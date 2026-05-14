@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from collections import defaultdict
+import math
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import DefaultDict, Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Sequence
 
 import numpy as np
 import pandas as pd
@@ -28,6 +30,41 @@ LEGACY_DYNAMIC_FEATURE_ALIASES: Dict[str, tuple[str, ...]] = {
     "ret_std_60": ("ret_std_20",),
     "ret_std_120": ("ret_std_20",),
 }
+
+_STAGE1_SCORE_NEAR_TIE_TOLERANCE = 1e-12
+
+
+@dataclass
+class _StreamingFeatureStats:
+    n: int = 0
+    sum_x: float = 0.0
+    sum_y: float = 0.0
+    sum_x2: float = 0.0
+    sum_y2: float = 0.0
+    sum_xy: float = 0.0
+
+    def add(self, x: np.ndarray, y: np.ndarray) -> None:
+        self.n += int(x.size)
+        self.sum_x += float(x.sum())
+        self.sum_y += float(y.sum())
+        self.sum_x2 += float(np.dot(x, x))
+        self.sum_y2 += float(np.dot(y, y))
+        self.sum_xy += float(np.dot(x, y))
+
+    def score(self) -> float | None:
+        if self.n <= 0:
+            return None
+        n = float(self.n)
+        cov_num = self.sum_xy - (self.sum_x * self.sum_y / n)
+        x_var_num = self.sum_x2 - (self.sum_x * self.sum_x / n)
+        y_var_num = self.sum_y2 - (self.sum_y * self.sum_y / n)
+        denom = math.sqrt(max(0.0, x_var_num) * max(0.0, y_var_num))
+        if denom <= 0.0:
+            return None
+        corr = cov_num / denom
+        if not np.isfinite(corr):
+            return None
+        return float(abs(corr))
 
 
 def _horizon_bars(horizon_minutes: int, interval_minutes: int) -> int:
@@ -65,6 +102,110 @@ def _resolve_actual_feature_name(requested_feature_name: str, available_columns:
     return None
 
 
+def _legacy_score_feature_frames(
+    frames: Sequence[pd.DataFrame],
+    *,
+    requested: Sequence[str],
+    target_col: str,
+    min_feature_rows: int,
+) -> List[tuple[str, float, int]]:
+    per_feature_pairs: Dict[str, List[tuple[float, float]]] = {}
+    for merged in frames:
+        if target_col not in merged.columns:
+            continue
+        y = pd.to_numeric(merged[target_col], errors="coerce").to_numpy(dtype=float)
+        for requested_name in requested:
+            actual_name = _resolve_actual_feature_name(requested_name, merged.columns)
+            if actual_name is None or actual_name not in merged.columns:
+                continue
+            x = pd.to_numeric(merged[actual_name], errors="coerce").to_numpy(dtype=float)
+            mask = np.isfinite(x) & np.isfinite(y)
+            if int(mask.sum()) < int(min_feature_rows):
+                continue
+            xx = x[mask]
+            yy = y[mask]
+            if np.unique(xx).size <= 1 or np.unique(yy).size <= 1:
+                continue
+            pairs = per_feature_pairs.setdefault(str(actual_name), [])
+            pairs.extend((float(xv), float(yv)) for xv, yv in zip(xx, yy))
+
+    scored_features: List[tuple[str, float, int]] = []
+    for feature_name, pairs in per_feature_pairs.items():
+        if len(pairs) < int(min_feature_rows):
+            continue
+        xvals = np.asarray([pair[0] for pair in pairs], dtype=float)
+        yvals = np.asarray([pair[1] for pair in pairs], dtype=float)
+        if xvals.size < int(min_feature_rows) or np.unique(xvals).size <= 1 or np.unique(yvals).size <= 1:
+            continue
+        corr = np.corrcoef(xvals, yvals)[0, 1]
+        if not np.isfinite(corr):
+            continue
+        scored_features.append((str(feature_name), float(abs(corr)), int(xvals.size)))
+    scored_features.sort(key=lambda item: (-item[1], -item[2], item[0]))
+    return scored_features
+
+
+def _legacy_score_stage1_sources(
+    *,
+    parquet_root: Path,
+    asset_list: Sequence[str],
+    interval_minutes: int,
+    common_edge_ts: int,
+    history_start_ts: int,
+    feature_pool: Sequence[str],
+    requested: Sequence[str],
+    target_col: str,
+    horizon_bars: int,
+    min_feature_rows: int,
+) -> List[tuple[str, float, int]]:
+    frames: List[pd.DataFrame] = []
+    for asset_name in asset_list:
+        ohlc_frame = read_ohlcvt(
+            root=Path(parquet_root),
+            asset=str(asset_name),
+            interval_min=int(interval_minutes),
+            start_ts=int(history_start_ts),
+            end_ts=int(common_edge_ts),
+            columns=["ts", "asset", "high", "low", "close"],
+        )
+        if ohlc_frame.empty:
+            continue
+        feature_frame = read_feature_window_columns(
+            root=Path(parquet_root),
+            interval_minutes=int(interval_minutes),
+            asset=str(asset_name),
+            columns=feature_pool,
+            start_ts=int(history_start_ts),
+            end_ts=int(common_edge_ts),
+        )
+        merged = ohlc_frame.merge(feature_frame, on=["ts", "asset"], how="left", sort=True).reset_index(drop=True)
+        labels, _stats = compute_future_labels(
+            merged.loc[:, ["high", "low", "close"]].reset_index(drop=True),
+            int(horizon_bars),
+            future_direction_deadzone=0.0,
+            target_columns=[target_col],
+        )
+        if target_col in merged.columns and target_col in labels.columns:
+            merged = merged.drop(columns=[target_col])
+        merged = pd.concat([merged, labels.reset_index(drop=True)], axis=1)
+        frames.append(merged)
+    return _legacy_score_feature_frames(
+        frames,
+        requested=requested,
+        target_col=target_col,
+        min_feature_rows=int(min_feature_rows),
+    )
+
+
+def _scores_need_legacy_boundary_order(scores: Sequence[tuple[str, float, int]], max_features: int) -> bool:
+    selected_count = max(1, int(max_features))
+    if len(scores) <= 1 or selected_count >= len(scores):
+        return False
+    selected_boundary = float(scores[selected_count - 1][1])
+    first_unselected = float(scores[selected_count][1])
+    return abs(selected_boundary - first_unselected) <= _STAGE1_SCORE_NEAR_TIE_TOLERANCE
+
+
 def select_stage1_dynamic_feature_columns(
     *,
     parquet_root: Path,
@@ -82,6 +223,7 @@ def select_stage1_dynamic_feature_columns(
     stage: str = "stage1",
     combo_key: str | None = None,
 ) -> List[str]:
+    started = time.perf_counter()
     base_event = {
         "family": family,
         "model": model,
@@ -92,6 +234,7 @@ def select_stage1_dynamic_feature_columns(
         "task": str(task),
         "module_name": __name__,
         "asset_count": len(asset_list),
+        "training_window_months": int(training_window_months),
     }
     requested = [str(name).strip() for name in requested_feature_names if str(name).strip()]
     if not requested or not asset_list:
@@ -102,8 +245,12 @@ def select_stage1_dynamic_feature_columns(
             phase_name="feature_selection",
             status="skipped",
             reason_code="no_assets" if not asset_list else "required_columns_missing",
+            elapsed_seconds=time.perf_counter() - started,
             output_rows=0,
             output_columns_count=0,
+            candidate_feature_count=len(requested),
+            selected_feature_count=0,
+            dynamic_feature_count=0,
             source_path=str(parquet_root),
         )
         return []
@@ -130,7 +277,7 @@ def select_stage1_dynamic_feature_columns(
     feature_pool = _candidate_pool(requested)
     target_col = str(NUMERIC_TASK_TO_TARGET_COLUMN[str(task)])
     horizon_bars = _horizon_bars(int(horizon_minutes), int(interval_minutes))
-    per_feature_pairs: DefaultDict[str, List[tuple[float, float]]] = defaultdict(list)
+    per_feature_stats: Dict[str, _StreamingFeatureStats] = {}
 
     for asset_name in asset_list:
         asset_event = {**base_event, "asset": str(asset_name)}
@@ -228,25 +375,21 @@ def select_stage1_dynamic_feature_columns(
             yy = y[mask]
             if np.unique(xx).size <= 1 or np.unique(yy).size <= 1:
                 continue
-            per_feature_pairs[actual_name].extend((float(xv), float(yv)) for xv, yv in zip(xx, yy))
+            per_feature_stats.setdefault(str(actual_name), _StreamingFeatureStats()).add(xx, yy)
 
     scored_features: List[tuple[str, float, int]] = []
-    for feature_name, pairs in per_feature_pairs.items():
-        if len(pairs) < int(min_feature_rows):
+    for feature_name, stats in per_feature_stats.items():
+        if int(stats.n) < int(min_feature_rows):
             continue
-        xvals = np.asarray([pair[0] for pair in pairs], dtype=float)
-        yvals = np.asarray([pair[1] for pair in pairs], dtype=float)
-        if xvals.size < int(min_feature_rows) or np.unique(xvals).size <= 1 or np.unique(yvals).size <= 1:
+        score = stats.score()
+        if score is None:
             continue
-        corr = np.corrcoef(xvals, yvals)[0, 1]
-        if not np.isfinite(corr):
-            continue
-        scored_features.append((str(feature_name), float(abs(corr)), int(xvals.size)))
+        scored_features.append((str(feature_name), float(score), int(stats.n)))
 
     if not scored_features:
         fallback_selected: List[str] = []
         for requested_name in requested:
-            actual_name = _resolve_actual_feature_name(requested_name, per_feature_pairs.keys())
+            actual_name = _resolve_actual_feature_name(requested_name, per_feature_stats.keys())
             if actual_name is not None and actual_name not in fallback_selected:
                 fallback_selected.append(actual_name)
         selected = fallback_selected[: max(1, int(max_features))]
@@ -257,12 +400,33 @@ def select_stage1_dynamic_feature_columns(
             phase_name="feature_selection",
             status="completed",
             reason_code=("feature_load_empty" if not selected else ""),
+            elapsed_seconds=time.perf_counter() - started,
             input_columns_count=len(feature_pool),
             output_columns_count=len(selected),
+            input_rows=sum(int(stats.n) for stats in per_feature_stats.values()),
+            output_rows=len(selected),
+            candidate_feature_count=len(feature_pool),
+            selected_feature_count=len(selected),
+            dynamic_feature_count=len(selected),
+            quality_reason="streaming_stats_no_scored_features",
         )
         return selected
 
     scored_features.sort(key=lambda item: (-item[1], -item[2], item[0]))
+    near_tie_fallback = _scores_need_legacy_boundary_order(scored_features, int(max_features))
+    if near_tie_fallback:
+        scored_features = _legacy_score_stage1_sources(
+            parquet_root=Path(parquet_root),
+            asset_list=asset_list,
+            interval_minutes=int(interval_minutes),
+            common_edge_ts=int(common_edge_ts),
+            history_start_ts=int(history_start_ts),
+            feature_pool=feature_pool,
+            requested=requested,
+            horizon_bars=int(horizon_bars),
+            target_col=target_col,
+            min_feature_rows=int(min_feature_rows),
+        )
     selected: List[str] = []
     for feature_name, _score, _rows in scored_features:
         if feature_name not in selected:
@@ -275,7 +439,15 @@ def select_stage1_dynamic_feature_columns(
         function_name="select_stage1_dynamic_feature_columns",
         phase_name="feature_selection",
         status="completed",
+        elapsed_seconds=time.perf_counter() - started,
         input_columns_count=len(feature_pool),
         output_columns_count=len(selected),
+        input_rows=sum(int(rows) for _feature, _score, rows in scored_features),
+        output_rows=len(selected),
+        candidate_feature_count=len(feature_pool),
+        selected_feature_count=len(selected),
+        dynamic_feature_count=len(selected),
+        warning_count=1 if near_tie_fallback else 0,
+        quality_reason="near_tie_legacy_boundary_fallback" if near_tie_fallback else "streaming_stats",
     )
     return selected
