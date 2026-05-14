@@ -6,20 +6,16 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from src.regimes.core.contracts import TrialResultEnvelope, require_schema_version
+from src.regimes.core.paths import default_foundation_report_root, is_relative_to, path_ends_with_parts
 from src.regimes.core.serialization import require_json_object, to_jsonable
 
 
-FOUNDATION_MANIFEST_ROOT = Path("reports/regimes/foundation")
+FOUNDATION_MANIFEST_ROOT = default_foundation_report_root()
 FOUNDATION_MANIFEST_KIND = "regime_foundation_manifest"
 
 
-def _normalized_parts(path: Path) -> tuple[str, ...]:
-    return tuple(part.lower() for part in Path(path).parts if part not in {"", os.sep})
-
-
 def is_foundation_manifest_root(root: Path | str) -> bool:
-    parts = _normalized_parts(Path(root))
-    return len(parts) >= 3 and parts[-3:] == ("reports", "regimes", "foundation")
+    return path_ends_with_parts(Path(root), ("reports", "regimes", "foundation"))
 
 
 def require_foundation_manifest_root(root: Path | str) -> Path:
@@ -46,7 +42,7 @@ def resolve_foundation_manifest_path(
         raise ValueError("Regime foundation manifest paths must end in .json")
     root_resolved = root_path.resolve()
     candidate_resolved = candidate.resolve()
-    if not candidate_resolved.is_relative_to(root_resolved):
+    if not is_relative_to(candidate_resolved, root_resolved):
         raise ValueError("Regime foundation manifest path must stay under reports/regimes/foundation")
     return candidate
 

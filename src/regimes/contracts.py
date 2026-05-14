@@ -8,6 +8,16 @@ from typing import Dict, Iterable, Mapping, Sequence
 UNKNOWN_LABEL = "unknown"
 UNKNOWN_CLUSTER_ID = -1
 NEUTRAL_LABEL_ID = 1
+_INVALID_PARTITION_CHARS = set('/\\:*?"<>|')
+
+
+def safe_partition_value(value: object, *, field_name: str = "partition value") -> str:
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"Regime {field_name} must be non-empty")
+    if text in {".", ".."} or any(char in text for char in _INVALID_PARTITION_CHARS):
+        raise ValueError(f"Regime {field_name} contains unsafe path characters: {value!r}")
+    return text
 
 
 @dataclass(frozen=True)
@@ -164,7 +174,7 @@ def regime_label_month_dir(root: Path, ceiling_interval_min: int, asset: str, ye
     return (
         Path(root)
         / regime_table_dir(int(ceiling_interval_min))
-        / f"asset={str(asset)}"
+        / f"asset={safe_partition_value(asset, field_name='asset')}"
         / f"year={int(year)}"
         / f"month={int(month):02d}"
     )
@@ -174,7 +184,7 @@ def regime_forecast_month_dir(root: Path, interval_min: int, asset: str, year: i
     return (
         Path(root)
         / f"{int(interval_min)}"
-        / f"asset={str(asset)}"
+        / f"asset={safe_partition_value(asset, field_name='asset')}"
         / f"year={int(year)}"
         / f"month={int(month):02d}"
     )

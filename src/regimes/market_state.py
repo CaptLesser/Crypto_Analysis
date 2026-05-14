@@ -7,6 +7,7 @@ from typing import Sequence
 
 import pandas as pd
 
+from src.regimes.core.paths import default_foundation_report_root
 from src.regimes.core import (
     PathwayDiagnosticsRootPolicy,
     read_json,
@@ -146,7 +147,7 @@ def metadata_manifest(
     manifest_id: str = "market_state_metadata_manifest",
     universe: str = "global",
     bands: Sequence[str] = ("micro",),
-    report_root: str | Path = "reports/regimes/foundation/market_state_metadata",
+    report_root: str | Path = default_foundation_report_root("market_state_metadata"),
 ) -> MarketStateMetadataManifest:
     return build_market_state_metadata_manifest(
         manifest_id=manifest_id,

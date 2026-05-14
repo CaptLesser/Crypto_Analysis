@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from typing import Any, Mapping, Protocol, Sequence
 from src.forecasting.common.sandbox_paths import default_production_roots, is_relative_to
 from src.regimes.contracts import REGIME_BANDS, RegimeBandContract, band_for_ceiling
 from src.regimes.core.artifacts import read_json, safe_path_part, validate_partition_month, write_json
+from src.regimes.core.paths import resolve_project_root
 
 
 PATHWAY_MANIFEST_STATUS = "scaffold_only"
@@ -1116,7 +1118,10 @@ def _project_production_adjacent_roots(project_root: Path) -> tuple[Path, ...]:
 
 def _temp_like_roots() -> tuple[Path, ...]:
     roots = {Path(tempfile.gettempdir())}
-    for raw in ("D:/pipeline_codex_temp", "D:/reports"):
+    for raw in str(os.getenv("PIPELINE_REGIME_TEMP_ROOTS", "") or "").split(os.pathsep):
+        raw = raw.strip()
+        if not raw:
+            continue
         roots.add(Path(raw))
     return tuple(roots)
 
@@ -1128,7 +1133,7 @@ def classify_pathway_diagnostics_root(
     env: Mapping[str, str] | None = None,
 ) -> PathwayDiagnosticsRootPolicy:
     root = _resolved(Path(diagnostics_root))
-    project = _resolved(project_root or Path.cwd())
+    project = resolve_project_root(project_root)
     production_roots = (*default_production_roots(env), *_project_production_adjacent_roots(project))
     if _under_any(root, production_roots):
         return PathwayDiagnosticsRootPolicy(
@@ -3376,7 +3381,7 @@ def _market_aggregation_source_root_policy(
 ) -> dict[str, Any]:
     raw = str(source_root or "").strip()
     root = _resolved(Path(raw)) if raw else None
-    project = _resolved(project_root or Path.cwd())
+    project = resolve_project_root(project_root)
     exists = bool(root is not None and root.exists())
     is_dir = bool(root is not None and root.is_dir())
     unsafe_parts = {"regime_definitions", "model_states"}

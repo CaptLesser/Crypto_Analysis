@@ -20,6 +20,12 @@ from src.regimes.core.contracts import (
     require_non_empty_string,
     require_schema_version,
 )
+from src.regimes.core.paths import (
+    default_foundation_report_root,
+    is_relative_to,
+    require_foundation_report_root,
+    resolve_project_root,
+)
 from src.regimes.core.promotion_gate import PROMOTION_STATUS_BLOCKED
 from src.regimes.core.serialization import dumps_json, loads_json, require_json_object, to_jsonable
 from src.regimes.studies.fixtures import synthetic_asset_state_fixture
@@ -32,52 +38,23 @@ from src.regimes.studies.small_panel_benchmark import run_small_panel_benchmark
 
 FOUNDATION_READY_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
 FOUNDATION_READY_ARTIFACT_KIND = "regime_foundation_ready_closeout"
-DEFAULT_FOUNDATION_READY_REPORT_ROOT = Path("reports") / "regimes" / "foundation"
+DEFAULT_FOUNDATION_READY_REPORT_ROOT = default_foundation_report_root()
 FOUNDATION_INDEX_JSON = "foundation_index.json"
 FOUNDATION_READY_MD = "foundation_ready.md"
 
 
-def _resolve_root(report_root: str | Path) -> Path:
-    root = Path(report_root).expanduser()
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    return root.resolve()
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        return path == root or path.is_relative_to(root)
-    except AttributeError:  # pragma: no cover - Python compatibility only
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return False
-
-
 def validate_foundation_report_root(report_root: str | Path, *, project_root: str | Path | None = None) -> Path:
-    root = _resolve_root(report_root)
-    project = _resolve_root(project_root or Path.cwd())
-    production_tokens = {"parquet", "regime_definitions", "model_states", "state"}
-    if any(part.lower() in production_tokens for part in root.parts):
-        raise ValueError("Regime foundation readiness report root is production-adjacent and is not allowed")
-    for candidate in (
-        project / "parquet",
-        project / "regime_definitions",
-        project / "model_states",
-        project / "state",
-    ):
-        if _is_relative_to(root, _resolve_root(candidate)):
-            raise ValueError("Regime foundation readiness report root is production-adjacent and is not allowed")
-    normalized = tuple(part.lower() for part in root.parts)
-    if len(normalized) < 3 or normalized[-3:] != ("reports", "regimes", "foundation"):
-        raise ValueError("Regime foundation readiness report root must end with reports/regimes/foundation")
-    return root
+    return require_foundation_report_root(
+        report_root,
+        project_root=project_root,
+        required_suffix=("reports", "regimes", "foundation"),
+        error_prefix="Regime foundation readiness report root",
+    )
 
 
 def _safe_child(root: Path, *parts: str) -> Path:
     candidate = root.joinpath(*parts).resolve()
-    if not _is_relative_to(candidate, root):
+    if not is_relative_to(candidate, root):
         raise ValueError("Regime foundation readiness artifact path must stay under report_root")
     return candidate
 
@@ -116,8 +93,8 @@ def _assert_artifact_paths_under_root(paths: Mapping[str, str], root: Path) -> N
     for name, raw_path in paths.items():
         path = Path(raw_path).expanduser()
         if not path.is_absolute():
-            path = Path.cwd() / path
-        if not _is_relative_to(path.resolve(), root):
+            path = resolve_project_root() / path
+        if not is_relative_to(path.resolve(), root):
             raise ValueError(f"Regime foundation readiness artifact path {name!r} escaped report_root")
 
 
@@ -481,7 +458,7 @@ def validate_regimes_foundation_ready(
     project_root: str | Path | None = None,
 ) -> FoundationReadyResult:
     root = validate_foundation_report_root(report_root, project_root=project_root)
-    project = _resolve_root(project_root or Path.cwd())
+    project = resolve_project_root(project_root)
     run_token = require_non_empty_string(run_id, field_name="foundation readiness run_id")
     checks = [
         _run_core_contract_check(root, write_outputs=write_outputs),

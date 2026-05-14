@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 import pandas as pd
 
 from src.regimes.core.contracts import CANONICAL_SCHEMA_VERSION, require_json_mapping, require_non_empty_string, require_schema_version
+from src.regimes.core.paths import resolve_project_path
 from src.regimes.core.serialization import dumps_json, loads_json, require_json_object, to_jsonable
 from src.regimes.studies.fixtures import synthetic_asset_state_fixture
 from src.regimes.studies.manifest import StudyManifest
@@ -40,10 +41,7 @@ FAILED_TRIAL_OBJECTIVE_VALUES: tuple[float, ...] = (-1.0, 0.0, 999.0)
 
 
 def _resolve_root(report_root: str | Path) -> Path:
-    root = Path(report_root).expanduser()
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    return root.resolve()
+    return resolve_project_path(report_root)
 
 
 def _safe_float(value: object, *, default: float) -> float:

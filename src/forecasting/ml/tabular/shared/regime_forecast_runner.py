@@ -45,6 +45,7 @@ from src.regimes.contracts import (
     forecast_ceiling_interval,
     forecast_output_columns,
     regime_forecast_part_path,
+    safe_partition_value,
 )
 
 
@@ -90,6 +91,7 @@ class RegimeForecastIOConfig:
     parquet_root: Path
     staging_root: Path
     state_root: Path
+    log_root: Path
     scalar_root: Path
     ohlc_root: Path
     regime_label_root: Path
@@ -515,7 +517,9 @@ def regime_read_state(state_root: Path) -> tuple[dict, dict, dict]:
 
 
 def regime_write_state(state_root: Path, watermarks: dict, pending: dict, progress: dict) -> None:
-    write_ml_state(Path(state_root), watermarks, pending, progress)
+    root = Path(state_root)
+    assert_write_allowed(root, "tabular regime model state root")
+    write_ml_state(root, watermarks, pending, progress)
 
 
 def regime_pending_prefix(
@@ -712,7 +716,7 @@ def regime_family_output_root(io_config: RegimeForecastIOConfig, spec: RegimeFam
 
 
 def regime_forecast_output_max_ts(output_root: Path, *, interval: int, asset: str) -> Optional[int]:
-    base = Path(output_root) / f"{int(interval)}" / f"asset={str(asset)}"
+    base = Path(output_root) / f"{int(interval)}" / f"asset={safe_partition_value(asset, field_name='asset')}"
     return partition_max_ts(base, ts_column="ts")
 
 
@@ -724,7 +728,7 @@ def regime_forecast_horizon_output_max_ts(
     asset: str,
     horizon_minutes: int,
 ) -> Optional[int]:
-    base = Path(output_root) / f"{int(interval)}" / f"asset={str(asset)}"
+    base = Path(output_root) / f"{int(interval)}" / f"asset={safe_partition_value(asset, field_name='asset')}"
     expected_cols = list(forecast_output_columns(spec.prediction_prefix, int(horizon_minutes)))
     max_ts: Optional[int] = None
     for path in sorted(base.glob("year=*/month=*/part-000.parquet")):
@@ -1179,18 +1183,23 @@ def resolve_regime_io_config(
     sandbox_roots = resolve_sandbox_output_roots(env=_sandbox_resolution_env(source_env))
 
     if sandbox_roots.enabled:
+        log_root = _sandbox_env_path(sandbox_roots, "PIPELINE_SANDBOX_LOG_ROOT", sandbox_roots.log_root, "tabular regime log root", source_env)
         parquet_root = _sandbox_env_path(sandbox_roots, "PIPELINE_SANDBOX_PARQUET_ROOT", sandbox_roots.parquet_root, "tabular regime parquet root", source_env)
         state_base = _sandbox_env_path(sandbox_roots, "PIPELINE_SANDBOX_STATE_ROOT", sandbox_roots.state_root, "tabular regime state root", source_env)
         tmp_root = _sandbox_env_path(sandbox_roots, "PIPELINE_SANDBOX_TMP_ROOT", sandbox_roots.tmp_root, "tabular regime tmp root", source_env)
         state_root = state_base / "model_states" / spec.module_slug
         staging_root = tmp_root / f"{spec.module_slug}_stage"
         for path, kind in (
+            (log_root, "tabular regime log root"),
             (state_root, "tabular regime model state root"),
             (staging_root, "tabular regime staging root"),
         ):
             assert_write_allowed(path, kind, roots=sandbox_roots)
     else:
         legacy_pipeline_root = Path(source_env["PIPELINE_ROOT"]) if str(source_env.get("PIPELINE_ROOT", "")).strip() else None
+        log_root = resolve_path("log_root", profile=pipeline_profile, env=path_config_env, required=False) or (
+            legacy_pipeline_root / "logs" if legacy_pipeline_root is not None else Path("logs")
+        )
         state_base = resolve_path("state_root", profile=pipeline_profile, env=path_config_env, required=False) or (
             legacy_pipeline_root / "model_states" if legacy_pipeline_root is not None else Path("model_states")
         )
@@ -1224,7 +1233,7 @@ def resolve_regime_io_config(
         or parquet_root
     )
 
-    for path in (state_root, staging_root):
+    for path in (log_root, state_root, staging_root):
         try:
             Path(path).mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -1234,6 +1243,7 @@ def resolve_regime_io_config(
         parquet_root=Path(parquet_root),
         staging_root=Path(staging_root),
         state_root=Path(state_root),
+        log_root=Path(log_root),
         scalar_root=Path(scalar_root),
         ohlc_root=Path(ohlc_root),
         regime_label_root=Path(regime_label_root),

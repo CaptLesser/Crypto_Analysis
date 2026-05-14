@@ -7,6 +7,7 @@ from typing import Sequence
 
 import pandas as pd
 
+from src.regimes.core.paths import default_foundation_report_root
 from src.regimes.core import write_pathway_dry_run_diagnostic
 from src.regimes.core.relative_state_contracts import (
     RelativeStateMetadataManifest,
@@ -77,7 +78,7 @@ def metadata_manifest(
     *,
     manifest_id: str = "relative_state_metadata_manifest",
     primary_asset: str = "ETHUSD",
-    report_root: str | Path = "reports/regimes/foundation/relative_state_metadata",
+    report_root: str | Path = default_foundation_report_root("relative_state_metadata"),
 ) -> RelativeStateMetadataManifest:
     return build_relative_state_metadata_manifest(
         manifest_id=manifest_id,

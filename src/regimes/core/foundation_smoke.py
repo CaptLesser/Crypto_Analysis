@@ -25,6 +25,7 @@ from src.regimes.core.foundation_contracts import (
     RegimeStudyIdentity,
     SourceArtifactLineage,
 )
+from src.regimes.core.paths import default_foundation_report_root, resolve_project_root
 from src.regimes.core.pathway_artifacts import require_pathway_diagnostics_root
 from src.regimes.core.study_runner import RegimeStudyManifest, run_regime_single_trial
 
@@ -301,7 +302,7 @@ def run_regime_foundation_smoke(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the tiny Regime foundation smoke.")
-    parser.add_argument("--diagnostics-root", type=Path, default=Path("reports") / "regime_foundation_smoke")
+    parser.add_argument("--diagnostics-root", type=Path, default=default_foundation_report_root("legacy_foundation_smoke"))
     parser.add_argument("--run-id", type=str, default="foundation_smoke")
     parser.add_argument("--no-write", action="store_true")
     return parser
@@ -312,7 +313,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     result = run_regime_foundation_smoke(
         diagnostics_root=Path(args.diagnostics_root),
         run_id=str(args.run_id),
-        project_root=Path.cwd(),
+        project_root=resolve_project_root(),
         write_outputs=not bool(args.no_write),
     )
     print(json.dumps(result.as_dict(), indent=2, sort_keys=True))

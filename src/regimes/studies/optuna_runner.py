@@ -16,6 +16,7 @@ from src.regimes.core.contracts import (
     require_non_empty_string,
     require_schema_version,
 )
+from src.regimes.core.paths import default_foundation_report_root, is_relative_to, require_foundation_report_root
 from src.regimes.core.promotion_gate import PROMOTION_STATUS_BLOCKED
 from src.regimes.core.serialization import dumps_json, loads_json, require_json_object, to_jsonable
 from src.regimes.studies.fixtures import synthetic_asset_state_fixture
@@ -42,7 +43,7 @@ except Exception as exc:  # pragma: no cover - exercised only when optional depe
 
 OPTUNA_STUB_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
 OPTUNA_STUB_ARTIFACT_KIND = "regime_optuna_stub_study_summary"
-DEFAULT_OPTUNA_REPORT_ROOT = Path("reports") / "regimes" / "foundation" / "optuna"
+DEFAULT_OPTUNA_REPORT_ROOT = default_foundation_report_root("optuna")
 OPTUNA_STUB_SUMMARY_JSON = "optuna_study_summary.json"
 OPTUNA_STUB_SUMMARY_MD = "optuna_study_summary.md"
 OPTUNA_STUB_TRIAL_SUMMARIES_JSON = "optuna_trial_summaries.json"
@@ -62,47 +63,18 @@ def require_optuna() -> Any:
     return _OPTUNA
 
 
-def _resolve_root(report_root: str | Path) -> Path:
-    root = Path(report_root).expanduser()
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    return root.resolve()
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        return path == root or path.is_relative_to(root)
-    except AttributeError:  # pragma: no cover - Python compatibility only
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return False
-
-
 def validate_optuna_report_root(report_root: str | Path, *, project_root: str | Path | None = None) -> Path:
-    root = _resolve_root(report_root)
-    project = _resolve_root(project_root or Path.cwd())
-    production_tokens = {"parquet", "regime_definitions", "model_states", "state"}
-    if any(part.lower() in production_tokens for part in root.parts):
-        raise ValueError("Regime Optuna report root is production-adjacent and is not allowed")
-    for candidate in (
-        project / "parquet",
-        project / "regime_definitions",
-        project / "model_states",
-        project / "state",
-    ):
-        if _is_relative_to(root, _resolve_root(candidate)):
-            raise ValueError("Regime Optuna report root is production-adjacent and is not allowed")
-    normalized = tuple(part.lower() for part in root.parts)
-    if len(normalized) < 4 or normalized[-4:] != ("reports", "regimes", "foundation", "optuna"):
-        raise ValueError("Regime Optuna report root must end with reports/regimes/foundation/optuna")
-    return root
+    return require_foundation_report_root(
+        report_root,
+        project_root=project_root,
+        required_suffix=("reports", "regimes", "foundation", "optuna"),
+        error_prefix="Regime Optuna report root",
+    )
 
 
 def _safe_child(root: Path, *parts: str) -> Path:
     candidate = root.joinpath(*parts).resolve()
-    if not _is_relative_to(candidate, root):
+    if not is_relative_to(candidate, root):
         raise ValueError("Regime Optuna artifact path must stay under report_root")
     return candidate
 

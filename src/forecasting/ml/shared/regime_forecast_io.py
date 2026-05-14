@@ -7,7 +7,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-from src.regimes.contracts import REGIME_AXES, REGIME_AXIS_ORDER, band_for_ceiling, regime_table_dir
+from src.regimes.contracts import REGIME_AXES, REGIME_AXIS_ORDER, band_for_ceiling, regime_label_month_dir, regime_table_dir
 
 
 class RegimeLabelReadError(RuntimeError):
@@ -76,13 +76,14 @@ def _requested_required_columns(columns: Optional[Sequence[str]]) -> Optional[Li
 def _month_dirs(
     *,
     base_dir: Path,
-    table_dir: str,
+    ceiling_interval: int,
     asset: str,
     year: int,
     month: int,
     allow_legacy_unpartitioned: bool,
 ) -> List[Path]:
-    dirs = [Path(base_dir) / table_dir / f"asset={str(asset)}" / f"year={int(year)}" / f"month={int(month):02d}"]
+    table_dir = regime_table_dir(int(ceiling_interval))
+    dirs = [regime_label_month_dir(Path(base_dir), int(ceiling_interval), str(asset), int(year), int(month))]
     if allow_legacy_unpartitioned:
         dirs.append(Path(base_dir) / table_dir / f"year={int(year)}" / f"month={int(month):02d}")
     return dirs
@@ -139,7 +140,6 @@ def read_regime_labels(
     validate_schema: bool = True,
     stats: Optional[RegimeLabelReadStats] = None,
 ) -> pd.DataFrame:
-    table_dir = regime_table_dir(int(ceiling_interval))
     read_columns = _requested_required_columns(columns)
     local_stats = stats if stats is not None else RegimeLabelReadStats()
     frames: List[pd.DataFrame] = []
@@ -148,7 +148,7 @@ def read_regime_labels(
         month_files: List[Path] = []
         for month_dir in _month_dirs(
             base_dir=Path(base_dir),
-            table_dir=table_dir,
+            ceiling_interval=int(ceiling_interval),
             asset=str(asset),
             year=int(year),
             month=int(month),

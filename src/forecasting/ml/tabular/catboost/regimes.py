@@ -88,7 +88,6 @@ except Exception:
 
 PIPELINE_PROFILE = selected_profile()
 LOG_DIR = Path(resolve_path("log_root", profile=PIPELINE_PROFILE, required=False) or Path("logs"))
-LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "catboost_regimes.log"
 
 PARQUET_ROOT = Path(
@@ -98,7 +97,6 @@ PARQUET_ROOT = Path(
 )
 OUTPUT_ROOT = PARQUET_ROOT / "CatBoost_Regimes"
 STATE_ROOT = OUTPUT_ROOT / "state"
-STATE_ROOT.mkdir(parents=True, exist_ok=True)
 
 WATERMARK_FILE = STATE_ROOT / "ml_watermarks.json"
 PENDING_FILE = STATE_ROOT / "ml_pending.json"
@@ -177,22 +175,33 @@ CB_PARAMS = {
 }
 
 
+_LOGGER: Any = None
+
+
 def log(msg: str) -> None:
+    global _LOGGER
+    if _LOGGER is None:
+        _LOGGER = get_module_logger(
+            REGIME_RUNNER_SPEC.module_slug,
+            LOG_FILE,
+            base_log_fn=lambda m: base_log(f"[{REGIME_RUNNER_SPEC.module_slug}] {m}"),
+        )
     _LOGGER(msg)
-
-
-_LOGGER = get_module_logger("catboost_regimes", LOG_FILE, base_log_fn=lambda m: base_log(f"[catboost_regimes] {m}"))
 
 
 def _apply_io_config(io_config: RegimeForecastIOConfig) -> RegimeForecastIOConfig:
     global REGIME_IO_CONFIG, PARQUET_ROOT, OUTPUT_ROOT, STATE_ROOT
     global WATERMARK_FILE, PENDING_FILE, PROGRESS_FILE, MANIFEST_FILE
+    global LOG_DIR, LOG_FILE, _LOGGER
     global REGIME_ROOT, SCALAR_ROOT, OHLCVT_PARQUET_ROOT
     REGIME_IO_CONFIG = io_config
     PARQUET_ROOT = Path(io_config.parquet_root)
     OUTPUT_ROOT = regime_family_output_root(io_config, REGIME_RUNNER_SPEC)
     STATE_ROOT = Path(io_config.state_root)
     STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    LOG_DIR = Path(io_config.log_root)
+    LOG_FILE = LOG_DIR / "catboost_regimes.log"
+    _LOGGER = None
     WATERMARK_FILE = STATE_ROOT / "ml_watermarks.json"
     PENDING_FILE = STATE_ROOT / "ml_pending.json"
     PROGRESS_FILE = STATE_ROOT / "ml_progress.json"
