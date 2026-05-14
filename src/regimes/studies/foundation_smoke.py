@@ -25,6 +25,7 @@ from src.regimes.core.feature_cache import (
 )
 from src.regimes.core.feature_registry import default_feature_family_registry
 from src.regimes.core.foundation_contracts import SourceArtifactLineage
+from src.regimes.core.paths import default_foundation_report_root, is_relative_to, require_foundation_report_root
 from src.regimes.core.preprocessing import fit_preprocessing_pipeline, transform_score_window_preprocessor
 from src.regimes.core.promotion_gate import PROMOTION_STATUS_BLOCKED, PromotionGateInput, evaluate_promotion_gate
 from src.regimes.core.serialization import dumps_json, loads_json, require_json_object, to_jsonable
@@ -36,52 +37,23 @@ from src.regimes.studies.single_trial import REGIME_SINGLE_TRIAL_ARTIFACT_KIND, 
 
 FOUNDATION_SMOKE_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
 FOUNDATION_SMOKE_ARTIFACT_KIND = "regime_foundation_smoke_summary"
-DEFAULT_FOUNDATION_SMOKE_REPORT_ROOT = Path("reports") / "regimes" / "foundation" / "smoke"
+DEFAULT_FOUNDATION_SMOKE_REPORT_ROOT = default_foundation_report_root("smoke")
 FOUNDATION_SMOKE_SUMMARY_JSON = "foundation_smoke_summary.json"
 FOUNDATION_SMOKE_SUMMARY_MD = "foundation_smoke_summary.md"
 
 
-def _resolve_root(report_root: str | Path) -> Path:
-    root = Path(report_root).expanduser()
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    return root.resolve()
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        return path == root or path.is_relative_to(root)
-    except AttributeError:  # pragma: no cover - Python compatibility only
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return False
-
-
 def _validate_smoke_report_root(report_root: str | Path, *, project_root: str | Path | None = None) -> Path:
-    root = _resolve_root(report_root)
-    project = _resolve_root(project_root or Path.cwd())
-    production_tokens = {"parquet", "regime_definitions", "model_states", "state"}
-    if any(part.lower() in production_tokens for part in root.parts):
-        raise ValueError("Regime foundation smoke report root is production-adjacent and is not allowed")
-    for candidate in (
-        project / "parquet",
-        project / "regime_definitions",
-        project / "model_states",
-        project / "state",
-    ):
-        if _is_relative_to(root, _resolve_root(candidate)):
-            raise ValueError("Regime foundation smoke report root is production-adjacent and is not allowed")
-    normalized = tuple(part.lower() for part in root.parts)
-    if len(normalized) < 4 or normalized[-4:] != ("reports", "regimes", "foundation", "smoke"):
-        raise ValueError("Regime foundation smoke report root must end with reports/regimes/foundation/smoke")
-    return root
+    return require_foundation_report_root(
+        report_root,
+        project_root=project_root,
+        required_suffix=("reports", "regimes", "foundation", "smoke"),
+        error_prefix="Regime foundation smoke report root",
+    )
 
 
 def _safe_child(root: Path, *parts: str) -> Path:
     candidate = root.joinpath(*parts).resolve()
-    if not _is_relative_to(candidate, root):
+    if not is_relative_to(candidate, root):
         raise ValueError("Regime foundation smoke artifact path must stay under the report root")
     return candidate
 

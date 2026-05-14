@@ -18,6 +18,12 @@ from src.regimes.core.feature_cache import (
 )
 from src.regimes.core.feature_registry import default_feature_family_registry
 from src.regimes.core.flat_asset_policy import evaluate_flat_asset_policy
+from src.regimes.core.paths import (
+    has_path_parts,
+    is_production_adjacent_path,
+    is_relative_to,
+    resolve_project_path,
+)
 from src.regimes.core.preprocessing import (
     fit_preprocessing_pipeline,
     transform_score_window_preprocessor,
@@ -32,32 +38,11 @@ from src.regimes.studies.search_space import StudySearchSpace, build_search_spac
 
 REGIME_SINGLE_TRIAL_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
 REGIME_SINGLE_TRIAL_ARTIFACT_KIND = "regime_single_trial_result"
-_PRODUCTION_ADJACENT_ROOT_NAMES = {"parquet", "regime_definitions", "model_states", "state"}
 _FOUNDATION_ROOT_PARTS = ("reports", "regimes", "foundation")
 
 
-def _resolve_report_root(report_root: str | Path) -> Path:
-    root = Path(report_root).expanduser()
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    return root.resolve()
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        return path == root or path.is_relative_to(root)
-    except AttributeError:  # pragma: no cover - Python compatibility only
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return False
-
-
 def _has_foundation_report_root(path: Path) -> bool:
-    parts = tuple(part.lower() for part in path.parts)
-    width = len(_FOUNDATION_ROOT_PARTS)
-    return any(parts[idx : idx + width] == _FOUNDATION_ROOT_PARTS for idx in range(max(len(parts) - width + 1, 0)))
+    return has_path_parts(path, _FOUNDATION_ROOT_PARTS)
 
 
 def validate_single_trial_report_root(
@@ -66,18 +51,9 @@ def validate_single_trial_report_root(
     project_root: str | Path | None = None,
     allow_test_only_non_foundation_report_root: bool = False,
 ) -> Path:
-    root = _resolve_report_root(report_root)
-    project = _resolve_report_root(project_root or Path.cwd())
-    if any(part.lower() in _PRODUCTION_ADJACENT_ROOT_NAMES for part in root.parts):
+    root = resolve_project_path(report_root, project_root=project_root)
+    if is_production_adjacent_path(root, project_root=project_root):
         raise ValueError("Regime single-trial report root is production-adjacent and is not allowed")
-    for candidate in (
-        project / "parquet",
-        project / "regime_definitions",
-        project / "model_states",
-        project / "state",
-    ):
-        if _is_relative_to(root, _resolve_report_root(candidate)):
-            raise ValueError("Regime single-trial report root is production-adjacent and is not allowed")
     if not allow_test_only_non_foundation_report_root and not _has_foundation_report_root(root):
         raise ValueError("Regime single-trial report root must be under reports/regimes/foundation")
     return root
@@ -85,7 +61,7 @@ def validate_single_trial_report_root(
 
 def _safe_child(root: Path, *parts: str) -> Path:
     candidate = root.joinpath(*parts).resolve()
-    if not _is_relative_to(candidate, root):
+    if not is_relative_to(candidate, root):
         raise ValueError("Regime single-trial artifact path must stay under report_root")
     return candidate
 

@@ -23,6 +23,7 @@ from src.regimes.core.contracts import (
 )
 from src.regimes.core.feature_registry import default_feature_family_registry
 from src.regimes.core.flat_asset_policy import evaluate_flat_asset_policy
+from src.regimes.core.paths import default_foundation_report_root, is_relative_to, require_foundation_report_root
 from src.regimes.core.preprocessing import fit_preprocessing_pipeline, transform_score_window_preprocessor
 from src.regimes.core.promotion_gate import PROMOTION_STATUS_BLOCKED, PromotionGateInput, evaluate_promotion_gate
 from src.regimes.core.scoreboard import build_regime_scoreboard
@@ -34,7 +35,7 @@ from src.regimes.studies.search_space import build_search_space
 SMALL_PANEL_BENCHMARK_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
 SMALL_PANEL_BENCHMARK_ARTIFACT_KIND = "regime_small_panel_benchmark_summary"
 SMALL_PANEL_FAMILY_ARTIFACT_KIND = "regime_small_panel_benchmark_family_artifact_manifest"
-DEFAULT_SMALL_PANEL_BENCHMARK_ROOT = Path("reports") / "regimes" / "foundation" / "benchmarks"
+DEFAULT_SMALL_PANEL_BENCHMARK_ROOT = default_foundation_report_root("benchmarks")
 SMALL_PANEL_SUMMARY_JSON = "small_panel_summary.json"
 SMALL_PANEL_SUMMARY_MD = "small_panel_summary.md"
 BENCHMARK_FAMILIES: tuple[str, ...] = (
@@ -45,47 +46,18 @@ BENCHMARK_FAMILIES: tuple[str, ...] = (
 )
 
 
-def _resolve_root(report_root: str | Path) -> Path:
-    root = Path(report_root).expanduser()
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    return root.resolve()
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        return path == root or path.is_relative_to(root)
-    except AttributeError:  # pragma: no cover - Python compatibility only
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return False
-
-
 def _validate_benchmark_report_root(report_root: str | Path, *, project_root: str | Path | None = None) -> Path:
-    root = _resolve_root(report_root)
-    project = _resolve_root(project_root or Path.cwd())
-    production_tokens = {"parquet", "regime_definitions", "model_states", "state"}
-    if any(part.lower() in production_tokens for part in root.parts):
-        raise ValueError("Regime small-panel benchmark report root is production-adjacent and is not allowed")
-    for candidate in (
-        project / "parquet",
-        project / "regime_definitions",
-        project / "model_states",
-        project / "state",
-    ):
-        if _is_relative_to(root, _resolve_root(candidate)):
-            raise ValueError("Regime small-panel benchmark report root is production-adjacent and is not allowed")
-    normalized = tuple(part.lower() for part in root.parts)
-    if len(normalized) < 4 or normalized[-4:] != ("reports", "regimes", "foundation", "benchmarks"):
-        raise ValueError("Regime small-panel benchmark report root must end with reports/regimes/foundation/benchmarks")
-    return root
+    return require_foundation_report_root(
+        report_root,
+        project_root=project_root,
+        required_suffix=("reports", "regimes", "foundation", "benchmarks"),
+        error_prefix="Regime small-panel benchmark report root",
+    )
 
 
 def _safe_child(root: Path, *parts: str) -> Path:
     candidate = root.joinpath(*parts).resolve()
-    if not _is_relative_to(candidate, root):
+    if not is_relative_to(candidate, root):
         raise ValueError("Regime small-panel benchmark artifact path must stay under report_root")
     return candidate
 

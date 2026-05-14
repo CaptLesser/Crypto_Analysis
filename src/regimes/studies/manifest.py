@@ -19,11 +19,12 @@ from src.regimes.core.contracts import (
     require_schema_version,
     validate_layer_axis_band,
 )
+from src.regimes.core.paths import default_foundation_report_root
 from src.regimes.core.serialization import dumps_json, loads_json, require_json_object, to_jsonable
 
 
 REGIME_STUDY_MANIFEST_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
-DEFAULT_STUDY_REPORT_ROOT = "reports/regimes/foundation/studies"
+DEFAULT_STUDY_REPORT_ROOT = default_foundation_report_root("studies")
 DEFAULT_STUDY_SPLIT_POLICY: dict[str, Any] = {
     "name": "deterministic_head_tail",
     "train_fraction": 2.0 / 3.0,
@@ -97,7 +98,7 @@ class StudyManifest:
     candidate_clusterer_families: Sequence[str]
     split_policy: Mapping[str, Any] = field(default_factory=lambda: dict(DEFAULT_STUDY_SPLIT_POLICY))
     budget: Mapping[str, Any] = field(default_factory=lambda: dict(DEFAULT_STUDY_BUDGET))
-    report_root: str | Path = DEFAULT_STUDY_REPORT_ROOT
+    report_root: str | Path = field(default_factory=lambda: default_foundation_report_root("studies"))
     classification: str | RegimeClassification = RegimeClassification.STAGED.value
     metadata: Mapping[str, Any] = field(default_factory=dict)
     schema_version: int = REGIME_STUDY_MANIFEST_SCHEMA_VERSION

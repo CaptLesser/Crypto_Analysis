@@ -28,6 +28,7 @@ from src.regimes.core import (
     safe_path_part,
     write_json,
 )
+from src.regimes.core.paths import resolve_project_root
 
 
 CURRENT_LABEL_AUDIT_SCHEMA_VERSION = 1
@@ -824,7 +825,7 @@ def config_from_args(args: argparse.Namespace) -> tuple[AssetStateLabelAuditConf
         ohlcvt_root=ohlcvt_root,
         tiny_state_threshold=int(getattr(args, "tiny_state_threshold", 20)),
         allow_legacy_unpartitioned=bool(getattr(args, "allow_legacy_unpartitioned", False)),
-        project_root=Path.cwd(),
+        project_root=resolve_project_root(),
     )
     return config, sandbox_roots
 

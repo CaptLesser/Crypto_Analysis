@@ -19,6 +19,7 @@ from src.regimes.core.contracts import (
     validate_layer_axis_band,
 )
 from src.regimes.core.market_state_contracts import validate_market_state_metadata_report_root
+from src.regimes.core.paths import default_foundation_report_root
 from src.regimes.core.serialization import dumps_json, loads_json, require_json_object, to_jsonable
 
 
@@ -516,7 +517,7 @@ def build_relative_state_metadata_manifest(
     peer_group_identity: PeerGroupIdentity | Mapping[str, Any] | None = None,
     alignment_frame_policy: AlignmentFramePolicy | Mapping[str, Any] | None = None,
     feature_families: Sequence[RelativeFeatureFamilyDeclaration | Mapping[str, Any]] | None = None,
-    report_root: str | Path = "reports/regimes/foundation/relative_state_metadata",
+    report_root: str | Path = default_foundation_report_root("relative_state_metadata"),
     metadata: Mapping[str, Any] | None = None,
 ) -> RelativeStateMetadataManifest:
     return RelativeStateMetadataManifest(

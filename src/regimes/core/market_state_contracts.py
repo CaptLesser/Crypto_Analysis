@@ -18,6 +18,13 @@ from src.regimes.core.contracts import (
     require_schema_version,
     validate_layer_axis_band,
 )
+from src.regimes.core.paths import (
+    default_foundation_report_root,
+    is_production_adjacent_path,
+    is_relative_to,
+    resolve_project_path,
+    resolve_project_root,
+)
 from src.regimes.core.serialization import dumps_json, loads_json, require_json_object, to_jsonable
 
 
@@ -57,42 +64,18 @@ def _unique_tokens(values: Sequence[object], *, field_name: str, require_non_emp
     return out
 
 
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        return path == root or path.is_relative_to(root)
-    except AttributeError:  # pragma: no cover - compatibility only
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return False
-
-
-def _resolved(path: Path) -> Path:
-    return Path(path).expanduser().resolve()
-
-
 def validate_market_state_metadata_report_root(
     report_root: str | Path,
     *,
     project_root: str | Path | None = None,
 ) -> dict[str, Any]:
-    root = _resolved(Path(report_root))
-    project = _resolved(Path(project_root) if project_root is not None else Path.cwd())
-    production_tokens = {"parquet", "regime_definitions", "model_states", "state"}
-    if any(part.lower() in production_tokens for part in root.parts):
+    root = resolve_project_path(report_root, project_root=project_root)
+    project = resolve_project_root(project_root)
+    if is_production_adjacent_path(root, project_root=project):
         raise ValueError("Regime market-state metadata report_root is production-adjacent and is not allowed")
-    production_adjacent_roots = (
-        project / "parquet",
-        project / "regime_definitions",
-        project / "model_states",
-        project / "state",
-    )
-    if any(_is_relative_to(root, _resolved(candidate)) for candidate in production_adjacent_roots):
-        raise ValueError("Regime market-state metadata report_root is production-adjacent and is not allowed")
-    if _is_relative_to(root, project / "reports"):
+    if is_relative_to(root, project / "reports"):
         classification = "project_report_root"
-    elif _is_relative_to(root, project / "logs" / "diagnostics"):
+    elif is_relative_to(root, project / "logs" / "diagnostics"):
         classification = "project_diagnostics_root"
     elif any("pytest" in part.lower() or "tmp" in part.lower() or "temp" in part.lower() for part in root.parts):
         classification = "temporary_report_root"
@@ -395,7 +378,7 @@ def build_market_state_metadata_manifest(
     manifest_id: str = "market_state_metadata_manifest",
     universe: str = "global",
     bands: Sequence[str | RegimeBand] = (RegimeBand.MICRO,),
-    report_root: str | Path = "reports/regimes/foundation/market_state_metadata",
+    report_root: str | Path = default_foundation_report_root("market_state_metadata"),
     feature_families: Sequence[MarketStateFeatureFamilyDeclaration | Mapping[str, Any]] | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> MarketStateMetadataManifest:

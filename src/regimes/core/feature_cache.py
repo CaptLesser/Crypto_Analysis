@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.regimes.core.contracts import CANONICAL_SCHEMA_VERSION, require_json_mapping, require_non_empty_string, require_schema_version
+from src.regimes.core.paths import default_foundation_report_root, is_relative_to, require_foundation_report_root
 from src.regimes.core.serialization import dumps_json, loads_json, require_json_object, to_jsonable
 
 
@@ -28,7 +29,7 @@ CACHE_DECISIONS: tuple[str, ...] = (
     CACHE_DECISION_INVALIDATE,
 )
 
-FOUNDATION_FEATURE_CACHE_ROOT = Path("reports") / "regimes" / "foundation"
+FOUNDATION_FEATURE_CACHE_ROOT = default_foundation_report_root()
 
 
 def _token(value: object, *, field_name: str) -> str:
@@ -87,51 +88,22 @@ def _decision_status(value: object) -> str:
     return decision
 
 
-def _resolve_root(path: str | Path) -> Path:
-    root = Path(path).expanduser()
-    if not root.is_absolute():
-        root = Path.cwd() / root
-    return root.resolve()
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        return path == root or path.is_relative_to(root)
-    except AttributeError:  # pragma: no cover - compatibility only
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return False
-
-
 def validate_feature_cache_report_root(
     report_root: str | Path,
     *,
     project_root: str | Path | None = None,
 ) -> Path:
-    root = _resolve_root(report_root)
-    project = _resolve_root(project_root or Path.cwd())
-    production_tokens = {"parquet", "regime_definitions", "model_states", "state"}
-    if any(part.lower() in production_tokens for part in root.parts):
-        raise ValueError("Regime feature cache report root is production-adjacent and is not allowed")
-    for candidate in (
-        project / "parquet",
-        project / "regime_definitions",
-        project / "model_states",
-        project / "state",
-    ):
-        if _is_relative_to(root, _resolve_root(candidate)):
-            raise ValueError("Regime feature cache report root is production-adjacent and is not allowed")
-    normalized = tuple(part.lower() for part in root.parts)
-    if len(normalized) < 3 or normalized[-3:] != ("reports", "regimes", "foundation"):
-        raise ValueError("Regime feature cache report root must end with reports/regimes/foundation")
-    return root
+    return require_foundation_report_root(
+        report_root,
+        project_root=project_root,
+        required_suffix=("reports", "regimes", "foundation"),
+        error_prefix="Regime feature cache report root",
+    )
 
 
 def _safe_child(root: Path, *parts: str) -> Path:
     candidate = root.joinpath(*parts).resolve()
-    if not _is_relative_to(candidate, root):
+    if not is_relative_to(candidate, root):
         raise ValueError("Regime feature cache artifact path must stay under the report root")
     return candidate
 
