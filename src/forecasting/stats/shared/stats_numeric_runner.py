@@ -741,6 +741,24 @@ def _run_stats_asset_shard_core(
                     "convergence_warning_count": int(fit_meta.get("convergence_warning_count", 0) or 0),
                     "nonconverged_fit_count": int(fit_meta.get("nonconverged_fit_count", 0) or 0),
                     "fit_retry_count": int(fit_meta.get("fit_retry_count", 0) or 0),
+                    "retry_resolved_count": int(fit_meta.get("fit_retry_resolved_count", fit_meta.get("retry_resolved_count", 0)) or 0),
+                    "fit_count": int(fit_meta.get("fit_count", fit_meta.get("fit_success_count", fit_meta.get("forecast_fit_count", 0))) or 0),
+                    "origin_count": int(fit_meta.get("origin_count", fit_meta.get("forecast_origin_count", 0)) or 0),
+                    "fit_elapsed_s_total": round(float(fit_meta.get("fit_elapsed_s_total", 0.0) or 0.0), 3),
+                    "seconds_per_origin": (
+                        round(float(fit_meta.get("seconds_per_origin")), 6)
+                        if fit_meta.get("seconds_per_origin") is not None
+                        else None
+                    ),
+                    "spec_search_elapsed_s": round(float(fit_meta.get("spec_search_elapsed_s", fit_meta.get("spec_search_elapsed_s_total", 0.0)) or 0.0), 3),
+                    "spec_candidate_count": int(fit_meta.get("spec_candidate_count", fit_meta.get("spec_search_candidate_count", 0)) or 0),
+                    "spec_failed_candidate_count": int(fit_meta.get("spec_failed_candidate_count", fit_meta.get("spec_search_failed_candidate_count", 0)) or 0),
+                    "seasonality_used": bool(fit_meta.get("seasonality_used", fit_meta.get("seasonal_enabled", False))),
+                    "seasonality_source": fit_meta.get("seasonality_source"),
+                    "seasonal_period_bars": fit_meta.get("seasonal_period_bars"),
+                    "order": fit_meta.get("order"),
+                    "seasonal_order": fit_meta.get("seasonal_order"),
+                    "selected_window_bars": fit_meta.get("selected_window_bars"),
                 }
             )
             row_ts = [int(row["ts"]) for row in public_rows if row.get("ts") is not None]
@@ -809,6 +827,20 @@ def _run_stats_asset_shard_core(
                     "convergence_warning_count": 0,
                     "nonconverged_fit_count": 0,
                     "fit_retry_count": 0,
+                    "retry_resolved_count": 0,
+                    "fit_count": 0,
+                    "origin_count": 0,
+                    "fit_elapsed_s_total": 0.0,
+                    "seconds_per_origin": None,
+                    "spec_search_elapsed_s": 0.0,
+                    "spec_candidate_count": 0,
+                    "spec_failed_candidate_count": 0,
+                    "seasonality_used": False,
+                    "seasonality_source": None,
+                    "seasonal_period_bars": None,
+                    "order": None,
+                    "seasonal_order": None,
+                    "selected_window_bars": None,
                 }
             )
             updates.append(

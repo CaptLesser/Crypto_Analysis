@@ -170,6 +170,20 @@ def regime_label_month_dir(root: Path, ceiling_interval_min: int, asset: str, ye
     )
 
 
+def regime_forecast_month_dir(root: Path, interval_min: int, asset: str, year: int, month: int) -> Path:
+    return (
+        Path(root)
+        / f"{int(interval_min)}"
+        / f"asset={str(asset)}"
+        / f"year={int(year)}"
+        / f"month={int(month):02d}"
+    )
+
+
+def regime_forecast_part_path(root: Path, interval_min: int, asset: str, year: int, month: int) -> Path:
+    return regime_forecast_month_dir(root, interval_min, asset, year, month) / "part-000.parquet"
+
+
 def band_for_ceiling(ceiling_interval_min: int) -> RegimeBandContract:
     try:
         return REGIME_CEILING_TO_BAND[int(ceiling_interval_min)]

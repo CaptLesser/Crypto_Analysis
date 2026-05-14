@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import importlib
 import json
 import math
@@ -44,6 +45,8 @@ class BayesianOptunaModelSpec:
 CURRENT_MODEL_SPEC: Optional[BayesianOptunaModelSpec] = None
 CURRENT_NUMERICS: Any = None
 CURRENT_OPTUNA_PROFILE: Any = None
+_STAGE3_SETUP_CACHE_MAX_ENTRIES = 64
+_STAGE3_SETUP_CACHE_MAX_BYTES = 512 * 1024 * 1024
 
 
 def configure_for_model(model_spec: BayesianOptunaModelSpec) -> None:
@@ -98,6 +101,88 @@ class MetricResult:
     first_prediction_ts: Optional[int]
     last_prediction_ts: Optional[int]
     params_label: str
+
+
+class _Stage3SetupCache:
+    def __init__(self, *, max_entries: int = _STAGE3_SETUP_CACHE_MAX_ENTRIES, max_bytes: int = _STAGE3_SETUP_CACHE_MAX_BYTES) -> None:
+        self._max_entries = max(1, int(max_entries))
+        self._max_bytes = max(1, int(max_bytes))
+        self._entries: "OrderedDict[Tuple[Any, ...], Tuple[Any, int]]" = OrderedDict()
+        self._bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._puts = 0
+        self._evictions = 0
+        self._oversize_skips = 0
+
+    @staticmethod
+    def _object_bytes(value: Any) -> int:
+        if isinstance(value, pd.DataFrame):
+            try:
+                return int(value.memory_usage(index=True, deep=True).sum())
+            except Exception:
+                return int(getattr(value, "size", 0)) * 8
+        if isinstance(value, dict):
+            return max(4096, sum(len(inner) for inner in value.values() if isinstance(inner, dict)) * 24)
+        return 4096
+
+    @staticmethod
+    def _copy_value(value: Any) -> Any:
+        if isinstance(value, pd.DataFrame):
+            return value.copy(deep=True)
+        if isinstance(value, dict):
+            return {
+                key: (dict(inner) if isinstance(inner, dict) else inner)
+                for key, inner in value.items()
+            }
+        return value
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._puts = 0
+        self._evictions = 0
+        self._oversize_skips = 0
+
+    def get(self, key: Tuple[Any, ...]) -> Any:
+        entry = self._entries.get(key)
+        if entry is None:
+            self._misses += 1
+            return None
+        value, _byte_size = entry
+        self._entries.move_to_end(key)
+        self._hits += 1
+        return self._copy_value(value)
+
+    def put(self, key: Tuple[Any, ...], value: Any) -> None:
+        stored = self._copy_value(value)
+        byte_size = self._object_bytes(stored)
+        if byte_size > self._max_bytes:
+            self._oversize_skips += 1
+            return
+        old = self._entries.pop(key, None)
+        if old is not None:
+            self._bytes -= int(old[1])
+        self._entries[key] = (stored, byte_size)
+        self._bytes += byte_size
+        self._puts += 1
+        while self._entries and (len(self._entries) > self._max_entries or self._bytes > self._max_bytes):
+            _, (_, evicted_size) = self._entries.popitem(last=False)
+            self._bytes -= int(evicted_size)
+            self._evictions += 1
+
+    def stats(self) -> Dict[str, int]:
+        return {
+            "cache_entries": int(len(self._entries)),
+            "cache_bytes_estimate": int(self._bytes),
+            "cache_hit_count": int(self._hits),
+            "cache_miss_count": int(self._misses),
+            "cache_put_count": int(self._puts),
+            "cache_eviction_count": int(self._evictions),
+            "cache_oversize_skip_count": int(self._oversize_skips),
+        }
 
 
 def utc_now_stamp() -> str:
@@ -220,6 +305,56 @@ def _source_feature_root(fallback: Optional[Path] = None) -> Path:
     return Path(resolve_path("source_feature_root", profile=profile, required=False) or fallback or _source_ohlcvt_root())
 
 
+def _path_stat_identity(path: Optional[Path]) -> Tuple[str, int, int, int]:
+    if path is None:
+        return ("", 0, 0, 0)
+    try:
+        resolved = Path(path).resolve()
+        stat = resolved.stat()
+        ctime_ns = getattr(stat, "st_ctime_ns", None)
+        if ctime_ns is None:
+            ctime_ns = int(float(getattr(stat, "st_ctime", 0.0)) * 1_000_000_000)
+        return (str(resolved), int(stat.st_size), int(stat.st_mtime_ns), int(ctime_ns))
+    except Exception:
+        return (str(path), 0, 0, 0)
+
+
+def _setup_common_key(
+    *,
+    combo: ComboSpec,
+    args: argparse.Namespace,
+    feature_profile_json: Optional[Path],
+    selected_feature_columns: Optional[Sequence[str]],
+    history_start_ts: int,
+    eval_end_ts: int,
+    use_dynamic_features: bool,
+    use_seasonality: bool,
+) -> Tuple[Any, ...]:
+    ohlc_root = _source_ohlcvt_root().resolve()
+    feature_root = _source_feature_root(fallback=ohlc_root).resolve()
+    selected_key = None if selected_feature_columns is None else tuple(str(col) for col in selected_feature_columns)
+    return (
+        "Bayesian_Numeric",
+        str(CURRENT_MODEL_SPEC.model_key),
+        str(getattr(CURRENT_NUMERICS.MODULE_SPEC, "module_key", CURRENT_MODEL_SPEC.model_key)),
+        int(combo.interval),
+        int(combo.horizon_minutes),
+        str(combo.task),
+        int(history_start_ts),
+        int(eval_end_ts),
+        int(getattr(args, "recent_eval_days", 0)),
+        int(getattr(args, "history_window_months", 0)),
+        int(getattr(args, "max_eval_origins", 0)),
+        str(ohlc_root),
+        str(feature_root),
+        _path_stat_identity(feature_profile_json),
+        selected_key,
+        bool(use_dynamic_features),
+        bool(use_seasonality),
+        bool(CURRENT_NUMERICS.MODULE_SPEC.needs_factor_cache),
+    )
+
+
 def _evaluate_window(edge_ts: int, recent_eval_days: int, history_window_months: int) -> Tuple[int, int]:
     eval_end_ts = int(edge_ts)
     eval_start_ts = int(edge_ts) - int(recent_eval_days) * 86400
@@ -286,7 +421,13 @@ def _build_factor_maps(frames: Dict[str, pd.DataFrame], combo: ComboSpec) -> Dic
     return factor_maps
 
 
-def build_datasets(combo: ComboSpec, assets: Sequence[str], args: argparse.Namespace, telemetry_path: Optional[Path] = None) -> List[Dataset]:
+def build_datasets(
+    combo: ComboSpec,
+    assets: Sequence[str],
+    args: argparse.Namespace,
+    telemetry_path: Optional[Path] = None,
+    setup_cache: Optional[_Stage3SetupCache] = None,
+) -> List[Dataset]:
     with telemetry_scope_for_path(
         telemetry_path,
         family="Bayesian_Numeric",
@@ -329,21 +470,54 @@ def build_datasets(combo: ComboSpec, assets: Sequence[str], args: argparse.Names
             else None
         )
         frames: Dict[str, pd.DataFrame] = {}
+        frame_keys: Dict[str, Tuple[Any, ...]] = {}
         for asset in assets:
-            frame = _load_asset_frame(
-                str(asset),
-                combo,
-                int(history_start_ts),
-                int(eval_end_ts),
-                selected_dynamic_feature_columns=(
-                    tuple(str(value) for value in combo_profile.selected_dynamic_feature_columns)
-                    if combo_profile is not None and combo_profile.use_dynamic_features
-                    else ()
-                ) if combo_profile is not None else None,
+            selected_dynamic_feature_columns = (
+                tuple(str(value) for value in combo_profile.selected_dynamic_feature_columns)
+                if combo_profile is not None and combo_profile.use_dynamic_features
+                else ()
+            ) if combo_profile is not None else None
+            use_dynamic_features = (
+                bool(combo_profile.use_dynamic_features)
+                if combo_profile is not None
+                else bool(CURRENT_NUMERICS.MODULE_SPEC.needs_dynamic_features)
             )
+            use_seasonality = (
+                bool(combo_profile.use_seasonality)
+                if combo_profile is not None
+                else bool(CURRENT_NUMERICS.MODULE_SPEC.use_seasonality)
+            )
+            common_key = _setup_common_key(
+                combo=combo,
+                args=args,
+                feature_profile_json=feature_profile_json,
+                selected_feature_columns=selected_dynamic_feature_columns,
+                history_start_ts=int(history_start_ts),
+                eval_end_ts=int(eval_end_ts),
+                use_dynamic_features=use_dynamic_features,
+                use_seasonality=use_seasonality,
+            )
+            frame_key = ("asset_frame", str(asset), common_key)
+            frame_keys[str(asset)] = frame_key
+            frame = setup_cache.get(frame_key) if setup_cache is not None else None
+            if frame is None:
+                frame = _load_asset_frame(
+                    str(asset),
+                    combo,
+                    int(history_start_ts),
+                    int(eval_end_ts),
+                    selected_dynamic_feature_columns=selected_dynamic_feature_columns,
+                )
+                if setup_cache is not None and not frame.empty:
+                    setup_cache.put(frame_key, frame)
             if frame.empty:
                 continue
-            labels = _label_frame(frame, combo)
+            label_key = ("labels", str(asset), common_key)
+            labels = setup_cache.get(label_key) if setup_cache is not None else None
+            if labels is None:
+                labels = _label_frame(frame, combo)
+                if setup_cache is not None:
+                    setup_cache.put(label_key, labels)
             label_col = NUMERIC_TASK_TO_TARGET_COLUMN[str(combo.task)]
             if label_col in frame.columns and label_col in labels.columns:
                 frame = frame.drop(columns=[label_col])
@@ -351,7 +525,61 @@ def build_datasets(combo: ComboSpec, assets: Sequence[str], args: argparse.Names
             if merged.columns.has_duplicates:
                 merged = merged.loc[:, ~merged.columns.duplicated(keep="last")].copy()
             frames[str(asset)] = merged
-        factor_maps = _build_factor_maps(frames, combo)
+        factor_key = (
+            "factor_maps",
+            tuple(str(asset) for asset in assets),
+            tuple(frame_keys.get(str(asset)) for asset in assets),
+            bool(CURRENT_NUMERICS.MODULE_SPEC.needs_factor_cache),
+        )
+        factor_maps = setup_cache.get(factor_key) if setup_cache is not None else None
+        if factor_maps is None:
+            factor_started = time.perf_counter()
+            factor_maps = _build_factor_maps(frames, combo)
+            emit_event_for_path(
+                telemetry_path,
+                family="Bayesian_Numeric",
+                model=str(CURRENT_MODEL_SPEC.model_key),
+                stage="stage3",
+                function_name="_build_factor_maps",
+                module_name=__name__,
+                phase_name="factor_map_build",
+                parent_phase="dataset_construction",
+                combo_key=combo.tuple_label,
+                interval_minutes=int(combo.interval),
+                horizon_minutes=int(combo.horizon_minutes),
+                training_window_months=int(combo.training_window_months),
+                task=str(combo.task),
+                elapsed_seconds=time.perf_counter() - factor_started,
+                input_rows=sum(len(frame) for frame in frames.values()),
+                output_rows=sum(len(mapping) for mapping in factor_maps.values()),
+                asset_count=len(frames),
+                cache_hit_count=0,
+                cache_miss_count=1,
+            )
+            if setup_cache is not None:
+                setup_cache.put(factor_key, factor_maps)
+        else:
+            emit_event_for_path(
+                telemetry_path,
+                family="Bayesian_Numeric",
+                model=str(CURRENT_MODEL_SPEC.model_key),
+                stage="stage3",
+                function_name="_build_factor_maps",
+                module_name=__name__,
+                phase_name="factor_map_build",
+                parent_phase="dataset_construction",
+                combo_key=combo.tuple_label,
+                interval_minutes=int(combo.interval),
+                horizon_minutes=int(combo.horizon_minutes),
+                training_window_months=int(combo.training_window_months),
+                task=str(combo.task),
+                elapsed_seconds=0.0,
+                input_rows=sum(len(frame) for frame in frames.values()),
+                output_rows=sum(len(mapping) for mapping in factor_maps.values()),
+                asset_count=len(frames),
+                cache_hit_count=1,
+                cache_miss_count=0,
+            )
         datasets: List[Dataset] = []
         label_col = NUMERIC_TASK_TO_TARGET_COLUMN[str(combo.task)]
         for asset, frame in frames.items():
@@ -399,17 +627,31 @@ def build_datasets(combo: ComboSpec, assets: Sequence[str], args: argparse.Names
             output_rows=sum(len(dataset.frame) for dataset in datasets),
             reason_code="" if datasets else "objective_dataset_empty",
             artifact_profile_source=str(feature_profile_json or ""),
+            selected_feature_count=max((len(dataset.selected_dynamic_feature_columns) for dataset in datasets), default=0),
+            dynamic_feature_count=max((len(dataset.selected_dynamic_feature_columns) for dataset in datasets), default=0),
+            **(setup_cache.stats() if setup_cache is not None else {}),
         )
         return datasets
 
 
-def _build_datasets_with_telemetry(combo: ComboSpec, assets: Sequence[str], args: argparse.Namespace, telemetry_path: Optional[Path]) -> List[Dataset]:
+def _build_datasets_with_telemetry(
+    combo: ComboSpec,
+    assets: Sequence[str],
+    args: argparse.Namespace,
+    telemetry_path: Optional[Path],
+    setup_cache: Optional[_Stage3SetupCache] = None,
+) -> List[Dataset]:
     try:
-        return build_datasets(combo, assets, args, telemetry_path=telemetry_path)
+        return build_datasets(combo, assets, args, telemetry_path=telemetry_path, setup_cache=setup_cache)
     except TypeError as exc:
-        if "telemetry_path" not in str(exc):
+        if "telemetry_path" not in str(exc) and "setup_cache" not in str(exc):
             raise
-        return build_datasets(combo, assets, args)
+        try:
+            return build_datasets(combo, assets, args, telemetry_path=telemetry_path)
+        except TypeError as retry_exc:
+            if "telemetry_path" not in str(retry_exc):
+                raise
+            return build_datasets(combo, assets, args)
 
 
 def evaluate_dataset(dataset: Dataset, params: Dict[str, Any], params_label: str) -> MetricResult:
@@ -622,6 +864,9 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         module_name=__name__,
         phase_name="study_setup",
         parent_phase="tuning",
+        event_type="setup_control",
+        setup_control=True,
+        row_producing=False,
         combo_key=combo.tuple_label,
         interval_minutes=int(combo.interval),
         horizon_minutes=int(combo.horizon_minutes),
@@ -812,30 +1057,34 @@ def main_for_model(model_spec: BayesianOptunaModelSpec) -> None:
     combo_rows: List[Dict[str, Any]] = []
     metric_rows: List[MetricResult] = []
     trial_rows: List[Dict[str, Any]] = []
-    for combo in combos:
-        datasets = _build_datasets_with_telemetry(combo, assets, args, output_dir)
-        if not datasets:
-            combo_rows.append(
-                {
-                    "combo": combo.tuple_label,
-                    "status": "ineligible",
-                    "reason": "no_evaluation_datasets",
-                    "baseline_rmse": None,
-                    "tuned_rmse": None,
-                    "baseline_mae": None,
-                    "tuned_mae": None,
-                    "rmse_delta": None,
-                    "mae_delta": None,
-                    "trial_count": 0,
-                }
-            )
-            continue
-        for dataset in datasets:
-            sample_rows.append({"combo": combo.tuple_label, "asset": dataset.asset, "eval_start_ts": int(dataset.eval_start_ts), "eval_end_ts": int(dataset.eval_end_ts), "rows": int(len(dataset.frame)), "origin_count": int(len(dataset.origins))})
-        combo_row, baseline_metrics, tuned_metrics, combo_trials = run_study_for_combo(combo, datasets, trials_per_combo=int(args.trials_per_combo), sampler_seed=int(args.sampler_seed), storage=(str(args.storage).strip() or None), study_name_prefix=str(args.study_name_prefix), resume_study=bool(args.resume_study), model_threads=int(args.model_threads), telemetry_path=output_dir)
-        combo_rows.append(combo_row)
-        metric_rows.extend(list(baseline_metrics))
-        metric_rows.extend(list(tuned_metrics))
-        trial_rows.extend(combo_trials)
-    write_outputs(output_dir, sample_rows, combo_rows, metric_rows, trial_rows)
+    setup_cache = _Stage3SetupCache()
+    try:
+        for combo in combos:
+            datasets = _build_datasets_with_telemetry(combo, assets, args, output_dir, setup_cache=setup_cache)
+            if not datasets:
+                combo_rows.append(
+                    {
+                        "combo": combo.tuple_label,
+                        "status": "ineligible",
+                        "reason": "no_evaluation_datasets",
+                        "baseline_rmse": None,
+                        "tuned_rmse": None,
+                        "baseline_mae": None,
+                        "tuned_mae": None,
+                        "rmse_delta": None,
+                        "mae_delta": None,
+                        "trial_count": 0,
+                    }
+                )
+                continue
+            for dataset in datasets:
+                sample_rows.append({"combo": combo.tuple_label, "asset": dataset.asset, "eval_start_ts": int(dataset.eval_start_ts), "eval_end_ts": int(dataset.eval_end_ts), "rows": int(len(dataset.frame)), "origin_count": int(len(dataset.origins))})
+            combo_row, baseline_metrics, tuned_metrics, combo_trials = run_study_for_combo(combo, datasets, trials_per_combo=int(args.trials_per_combo), sampler_seed=int(args.sampler_seed), storage=(str(args.storage).strip() or None), study_name_prefix=str(args.study_name_prefix), resume_study=bool(args.resume_study), model_threads=int(args.model_threads), telemetry_path=output_dir)
+            combo_rows.append(combo_row)
+            metric_rows.extend(list(baseline_metrics))
+            metric_rows.extend(list(tuned_metrics))
+            trial_rows.extend(combo_trials)
+        write_outputs(output_dir, sample_rows, combo_rows, metric_rows, trial_rows)
+    finally:
+        setup_cache.clear()
     print(json.dumps({"output_dir": str(output_dir), "combo_count": len(combo_rows)}, indent=2))

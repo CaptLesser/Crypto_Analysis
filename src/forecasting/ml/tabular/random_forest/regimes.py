@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,7 +13,6 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, log_loss
 
-from src.forecasting.common.io_atomic import atomic_replace, sibling_temp_path
 from src.forecasting.common.ohlcvt_source import read_ohlcvt
 from src.forecasting.common.path_config import resolve_path, selected_profile
 from src.features.scalar_features import (
@@ -36,12 +33,8 @@ from src.forecasting.common.ml_module_utils import (
     get_module_logger,
     horizon_bars_from_minutes as shared_horizon_bars_from_minutes,
     is_tail_index,
-    make_unit_key,
     prune_pending_ts,
-    read_ml_state,
-    replace_pending_entries_for_unit,
     select_regime_feature_columns,
-    write_ml_state,
 )
 from src.forecasting.ml.shared.regime_forecast_io import read_regime_labels
 from src.forecasting.ml.shared.regime_targets import (
@@ -50,6 +43,33 @@ from src.forecasting.ml.shared.regime_targets import (
     axis_label_id_column,
     future_axis_targets,
 )
+from src.forecasting.ml.tabular.shared.regime_forecast_runner import (
+    RegimeForecastIOConfig,
+    RegimeForecastTask,
+    RegimeForecastWorkItem,
+    RegimeFamilyModuleSpec,
+    apply_regime_unit_results,
+    build_regime_arg_parser,
+    dispatch_regime_work_items,
+    group_regime_tasks,
+    plan_regime_group_work,
+    regime_family_output_root,
+    regime_forecast_horizon_output_max_ts,
+    regime_build_run_manifest,
+    regime_pending_prefix,
+    regime_pending_ts_for_unit,
+    regime_read_state,
+    regime_replace_pending_for_unit,
+    regime_unit_meta,
+    regime_unit_key,
+    regime_write_month_parts,
+    regime_write_run_manifest,
+    regime_write_state,
+    resolve_regime_io_config,
+    resolve_regime_runtime_snapshot,
+    resolve_regime_run_plan,
+    resolve_regime_tasks,
+)
 from src.regimes.contracts import (
     REGIME_AXIS_ORDER,
     REGIME_DEFAULT_FORECAST_INTERVALS,
@@ -57,9 +77,8 @@ from src.regimes.contracts import (
     axis_id_to_label,
     axis_target,
     forecast_ceiling_interval,
-    forecast_output_columns,
 )
-from src.forecasting.common.runtime_config import cap_model_threads, get_model_threads, get_workers, log_resolved_runtime
+from src.forecasting.common.runtime_config import log_resolved_runtime
 
 try:
     from sklearn.ensemble import RandomForestClassifier  # type: ignore
@@ -85,6 +104,7 @@ WATERMARK_FILE = STATE_ROOT / "ml_watermarks.json"
 PENDING_FILE = STATE_ROOT / "ml_pending.json"
 PROGRESS_FILE = STATE_ROOT / "ml_progress.json"
 MANIFEST_FILE = STATE_ROOT / "ml_run_manifest.json"
+REGIME_IO_CONFIG: Optional[RegimeForecastIOConfig] = None
 
 REGIME_ROOT = Path(
     resolve_path("source_regime_root", profile=PIPELINE_PROFILE, required=False)
@@ -113,6 +133,27 @@ WINDOW_SWITCH_COOLDOWN_DAYS = int(os.getenv("RF_REGIME_WINDOW_COOLDOWN_DAYS", "1
 NEUTRAL_CLASS = 1
 CLASS_LABELS = [0, 1, 2]
 
+REGIME_RUNNER_SPEC = RegimeFamilyModuleSpec(
+    module_slug="random_forest_regimes",
+    family_name=FAMILY,
+    prediction_prefix="rf",
+    log_prefix="[rf]",
+    parquet_root_env="PIPELINE_PARQUET_RF_REGIMES_ROOT",
+    progress_seconds_env="RF_REGIME_PROGRESS_SECONDS",
+    source_start_env="RF_REGIME_SOURCE_START_TS",
+    source_end_env="RF_REGIME_SOURCE_END_TS",
+    work_start_env="RF_REGIME_WORK_START_TS",
+    forecast_resume_edge_env="RF_REGIME_FORECAST_RESUME_EDGE_TS",
+    default_unit_workers=1,
+    default_model_threads=4,
+    max_logical_threads=32,
+    thread_env_vars=("RF_REGIME_N_JOBS",),
+    thread_param_name="n_jobs",
+    default_intervals=REGIME_DEFAULT_FORECAST_INTERVALS,
+    default_horizon_minutes=tuple(DEFAULT_HORIZON_MINUTES),
+    axes=REGIME_AXIS_ORDER,
+)
+
 REFIT_EVAL_BARS = int(os.getenv("RF_REGIME_REFIT_EVAL_BARS", "500"))
 REFIT_CHECK_K = int(os.getenv("RF_REGIME_REFIT_K", "2"))
 REFIT_CHECK_M = int(os.getenv("RF_REGIME_REFIT_M", "3"))
@@ -131,7 +172,7 @@ RF_PARAMS = {
     "max_features": os.getenv("RF_REGIME_MAX_FEATURES", "sqrt"),
     "bootstrap": os.getenv("RF_REGIME_BOOTSTRAP", "1").strip() == "1",
     "random_state": int(os.getenv("RF_REGIME_RANDOM_STATE", "17")),
-    "n_jobs": int(os.getenv("RF_REGIME_N_JOBS", str(get_model_threads("random_forest_numerics", 4)))),
+    "n_jobs": int(os.getenv("RF_REGIME_N_JOBS", str(REGIME_RUNNER_SPEC.default_model_threads))),
 }
 
 
@@ -142,19 +183,30 @@ def log(msg: str) -> None:
 _LOGGER = get_module_logger("random_forest_regimes", LOG_FILE, base_log_fn=lambda m: base_log(f"[random_forest_regimes] {m}"))
 
 
+def _apply_io_config(io_config: RegimeForecastIOConfig) -> RegimeForecastIOConfig:
+    global REGIME_IO_CONFIG, PARQUET_ROOT, OUTPUT_ROOT, STATE_ROOT
+    global WATERMARK_FILE, PENDING_FILE, PROGRESS_FILE, MANIFEST_FILE
+    global REGIME_ROOT, SCALAR_ROOT, OHLCVT_PARQUET_ROOT
+    REGIME_IO_CONFIG = io_config
+    PARQUET_ROOT = Path(io_config.parquet_root)
+    OUTPUT_ROOT = regime_family_output_root(io_config, REGIME_RUNNER_SPEC)
+    STATE_ROOT = Path(io_config.state_root)
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    WATERMARK_FILE = STATE_ROOT / "ml_watermarks.json"
+    PENDING_FILE = STATE_ROOT / "ml_pending.json"
+    PROGRESS_FILE = STATE_ROOT / "ml_progress.json"
+    MANIFEST_FILE = STATE_ROOT / "ml_run_manifest.json"
+    REGIME_ROOT = Path(io_config.regime_label_root)
+    SCALAR_ROOT = Path(io_config.scalar_root)
+    OHLCVT_PARQUET_ROOT = Path(io_config.ohlc_root)
+    return io_config
+
+
 def read_json(path: Path) -> dict:
     if not path.exists():
         return {}
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def write_json(path: Path, obj: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = sibling_temp_path(path)
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, sort_keys=True)
-    atomic_replace(tmp, path)
 
 
 def month_start_ts(year: int, month: int) -> int:
@@ -187,44 +239,56 @@ def horizon_bars_from_minutes(horizon_minutes: int, interval_minutes: int) -> in
 
 
 def _unit_key(horizon_minutes: int, asset: str, interval: int) -> str:
-    return make_unit_key(FAMILY, DOMAIN, TASK, horizon_minutes, asset, interval)
+    return regime_unit_key(
+        family=FAMILY,
+        domain=DOMAIN,
+        task=TASK,
+        horizon_minutes=int(horizon_minutes),
+        asset=str(asset),
+        interval=int(interval),
+    )
 
 
 def _unit_meta(horizon_minutes: int, horizon_bars: int, asset: str, interval: int) -> dict:
-    return {
-        "family": FAMILY,
-        "domain": DOMAIN,
-        "task": TASK,
-        "horizon_minutes": int(horizon_minutes),
-        "horizon_bars": int(horizon_bars),
-        "asset": str(asset),
-        "interval": int(interval),
-        "requested_interval": int(interval),
-        "resolved_regime_ceiling_interval": int(forecast_ceiling_interval(interval)),
-    }
+    return regime_unit_meta(
+        REGIME_RUNNER_SPEC,
+        family=FAMILY,
+        domain=DOMAIN,
+        task=TASK,
+        horizon_minutes=int(horizon_minutes),
+        horizon_bars=int(horizon_bars),
+        asset=str(asset),
+        interval=int(interval),
+    )
 
 
 def _read_state() -> Tuple[dict, dict, dict]:
-    return read_ml_state(STATE_ROOT, default_compaction={})
+    return regime_read_state(STATE_ROOT)
 
 def _write_state(watermarks: dict, pending: dict, progress: dict) -> None:
-    write_ml_state(STATE_ROOT, watermarks, pending, progress)
+    regime_write_state(STATE_ROOT, watermarks, pending, progress)
 
 def _pending_prefix(horizon_minutes: int, asset: str, interval: int) -> str:
-    return f"{_unit_key(horizon_minutes, asset, interval)}|"
+    return regime_pending_prefix(
+        family=FAMILY,
+        domain=DOMAIN,
+        task=TASK,
+        horizon_minutes=int(horizon_minutes),
+        asset=str(asset),
+        interval=int(interval),
+    )
 
 
 def _pending_ts_for_unit(pending: dict, horizon_minutes: int, asset: str, interval: int) -> List[int]:
-    pref = _pending_prefix(horizon_minutes, asset, interval)
-    out: List[int] = []
-    for key, val in (pending.get("entries", {}) if isinstance(pending.get("entries", {}), dict) else {}).items():
-        if not str(key).startswith(pref):
-            continue
-        try:
-            out.append(int(val.get("ts")))
-        except Exception:
-            continue
-    return sorted(set(out))
+    return regime_pending_ts_for_unit(
+        pending,
+        family=FAMILY,
+        domain=DOMAIN,
+        task=TASK,
+        horizon_minutes=int(horizon_minutes),
+        asset=str(asset),
+        interval=int(interval),
+    )
 
 
 def _replace_pending_for_unit(
@@ -235,13 +299,17 @@ def _replace_pending_for_unit(
     interval: int,
     ts_list: Sequence[int],
 ) -> None:
-    meta = _unit_meta(horizon_minutes, horizon_bars, asset, interval)
-    replace_pending_entries_for_unit(
-        pending=pending,
-        unit_key=_unit_key(horizon_minutes, asset, interval),
-        unit_meta=meta,
+    regime_replace_pending_for_unit(
+        pending,
+        REGIME_RUNNER_SPEC,
+        family=FAMILY,
+        domain=DOMAIN,
+        task=TASK,
+        horizon_minutes=int(horizon_minutes),
+        horizon_bars=int(horizon_bars),
+        asset=str(asset),
+        interval=int(interval),
         ts_list=ts_list,
-        reason="tail_pending",
     )
 
 
@@ -804,58 +872,40 @@ def _walk_forward_predict(
     return out, sorted(pending_ts), meta
 
 
-def _output_file_path(interval: int, year: int, month: int, run_id: str, horizon_minutes: int) -> Path:
-    return (
-        OUTPUT_ROOT
-        / f"{interval}"
-        / f"year={year}"
-        / f"month={month:02d}"
-        / f"part-random_forest_regimes_{interval}-{year}{month:02d}-h{horizon_minutes}m-{run_id}.parquet"
-    )
-
-
 def _write_month_parts(
     month_frames: Dict[Tuple[int, int], List[pd.DataFrame]],
     interval: int,
     horizon_minutes: int,
-    run_id: str,
-    compaction_state: dict,
 ) -> List[dict]:
-    if not month_frames:
-        return []
-    out_cols = list(forecast_output_columns("rf", horizon_minutes)) + [
+    compatibility_columns = [
         f"rf_pred_regime3_{horizon_minutes}m",
         f"rf_pred_regime3_prob_{horizon_minutes}m",
     ]
-    parts: List[dict] = []
-    for (y, m), frames in sorted(month_frames.items()):
-        if not frames:
-            continue
-        chunk = pd.concat(frames, ignore_index=True)
-        chunk = chunk[["ts", "asset"] + out_cols].copy()
-        chunk = chunk.sort_values(["ts", "asset"]).drop_duplicates(subset=["asset", "ts"], keep="last")
-        dst = _output_file_path(interval, int(y), int(m), run_id, horizon_minutes)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        tmp = sibling_temp_path(dst, suffix=".parquet.tmp")
-        chunk.to_parquet(tmp, engine="pyarrow", compression=PARQUET_COMPRESSION, index=False, row_group_size=PARQUET_ROW_GROUP)
-        atomic_replace(tmp, dst)
-        month_files = list(dst.parent.glob("*.parquet"))
-        if len(month_files) > 1:
-            compaction_state.setdefault(str(interval), {})[f"{int(y):04d}-{int(m):02d}"] = True
-        parts.append(
-            {
-                "path": str(dst),
-                "rows": int(len(chunk)),
-                "assets": sorted(set(str(x) for x in chunk["asset"].astype(str).tolist())),
-                "interval": int(interval),
-                "horizon_minutes": int(horizon_minutes),
-                "year": int(y),
-                "month": int(m),
-                "min_ts": int(chunk["ts"].min()),
-                "max_ts": int(chunk["ts"].max()),
-            }
-        )
-    return parts
+    return regime_write_month_parts(
+        month_frames,
+        output_root=OUTPUT_ROOT,
+        spec=REGIME_RUNNER_SPEC,
+        interval=int(interval),
+        horizon_minutes=int(horizon_minutes),
+        compatibility_columns=compatibility_columns,
+        parquet_compression=PARQUET_COMPRESSION,
+        parquet_row_group=PARQUET_ROW_GROUP,
+    )
+
+
+def _resolve_task_records(
+    intervals: Sequence[int],
+    assets_arg: str,
+    horizon_minutes_list: Sequence[int],
+) -> Tuple[RegimeForecastTask, ...]:
+    return resolve_regime_tasks(
+        intervals=intervals,
+        horizon_minutes_list=horizon_minutes_list,
+        assets_arg=str(assets_arg),
+        list_assets_from_ohlcvt_fn=lambda interval: list_assets_from_ohlcvt(int(interval), root=OHLCVT_PARQUET_ROOT),
+        assets_present_in_features_fn=lambda interval: assets_present_in_features(int(interval), root=SCALAR_ROOT),
+        horizon_bars_from_minutes_fn=horizon_bars_from_minutes,
+    )
 
 
 def _resolve_tasks(
@@ -863,20 +913,10 @@ def _resolve_tasks(
     assets_arg: str,
     horizon_minutes_list: Sequence[int],
 ) -> List[Tuple[str, int, int, int]]:
-    assets: set[str] = set()
-    if assets_arg.strip():
-        assets = {a.strip() for a in assets_arg.split(",") if a.strip()}
-    else:
-        for k in intervals:
-            assets.update(list_assets_from_ohlcvt(k))
-            assets.update(assets_present_in_features(k))
-    tasks: List[Tuple[str, int, int, int]] = []
-    for asset in sorted(assets):
-        for interval in intervals:
-            for hm in horizon_minutes_list:
-                hb = horizon_bars_from_minutes(int(hm), int(interval))
-                tasks.append((asset, int(interval), int(hm), int(hb)))
-    return tasks
+    return [
+        (task.asset, task.interval, task.horizon_minutes, task.horizon_bars)
+        for task in _resolve_task_records(intervals, assets_arg, horizon_minutes_list)
+    ]
 
 
 def _get_stop_ts(asset: str, interval: int) -> Optional[int]:
@@ -884,38 +924,57 @@ def _get_stop_ts(asset: str, interval: int) -> Optional[int]:
     return int(mx) if mx is not None else None
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Walk-forward RandomForest regime forecasting from canonical axis labels.")
-    parser.add_argument("--intervals", type=str, default=",".join(str(x) for x in DEFAULT_INTERVALS))
-    parser.add_argument("--assets", type=str, default="", help="Comma-delimited assets")
-    parser.add_argument("--horizon-minutes", type=str, default="30,240,720", help="Comma-delimited horizons in minutes")
-    parser.add_argument("--mode", type=str, default="incremental", choices=["incremental", "backfill"])
-    parser.add_argument("--unit-workers", type=int, default=get_workers("random_forest_numerics", "unit_workers", 1))
-    args = parser.parse_args()
-    args.unit_workers = max(1, int(args.unit_workers))
-    resolved_model_threads = cap_model_threads(
-        workers=int(args.unit_workers),
-        model_threads=get_model_threads("random_forest_numerics", 4),
-        max_logical_threads=32,
-    )
-    RF_PARAMS["n_jobs"] = int(resolved_model_threads)
-    log_resolved_runtime(
-        "random_forest_numerics",
-        resolved={
-            "unit_workers": int(args.unit_workers),
-            "model_threads": int(resolved_model_threads),
-            "writer_workers": 1,
-        },
+def _get_horizon_output_tail(asset: str, interval: int, horizon_minutes: int) -> Optional[int]:
+    return regime_forecast_horizon_output_max_ts(
+        OUTPUT_ROOT,
+        spec=REGIME_RUNNER_SPEC,
+        interval=int(interval),
+        asset=str(asset),
+        horizon_minutes=int(horizon_minutes),
     )
 
-    intervals = [int(x.strip()) for x in args.intervals.split(",") if x.strip()] or DEFAULT_INTERVALS
-    horizon_minutes_list = [int(x.strip()) for x in args.horizon_minutes.split(",") if x.strip()] or DEFAULT_HORIZON_MINUTES
+
+def main() -> None:
+    parser = build_regime_arg_parser(
+        REGIME_RUNNER_SPEC,
+        description="Walk-forward RandomForest regime forecasting from canonical axis labels.",
+    )
+    args = parser.parse_args()
+    plan = resolve_regime_run_plan(REGIME_RUNNER_SPEC, args)
+    args.unit_workers = int(plan.unit_workers)
+    _apply_io_config(
+        resolve_regime_io_config(
+            REGIME_RUNNER_SPEC,
+            profile=str(getattr(args, "profile", PIPELINE_PROFILE) or PIPELINE_PROFILE),
+            log_fn=log,
+        )
+    )
+    runtime_snapshot = resolve_regime_runtime_snapshot(
+        REGIME_RUNNER_SPEC,
+        args,
+        output_root=OUTPUT_ROOT,
+        diagnostic_root=LOG_DIR,
+    )
+    resolved_model_threads = int(runtime_snapshot["model_threads"])
+    RF_PARAMS["n_jobs"] = int(resolved_model_threads)
+    log_resolved_runtime(REGIME_RUNNER_SPEC.module_slug, resolved=runtime_snapshot)
+
+    intervals = list(plan.intervals)
+    horizon_minutes_list = list(plan.horizon_minutes)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
     try:
-        tasks = _resolve_tasks(intervals=intervals, assets_arg=args.assets, horizon_minutes_list=horizon_minutes_list)
+        task_records = _resolve_task_records(
+            intervals=intervals,
+            assets_arg=args.assets,
+            horizon_minutes_list=horizon_minutes_list,
+        )
     except ValueError as exc:
         raise SystemExit(f"[rf][error] {exc}")
+    tasks = [
+        (task.asset, task.interval, task.horizon_minutes, task.horizon_bars)
+        for task in task_records
+    ]
     if not tasks:
         log("[rf] no tasks to run")
         return
@@ -941,65 +1000,49 @@ def main() -> None:
     manifest_parts: List[dict] = []
     rows_dropped_pre_floor_total = 0
     ts_start_by_asset: Dict[str, int] = {}
-    groups: Dict[Tuple[int, int, int], List[str]] = {}
-    for asset, interval, horizon_minutes, horizon_bars in tasks:
-        groups.setdefault((int(interval), int(horizon_minutes), int(horizon_bars)), []).append(asset)
 
-    for (interval, horizon_minutes, horizon_bars), assets in sorted(groups.items()):
-        assets_sorted = sorted(set(assets))
-        work_items: List[Tuple[str, str, Optional[int], Optional[int], Optional[int], set[int], Optional[int]]] = []
-        for asset in assets_sorted:
-            ukey = _unit_key(horizon_minutes, asset, interval)
-            if ukey in completed:
-                stop_ts = _get_stop_ts(asset, interval)
-                wm = watermarks.get("units", {}).get(ukey, {})
-                prior_pending_ts = _pending_ts_for_unit(pending, horizon_minutes, asset, interval)
-                if (
-                    stop_ts is not None
-                    and wm.get("last_written_ts") is not None
-                    and int(wm.get("last_written_ts")) >= int(stop_ts)
-                    and not prior_pending_ts
-                ):
-                    continue
-                completed.discard(ukey)
-
-            stop_ts = _get_stop_ts(asset, interval)
-            if stop_ts is None:
+    for task_group in group_regime_tasks(task_records):
+        interval = int(task_group.interval)
+        horizon_minutes = int(task_group.horizon_minutes)
+        horizon_bars = int(task_group.horizon_bars)
+        buffer_seconds = int(interval) * 60 * max(0, int(PENDING_PRUNE_BUFFER_BARS))
+        work_plan = plan_regime_group_work(
+            task_group,
+            spec=REGIME_RUNNER_SPEC,
+            family=FAMILY,
+            domain=DOMAIN,
+            task=TASK,
+            watermarks=watermarks,
+            pending=pending,
+            completed_unit_keys=sorted(completed),
+            get_stop_ts_fn=_get_stop_ts,
+            get_horizon_output_tail_fn=_get_horizon_output_tail,
+            pending_prune_buffer_bars=PENDING_PRUNE_BUFFER_BARS,
+            pending_max_retain=(PENDING_MAX_RETAIN if PENDING_MAX_RETAIN > 0 else None),
+        )
+        completed_changed = False
+        for ukey in work_plan.completed_unit_keys:
+            if ukey not in completed:
                 completed.add(ukey)
-                progress["completed"] = sorted(completed)
-                progress["updated_at"] = datetime.now(timezone.utc).isoformat()
-                _write_state(watermarks, pending, progress)
-                continue
+                completed_changed = True
+        for ukey in work_plan.reopened_unit_keys:
+            if ukey in completed:
+                completed.discard(ukey)
+                completed_changed = True
+        if completed_changed:
+            progress["completed"] = sorted(completed)
+            progress["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _write_state(watermarks, pending, progress)
+        work_items = list(work_plan.work_items)
 
-            unit_wm = watermarks.setdefault("units", {}).get(ukey, {})
-            prior_wm = unit_wm.get("last_written_ts")
-            prior_selected_window = unit_wm.get("selected_window_bars")
-            prior_selection_timestamp = unit_wm.get("selection_timestamp")
-            buffer_seconds = int(interval) * 60 * max(0, int(PENDING_PRUNE_BUFFER_BARS))
-            prior_pending_set = set(
-                prune_pending_ts(
-                    _pending_ts_for_unit(pending, horizon_minutes, asset, interval),
-                    last_written_ts=(int(prior_wm) if prior_wm is not None else None),
-                    buffer_seconds=buffer_seconds,
-                    max_entries=(PENDING_MAX_RETAIN if PENDING_MAX_RETAIN > 0 else None),
-                )
-            )
-            work_items.append(
-                (
-                    asset,
-                    ukey,
-                    int(stop_ts),
-                    (int(prior_wm) if prior_wm is not None else None),
-                    (int(prior_selection_timestamp) if prior_selection_timestamp is not None else None),
-                    prior_pending_set,
-                    (int(prior_selected_window) if prior_selected_window is not None else None),
-                )
-            )
-
-        def _compute_one(item: Tuple[str, str, Optional[int], Optional[int], Optional[int], set[int], Optional[int]]) -> Dict[str, Any]:
-            asset, ukey, stop_ts, prior_wm_i, prior_sel_ts_i, prior_pending_set_i, prior_sel_w_i = item
-            if stop_ts is None:
-                return {"ukey": ukey, "asset": asset, "empty": True, "rows_dropped": 0}
+        def _compute_one(item: RegimeForecastWorkItem) -> Dict[str, Any]:
+            asset = str(item.asset)
+            ukey = str(item.unit_key)
+            stop_ts = int(item.stop_ts)
+            prior_wm_i = item.prior_watermark_ts
+            prior_sel_ts_i = item.prior_selection_timestamp
+            prior_pending_set_i = set(int(ts) for ts in item.prior_pending_ts)
+            prior_sel_w_i = item.prior_selected_window_bars
             df = _load_unit_frame(asset=asset, interval=interval, stop_ts=int(stop_ts))
             df, floor_meta = apply_head_floor(df, TS_FLOOR_2021, asset_col="asset", ts_col="ts")
             rows_dropped = int(floor_meta.get("rows_dropped_pre_floor", 0))
@@ -1068,75 +1111,51 @@ def main() -> None:
                 "asset_month_frames": asset_month_frames,
             }
 
-        if args.unit_workers <= 1 or len(work_items) <= 1:
-            unit_results = [_compute_one(w) for w in work_items]
-        else:
-            unit_results = []
-            with ThreadPoolExecutor(max_workers=min(max(1, int(args.unit_workers)), len(work_items))) as ex:
-                fut_map = {ex.submit(_compute_one, w): w[0] for w in work_items}
-                for fut in as_completed(fut_map):
-                    unit_results.append(fut.result())
+        unit_results = dispatch_regime_work_items(
+            work_items,
+            unit_workers=int(args.unit_workers),
+            compute_one_fn=_compute_one,
+        )
 
-        for res in unit_results:
-            ukey = str(res.get("ukey"))
-            asset = str(res.get("asset"))
-            rows_dropped_pre_floor_total += int(res.get("rows_dropped", 0) or 0)
-            ts_start = res.get("ts_start")
-            if ts_start is not None:
-                ts_start_by_asset[str(asset)] = int(ts_start)
-            if res.get("empty"):
-                completed.add(ukey)
-                progress["completed"] = sorted(completed)
-                progress["updated_at"] = datetime.now(timezone.utc).isoformat()
-                _write_state(watermarks, pending, progress)
-                continue
-            parts = _write_month_parts(
-                month_frames=res.get("asset_month_frames", {}),
-                interval=interval,
-                horizon_minutes=horizon_minutes,
-                run_id=run_id,
-                compaction_state=watermarks.setdefault("compaction", {}),
-            )
-            manifest_parts.extend(parts)
-            watermarks.setdefault("units", {})[ukey] = dict(res.get("unit_meta", {}))
-            _replace_pending_for_unit(
-                pending=pending,
-                horizon_minutes=horizon_minutes,
-                horizon_bars=horizon_bars,
-                asset=asset,
-                interval=interval,
-                ts_list=res.get("pending_clean", []),
-            )
-            completed.add(ukey)
-            progress["completed"] = sorted(completed)
-            progress["updated_at"] = datetime.now(timezone.utc).isoformat()
-            _write_state(watermarks, pending, progress)
-            log(
-                f"[rf] asset={asset} k={interval} h={horizon_minutes}m({horizon_bars}b) "
-                f"stop_ts={int(res.get('stop_ts', 0) or 0)} rows_written={int(res.get('rows_written', 0) or 0)} "
-                f"pending={len(res.get('pending_clean', []))}"
-            )
+        applied = apply_regime_unit_results(
+            unit_results,
+            spec=REGIME_RUNNER_SPEC,
+            family=FAMILY,
+            domain=DOMAIN,
+            task=TASK,
+            interval=interval,
+            horizon_minutes=horizon_minutes,
+            horizon_bars=horizon_bars,
+            watermarks=watermarks,
+            pending=pending,
+            progress=progress,
+            completed_unit_keys=completed,
+            write_month_parts_fn=_write_month_parts,
+            write_state_fn=_write_state,
+            log_fn=log,
+        )
+        manifest_parts.extend(applied.manifest_parts)
+        rows_dropped_pre_floor_total += applied.rows_dropped_pre_floor_total
+        ts_start_by_asset.update(applied.ts_start_by_asset)
+        completed = set(applied.completed_unit_keys)
 
     _write_state(watermarks, pending, progress)
 
-    manifest = {
-        "run_id": run_id,
-        "mode": args.mode,
-        "family": FAMILY,
-        "domain": DOMAIN,
-        "task": TASK,
-        "intervals": sorted(set(int(k) for (_, k, _, _) in tasks)),
-        "resolved_regime_ceiling_intervals": sorted(set(int(forecast_ceiling_interval(k)) for (_, k, _, _) in tasks)),
-        "horizon_minutes": sorted(set(int(hm) for (_, _, hm, _hb) in tasks)),
-        "horizon_bars": sorted(set(int(hb) for (_, _, _hm, hb) in tasks)),
-        "assets": sorted(set(a for (a, _, _, _) in tasks)),
-        "ts_floor": int(TS_FLOOR_2021),
-        "ts_start_by_asset": dict(sorted(ts_start_by_asset.items())),
-        "rows_dropped_pre_floor_total": int(rows_dropped_pre_floor_total),
-        "parts": manifest_parts,
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-    }
-    write_json(MANIFEST_FILE, manifest)
+    manifest = regime_build_run_manifest(
+        REGIME_RUNNER_SPEC,
+        plan,
+        run_id=run_id,
+        family=FAMILY,
+        domain=DOMAIN,
+        task=TASK,
+        runtime_snapshot=runtime_snapshot,
+        task_records=task_records,
+        ts_floor=int(TS_FLOOR_2021),
+        ts_start_by_asset=ts_start_by_asset,
+        rows_dropped_pre_floor_total=rows_dropped_pre_floor_total,
+        manifest_parts=manifest_parts,
+    )
+    regime_write_run_manifest(MANIFEST_FILE, manifest)
     log(f"[rf] run complete parts={len(manifest_parts)}")
 
 

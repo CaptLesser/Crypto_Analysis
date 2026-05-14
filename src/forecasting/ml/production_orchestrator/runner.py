@@ -417,6 +417,60 @@ def _source_parquet_root() -> Path:
 _LATEST_PARTITION_MAX_TS_CACHE: Dict[str, Optional[int]] = {}
 
 
+def _partition_parent_year(path: Path) -> Optional[int]:
+    if "=" not in str(path.name):
+        return None
+    try:
+        return int(str(path.name).split("=", 1)[1])
+    except Exception:
+        return None
+
+
+def _candidate_partition_parent_dirs(base: Path) -> Dict[int, List[Path]]:
+    by_year: Dict[int, List[Path]] = {}
+    candidates: List[Path] = [base]
+    try:
+        candidates.extend(path for path in base.rglob("*=*") if path.is_dir())
+    except Exception:
+        raise
+    for candidate in candidates:
+        year = _partition_parent_year(candidate)
+        if year is None:
+            continue
+        try:
+            has_month_child = any(child.is_dir() and child.name.startswith("month=") for child in candidate.iterdir())
+        except Exception:
+            continue
+        if has_month_child:
+            by_year.setdefault(int(year), []).append(candidate)
+    return by_year
+
+
+def _latest_partition_month_dirs(base: Path) -> List[Path]:
+    parent_dirs_by_year = _candidate_partition_parent_dirs(base)
+    for year in sorted(parent_dirs_by_year.keys(), reverse=True):
+        latest_month: Optional[int] = None
+        latest_dirs: List[Path] = []
+        for parent_dir in sorted(parent_dirs_by_year[year], key=lambda p: str(p).lower()):
+            try:
+                month_dirs = [path for path in parent_dir.glob("month=*") if path.is_dir()]
+            except Exception:
+                continue
+            for month_dir in month_dirs:
+                try:
+                    month = int(str(month_dir.name).split("=", 1)[1])
+                except Exception:
+                    continue
+                if latest_month is None or int(month) > int(latest_month):
+                    latest_month = int(month)
+                    latest_dirs = [month_dir]
+                elif int(month) == int(latest_month):
+                    latest_dirs.append(month_dir)
+        if latest_dirs:
+            return latest_dirs
+    return []
+
+
 def _recursive_latest_partition_max_ts(root: Path) -> Optional[int]:
     cache_key = str(Path(root).resolve()).lower()
     if cache_key in _LATEST_PARTITION_MAX_TS_CACHE:
@@ -425,26 +479,11 @@ def _recursive_latest_partition_max_ts(root: Path) -> Optional[int]:
     if not base.exists():
         _LATEST_PARTITION_MAX_TS_CACHE[cache_key] = None
         return None
-    latest_key: Optional[tuple[int, int]] = None
-    latest_dirs: List[Path] = []
     try:
-        month_dirs = [path for path in base.rglob("month=*") if path.is_dir()]
+        latest_dirs = _latest_partition_month_dirs(base)
     except Exception:
         _LATEST_PARTITION_MAX_TS_CACHE[cache_key] = None
         return None
-    for month_dir in month_dirs:
-        try:
-            month = int(str(month_dir.name).split("=", 1)[1])
-            year_dir = month_dir.parent
-            year = int(str(year_dir.name).split("=", 1)[1])
-        except Exception:
-            continue
-        key = (int(year), int(month))
-        if latest_key is None or key > latest_key:
-            latest_key = key
-            latest_dirs = [month_dir]
-        elif key == latest_key:
-            latest_dirs.append(month_dir)
     if not latest_dirs:
         value = partition_max_ts(base, ts_column="ts")
         _LATEST_PARTITION_MAX_TS_CACHE[cache_key] = value

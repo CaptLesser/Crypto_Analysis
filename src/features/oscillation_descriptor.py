@@ -329,7 +329,6 @@ def process_asset(asset: str, interval: str, lookback_days: int) -> pd.DataFrame
     v_sig = np.log1p(v_raw)
 
     price_method, price_imfs = decompose(p_sig)
-    _ = decompose(v_sig)
     decomp_method = price_method
 
     v_all = v_sig.copy()

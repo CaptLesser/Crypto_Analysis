@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -108,8 +109,10 @@ def _fit_predict_llt(
     kwargs: Dict[str, Any] = {"level": "local linear trend"}
     if seasonal_period_bars is not None and int(seasonal_period_bars) > 1:
         kwargs["seasonal"] = int(seasonal_period_bars)
+    fit_started = time.perf_counter()
     model = UnobservedComponents(endog=y_train.astype(float).to_numpy(), **kwargs)
     res = model.fit(disp=False)
+    fit_elapsed_s = time.perf_counter() - fit_started
     pred = res.get_forecast(steps=int(steps))
     yhat = float(np.asarray(pred.predicted_mean)[-1])
     ci = pred.conf_int(alpha=float(conf_alpha))
@@ -119,6 +122,7 @@ def _fit_predict_llt(
         "aic": float(res.aic) if hasattr(res, "aic") and res.aic is not None else None,
         "bic": float(res.bic) if hasattr(res, "bic") and res.bic is not None else None,
         "converged": bool((getattr(res, "mle_retvals", {}) or {}).get("converged", True)),
+        "fit_elapsed_s": float(fit_elapsed_s),
     }
     return yhat, lo, hi, meta
 
@@ -198,6 +202,8 @@ def _process_unit(
     rows: List[Dict[str, Any]] = []
     skipped_origins = 0
     last_fit_meta: Dict[str, Any] = {}
+    fit_elapsed_s_total = 0.0
+    fit_count = 0
     for origin_ts in origins:
         idx = int(np.searchsorted(ts, int(origin_ts), side="right") - 1)
         if idx < 0:
@@ -224,6 +230,8 @@ def _process_unit(
         except Exception:
             skipped_origins += 1
             continue
+        fit_count += 1
+        fit_elapsed_s_total += float(fit_meta.get("fit_elapsed_s", 0.0) or 0.0)
         rows.append(
             {
                 "ts": int(origin_ts),
@@ -260,6 +268,11 @@ def _process_unit(
             "start_ts": int(origin_start),
             "target_tail_ts": int(target_tail),
             "dst_tail_ts": int(dst_tail) if dst_tail is not None else None,
+            "origin_count": int(len(origins)),
+            "fit_count": int(fit_count),
+            "fit_elapsed_s_total": float(fit_elapsed_s_total),
+            "seconds_per_origin": (float(fit_elapsed_s_total) / float(fit_count) if int(fit_count) > 0 else None),
+            "forecast_rows": int(len(rows)),
         },
         "skipped_origins": int(skipped_origins),
     }

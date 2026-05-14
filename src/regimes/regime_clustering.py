@@ -8,10 +8,11 @@ import hashlib
 import inspect
 import time
 import uuid
+import multiprocessing as mp
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 
@@ -20,7 +21,9 @@ import pandas as pd
 
 from src.forecasting.common.io_atomic import atomic_replace, sibling_temp_path
 from src.forecasting.common.path_config import resolve_path, selected_profile
-from src.forecasting.common.runtime_config import get_workers, log_resolved_runtime
+from src.forecasting.common.runtime_config import RUNTIME_CONFIG_PATH, get_workers, log_resolved_runtime
+from src.forecasting.common.sandbox_paths import SandboxOutputRoots, resolve_sandbox_output_roots
+from src.regimes.core import artifacts as regime_artifacts
 from sklearn.preprocessing import RobustScaler, StandardScaler
 
 try:
@@ -77,25 +80,158 @@ _patch_check_array_compat()
 
 
 PIPELINE_PROFILE = selected_profile(default="production")
-LOG_DIR = Path(resolve_path("log_root", profile=PIPELINE_PROFILE, required=False) or Path("logs"))
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+REGIME_THREAD_CAP_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+REGIME_PARALLEL_THREAD_CAP_RECOMMENDATION = "1"
 
+
+@dataclass(frozen=True)
+class RegimeLabelGenerationIOConfig:
+    output_root: Path
+    definition_root: Path
+    diagnostic_root: Path
+    log_root: Path
+    tmp_root: Path
+    sandbox_enabled: bool = False
+
+    def to_json_ready(self) -> Dict[str, Any]:
+        return {
+            "output_root": str(self.output_root),
+            "definition_root": str(self.definition_root),
+            "diagnostic_root": str(self.diagnostic_root),
+            "log_root": str(self.log_root),
+            "tmp_root": str(self.tmp_root),
+            "sandbox_enabled": bool(self.sandbox_enabled),
+        }
+
+
+def resolve_regime_label_generation_io_config(
+    args: Optional[argparse.Namespace] = None,
+    *,
+    sandbox_roots: Optional[SandboxOutputRoots] = None,
+) -> RegimeLabelGenerationIOConfig:
+    roots = sandbox_roots if sandbox_roots is not None else resolve_sandbox_output_roots(args)
+    if roots.enabled:
+        return RegimeLabelGenerationIOConfig(
+            output_root=roots.parquet_root,
+            definition_root=roots.regime_definition_root,
+            diagnostic_root=roots.diagnostics_root,
+            log_root=roots.log_root,
+            tmp_root=roots.tmp_root,
+            sandbox_enabled=True,
+        )
+    return RegimeLabelGenerationIOConfig(
+        output_root=Path(
+            resolve_path("source_regime_root", profile=PIPELINE_PROFILE, required=False)
+            or resolve_path("output_parquet_root", profile=PIPELINE_PROFILE, required=False)
+            or Path("parquet")
+        ),
+        definition_root=Path(
+            resolve_path("regime_definition_root", profile=PIPELINE_PROFILE, required=False)
+            or Path("regime_definitions")
+        ),
+        diagnostic_root=Path(resolve_path("log_root", profile=PIPELINE_PROFILE, required=False) or Path("logs")),
+        log_root=Path(resolve_path("log_root", profile=PIPELINE_PROFILE, required=False) or Path("logs")),
+        tmp_root=Path(resolve_path("tmp_root", profile=PIPELINE_PROFILE, required=False) or Path("tmp")),
+        sandbox_enabled=False,
+    )
+
+
+def configure_regime_label_generation_io(
+    args: Optional[argparse.Namespace] = None,
+    *,
+    sandbox_roots: Optional[SandboxOutputRoots] = None,
+) -> RegimeLabelGenerationIOConfig:
+    roots = sandbox_roots if sandbox_roots is not None else resolve_sandbox_output_roots(args)
+    config = resolve_regime_label_generation_io_config(args, sandbox_roots=roots)
+    global REGIME_LABEL_IO_CONFIG, REGIME_LABEL_SANDBOX_ROOTS, REGIME_PARQUET_ROOT, DEFINITION_ROOT, LOG_DIR, LOG_FILE
+    REGIME_LABEL_IO_CONFIG = config
+    REGIME_LABEL_SANDBOX_ROOTS = roots if roots.enabled else None
+    REGIME_PARQUET_ROOT = Path(config.output_root)
+    DEFINITION_ROOT = Path(config.definition_root)
+    LOG_DIR = Path(config.log_root)
+    LOG_FILE = LOG_DIR / "regime_clustering.log"
+    for root in (REGIME_PARQUET_ROOT, DEFINITION_ROOT, LOG_DIR, Path(config.diagnostic_root), Path(config.tmp_root)):
+        root.mkdir(parents=True, exist_ok=True)
+    return config
+
+
+def _configure_worker_regime_label_generation_io(
+    config: RegimeLabelGenerationIOConfig,
+    sandbox_roots: Optional[SandboxOutputRoots],
+) -> None:
+    global REGIME_LABEL_IO_CONFIG, REGIME_LABEL_SANDBOX_ROOTS, REGIME_PARQUET_ROOT, DEFINITION_ROOT, LOG_DIR, LOG_FILE
+    REGIME_LABEL_IO_CONFIG = config
+    REGIME_LABEL_SANDBOX_ROOTS = sandbox_roots if sandbox_roots is not None and sandbox_roots.enabled else None
+    REGIME_PARQUET_ROOT = Path(config.output_root)
+    DEFINITION_ROOT = Path(config.definition_root)
+    LOG_DIR = Path(config.log_root)
+    LOG_FILE = LOG_DIR / "regime_clustering.log"
+
+
+REGIME_LABEL_IO_CONFIG = resolve_regime_label_generation_io_config()
+REGIME_LABEL_SANDBOX_ROOTS = None
+REGIME_PARQUET_ROOT = Path(REGIME_LABEL_IO_CONFIG.output_root)
+DEFINITION_ROOT = Path(REGIME_LABEL_IO_CONFIG.definition_root)
+LOG_DIR = Path(REGIME_LABEL_IO_CONFIG.log_root)
 LOG_FILE = LOG_DIR / "regime_clustering.log"
-
-REGIME_PARQUET_ROOT = Path(
-    resolve_path("source_regime_root", profile=PIPELINE_PROFILE, required=False)
-    or resolve_path("output_parquet_root", profile=PIPELINE_PROFILE, required=False)
-    or Path("parquet")
-)
-DEFINITION_ROOT = Path(
-    resolve_path("regime_definition_root", profile=PIPELINE_PROFILE, required=False)
-    or Path("regime_definitions")
-)
-DEFINITION_ROOT.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_INTERVALS = [1, 5, 15, 30, 60, 240, 720, 1440]
 SECONDS_PER_DAY = 86400
 HARD_OUTPUT_START_TS = int(pd.Timestamp("2021-01-01T00:00:00Z").timestamp())
+
+
+@dataclass(frozen=True)
+class RegimeClusteringRuntimeProfile:
+    name: str
+    asset_workers: Optional[int] = None
+    max_asset_workers: Optional[int] = None
+    max_output_months: Optional[int] = None
+    requires_bounded_output: bool = False
+    required_parallel_thread_cap: Optional[str] = None
+    diagnostics_verbosity: str = "normal"
+    feature_window_cache_policy: str = "column_discovery_cache"
+    description: str = ""
+
+
+REGIME_CLUSTERING_RUNTIME_PROFILES: Dict[str, RegimeClusteringRuntimeProfile] = {
+    "runtime_config": RegimeClusteringRuntimeProfile(
+        name="runtime_config",
+        asset_workers=None,
+        description="Use module-keyed pipeline_runtime.json defaults.",
+    ),
+    "regimes_architecture_validation": RegimeClusteringRuntimeProfile(
+        name="regimes_architecture_validation",
+        asset_workers=1,
+        diagnostics_verbosity="test",
+        description="Conservative import and contract validation profile.",
+    ),
+    "regimes_asset_state_preflight": RegimeClusteringRuntimeProfile(
+        name="regimes_asset_state_preflight",
+        asset_workers=2,
+        diagnostics_verbosity="preflight",
+        description="Explicit-asset source validation profile; override workers to match the planned candidate.",
+    ),
+    "regimes_asset_state_study": RegimeClusteringRuntimeProfile(
+        name="regimes_asset_state_study",
+        asset_workers=2,
+        description="Current bounded small-study profile selected from available evidence.",
+    ),
+    "regimes_asset_state_study_bounded": RegimeClusteringRuntimeProfile(
+        name="regimes_asset_state_study_bounded",
+        asset_workers=2,
+        max_output_months=2,
+        diagnostics_verbosity="benchmark",
+        description="Bounded label-generation probe profile for controlled worker sweeps.",
+    ),
+    "regimes_asset_state_backfill_interim": RegimeClusteringRuntimeProfile(
+        name="regimes_asset_state_backfill_interim",
+        asset_workers=None,
+        max_asset_workers=6,
+        requires_bounded_output=True,
+        required_parallel_thread_cap=REGIME_PARALLEL_THREAD_CAP_RECOMMENDATION,
+        description="Interim historical backfill profile using current runtime-config worker defaults after preflight.",
+    ),
+}
 
 DEFAULT_FEATURE_SUBSET = [
     "log_return",
@@ -111,6 +247,238 @@ DEFAULT_FEATURE_SUBSET = [
     "trade_intensity",
     "prr",
 ]
+
+
+def _runtime_memory_summary() -> Dict[str, Any]:
+    try:
+        import psutil  # type: ignore
+
+        vm = psutil.virtual_memory()
+        return {
+            "mem_total_gb": round(float(vm.total) / (1024 ** 3), 1),
+            "mem_avail_gb": round(float(vm.available) / (1024 ** 3), 1),
+            "mem_used_pct": round(float(vm.percent), 1),
+        }
+    except Exception:
+        return {"mem": "n/a"}
+
+
+def resolve_regime_clustering_runtime_profile(args: argparse.Namespace) -> RegimeClusteringRuntimeProfile:
+    raw_name = str(getattr(args, "runtime_profile", "") or "").strip() or "runtime_config"
+    profile = REGIME_CLUSTERING_RUNTIME_PROFILES.get(raw_name)
+    if profile is None:
+        valid = ", ".join(sorted(REGIME_CLUSTERING_RUNTIME_PROFILES))
+        raise ValueError(f"unknown Regime clustering runtime profile {raw_name!r}; expected one of: {valid}")
+    return profile
+
+
+def resolve_regime_clustering_workers(
+    args: argparse.Namespace,
+    *,
+    runtime_profile: Optional[RegimeClusteringRuntimeProfile] = None,
+) -> int:
+    profile = runtime_profile or resolve_regime_clustering_runtime_profile(args)
+    raw_workers = getattr(args, "workers", None)
+    if raw_workers is not None:
+        workers = _optional_positive_int(raw_workers) or 1
+        return _validate_regime_clustering_worker_cap(profile, workers)
+    if profile.asset_workers is not None:
+        workers = max(1, int(profile.asset_workers))
+        return _validate_regime_clustering_worker_cap(profile, workers)
+    workers = get_workers("regime_clustering", "asset_workers")
+    return _validate_regime_clustering_worker_cap(profile, workers)
+
+
+def _validate_regime_clustering_worker_cap(profile: RegimeClusteringRuntimeProfile, workers: int) -> int:
+    resolved = max(1, int(workers))
+    if profile.max_asset_workers is not None and resolved > int(profile.max_asset_workers):
+        raise ValueError(
+            f"{profile.name} supports at most {int(profile.max_asset_workers)} asset workers; "
+            f"got {resolved}"
+        )
+    return int(resolved)
+
+
+def _runtime_profile_snapshot(profile: RegimeClusteringRuntimeProfile) -> Dict[str, Any]:
+    return {
+        "name": str(profile.name),
+        "asset_workers": int(profile.asset_workers) if profile.asset_workers is not None else None,
+        "max_asset_workers": int(profile.max_asset_workers) if profile.max_asset_workers is not None else None,
+        "max_output_months": int(profile.max_output_months) if profile.max_output_months is not None else None,
+        "requires_bounded_output": bool(profile.requires_bounded_output),
+        "required_parallel_thread_cap": (
+            str(profile.required_parallel_thread_cap) if profile.required_parallel_thread_cap is not None else None
+        ),
+        "diagnostics_verbosity": str(profile.diagnostics_verbosity),
+        "feature_window_cache_policy": str(profile.feature_window_cache_policy),
+        "description": str(profile.description),
+    }
+
+
+def _environment_thread_cap_snapshot(asset_workers: int) -> Dict[str, Any]:
+    caps = {name: str(os.environ.get(name, "")) for name in REGIME_THREAD_CAP_ENV_VARS}
+    missing_caps = [name for name, value in caps.items() if not str(value).strip()]
+    return {
+        "caps": caps,
+        "policy": "record_only",
+        "recommended_for_parallel_runs": {
+            name: REGIME_PARALLEL_THREAD_CAP_RECOMMENDATION for name in REGIME_THREAD_CAP_ENV_VARS
+        },
+        "missing_caps": missing_caps,
+        "all_caps_set": not missing_caps,
+        "parallel_label_generation_warning": bool(int(asset_workers) > 1 and missing_caps),
+    }
+
+
+def resolve_regime_clustering_runtime_guardrails(
+    args: argparse.Namespace,
+    *,
+    workers: int,
+    runtime_profile: Optional[RegimeClusteringRuntimeProfile] = None,
+    output_limits: Optional["RegimeOutputLimits"] = None,
+) -> Dict[str, Any]:
+    profile = runtime_profile or resolve_regime_clustering_runtime_profile(args)
+    asset_workers = max(1, int(workers))
+    resolved_output_limits = output_limits or resolve_regime_output_limits(args, runtime_profile=profile)
+    output_limit_snapshot = resolved_output_limits.to_json_ready()
+    thread_caps = _environment_thread_cap_snapshot(asset_workers)
+    required_thread_cap = profile.required_parallel_thread_cap
+    cap_mismatches: List[Dict[str, str]] = []
+    if required_thread_cap is not None and asset_workers > 1:
+        expected = str(required_thread_cap)
+        for env_name, value in thread_caps["caps"].items():
+            if str(value).strip() != expected:
+                cap_mismatches.append(
+                    {
+                        "name": str(env_name),
+                        "expected": expected,
+                        "actual": str(value),
+                    }
+                )
+
+    failed_checks: List[str] = []
+    if bool(profile.requires_bounded_output) and not bool(output_limit_snapshot["active"]):
+        failed_checks.append(
+            f"{profile.name} requires --max-output-months or both --output-start and --output-end"
+        )
+    if profile.max_asset_workers is not None and asset_workers > int(profile.max_asset_workers):
+        failed_checks.append(
+            f"{profile.name} supports at most {int(profile.max_asset_workers)} asset workers; got {asset_workers}"
+        )
+    if cap_mismatches:
+        failed_checks.append(
+            f"{profile.name} parallel runs require {', '.join(REGIME_THREAD_CAP_ENV_VARS)}="
+            f"{str(required_thread_cap)} before launch"
+        )
+
+    return {
+        "profile_requires_guardrails": bool(
+            profile.requires_bounded_output
+            or profile.max_asset_workers is not None
+            or profile.required_parallel_thread_cap is not None
+        ),
+        "safe_for_execute": not failed_checks,
+        "requires_bounded_output": bool(profile.requires_bounded_output),
+        "bounded_output_scope": bool(output_limit_snapshot["active"]),
+        "max_asset_workers": int(profile.max_asset_workers) if profile.max_asset_workers is not None else None,
+        "worker_cap_satisfied": bool(
+            profile.max_asset_workers is None or asset_workers <= int(profile.max_asset_workers)
+        ),
+        "required_parallel_thread_cap": str(required_thread_cap) if required_thread_cap is not None else None,
+        "thread_cap_satisfied": not cap_mismatches,
+        "thread_cap_mismatches": cap_mismatches,
+        "failed_checks": failed_checks,
+        "notes": [
+            "native BLAS/thread caps must be set in the launcher environment before Python imports numeric libraries"
+        ]
+        if required_thread_cap is not None
+        else [],
+    }
+
+
+def validate_regime_clustering_runtime_guardrails(
+    args: argparse.Namespace,
+    *,
+    workers: int,
+    runtime_profile: Optional[RegimeClusteringRuntimeProfile] = None,
+    output_limits: Optional["RegimeOutputLimits"] = None,
+) -> Dict[str, Any]:
+    status = resolve_regime_clustering_runtime_guardrails(
+        args,
+        workers=workers,
+        runtime_profile=runtime_profile,
+        output_limits=output_limits,
+    )
+    failed_checks = list(status.get("failed_checks", []))
+    if failed_checks:
+        raise ValueError("; ".join(str(check) for check in failed_checks))
+    return status
+
+
+def resolve_regime_clustering_runtime_snapshot(
+    args: argparse.Namespace,
+    *,
+    workers: int,
+    runtime_profile: Optional[RegimeClusteringRuntimeProfile] = None,
+    output_limits: Optional["RegimeOutputLimits"] = None,
+) -> Dict[str, Any]:
+    profile = runtime_profile or resolve_regime_clustering_runtime_profile(args)
+    asset_workers = max(1, int(workers))
+    cpu_count = os.cpu_count() or 1
+    resolved_output_limits = output_limits or resolve_regime_output_limits(args, runtime_profile=profile)
+    output_limits_snapshot = resolved_output_limits.to_json_ready()
+    thread_caps = _environment_thread_cap_snapshot(asset_workers)
+    guardrails = resolve_regime_clustering_runtime_guardrails(
+        args,
+        workers=asset_workers,
+        runtime_profile=profile,
+        output_limits=resolved_output_limits,
+    )
+    return {
+        "profile_name": str(profile.name),
+        "path_profile": str(PIPELINE_PROFILE),
+        "module_slug": "regime_clustering",
+        "runtime_profile": _runtime_profile_snapshot(profile),
+        "asset_workers": int(asset_workers),
+        "writer_workers": 1,
+        "model_threads": "n/a",
+        "trial_workers": 0,
+        "cpu_count": int(cpu_count),
+        "cpu_budget": int(asset_workers),
+        "oversubscription_warning": bool(asset_workers > cpu_count),
+        "thread_pressure_warning": bool(thread_caps["parallel_label_generation_warning"]),
+        "thread_pressure_warning_reason": (
+            "parallel label generation has unset BLAS/thread caps"
+            if bool(thread_caps["parallel_label_generation_warning"])
+            else ""
+        ),
+        "process_start_method": str(mp.get_start_method(allow_none=True) or "default"),
+        "runtime_config_path": str(RUNTIME_CONFIG_PATH),
+        "environment_thread_caps": thread_caps["caps"],
+        "environment_thread_cap_policy": {
+            "policy": str(thread_caps["policy"]),
+            "recommended_for_parallel_runs": dict(thread_caps["recommended_for_parallel_runs"]),
+            "missing_caps": list(thread_caps["missing_caps"]),
+            "all_caps_set": bool(thread_caps["all_caps_set"]),
+        },
+        "runtime_guardrails": guardrails,
+        "output_root": str(REGIME_PARQUET_ROOT),
+        "diagnostic_root": str(LOG_DIR),
+        "label_generation_io": REGIME_LABEL_IO_CONFIG.to_json_ready(),
+        "memory": _runtime_memory_summary(),
+        "cli_overrides": {
+            "assets": str(getattr(args, "assets", "") or ""),
+            "bands": str(getattr(args, "bands", "") or ""),
+            "feature_strategy": str(getattr(args, "feature_strategy", "") or ""),
+            "n_per_interval": int(getattr(args, "n_per_interval", 0) or 0),
+            "workers": int(asset_workers),
+            "preflight_only": bool(getattr(args, "preflight_only", False)),
+            "output_start": str(getattr(args, "output_start", "") or ""),
+            "output_end": str(getattr(args, "output_end", "") or ""),
+            "max_output_months": _optional_positive_int(getattr(args, "max_output_months", None)),
+        },
+        "output_limits": output_limits_snapshot,
+    }
 
 CATEGORY_SPECS: Dict[str, Dict[str, object]] = {
     "trend": {
@@ -157,11 +525,130 @@ class BandSpec:
     train_days: int
 
 
+@dataclass(frozen=True)
+class RegimeOutputLimits:
+    output_start_ts: Optional[int] = None
+    output_end_ts: Optional[int] = None
+    max_output_months: Optional[int] = None
+
+    def to_json_ready(self) -> Dict[str, Any]:
+        return {
+            "output_start_ts": int(self.output_start_ts) if self.output_start_ts is not None else None,
+            "output_end_ts": int(self.output_end_ts) if self.output_end_ts is not None else None,
+            "max_output_months": int(self.max_output_months) if self.max_output_months is not None else None,
+            "active": bool(
+                self.output_start_ts is not None
+                or self.output_end_ts is not None
+                or self.max_output_months is not None
+            ),
+        }
+
+
+def _optional_positive_int(value: object) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        out = int(value)  # type: ignore[arg-type]
+    except Exception as exc:
+        raise ValueError(f"expected a positive integer, got {value!r}") from exc
+    if out <= 0:
+        raise ValueError(f"expected a positive integer, got {value!r}")
+    return int(out)
+
+
+def _optional_utc_ts(value: object) -> Optional[int]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except Exception:
+        pass
+    try:
+        ts = pd.Timestamp(text)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return int(ts.timestamp())
+    except Exception as exc:
+        raise ValueError(f"expected a UTC timestamp or parseable date, got {value!r}") from exc
+
+
+def resolve_regime_output_limits(
+    args: argparse.Namespace,
+    *,
+    runtime_profile: Optional[RegimeClusteringRuntimeProfile] = None,
+) -> RegimeOutputLimits:
+    start_ts = _optional_utc_ts(getattr(args, "output_start", None))
+    end_ts = _optional_utc_ts(getattr(args, "output_end", None))
+    profile = runtime_profile or resolve_regime_clustering_runtime_profile(args)
+    max_months = _optional_positive_int(getattr(args, "max_output_months", None))
+    if max_months is None and profile.max_output_months is not None:
+        max_months = max(1, int(profile.max_output_months))
+    if start_ts is not None and end_ts is not None and int(start_ts) > int(end_ts):
+        raise ValueError(f"output_start must be <= output_end, got {int(start_ts)} > {int(end_ts)}")
+    return RegimeOutputLimits(
+        output_start_ts=start_ts,
+        output_end_ts=end_ts,
+        max_output_months=max_months,
+    )
+
+
+def _month_limited_end_ts(start_ts: int, max_months: int, ceiling_min: int) -> int:
+    start_dt = pd.to_datetime(int(start_ts), unit="s", utc=True)
+    month_start = pd.Timestamp(year=start_dt.year, month=start_dt.month, day=1, tz="UTC")
+    next_window_start = month_start + pd.DateOffset(months=int(max_months))
+    raw_end = int(next_window_start.timestamp()) - ceiling_seconds(int(ceiling_min))
+    return int(floor_to_ceiling(raw_end, int(ceiling_min)))
+
+
+def apply_regime_output_limits(
+    start_ts: int,
+    end_ts: int,
+    band: BandSpec,
+    limits: Optional[RegimeOutputLimits],
+) -> Tuple[int, int, Dict[str, Any]]:
+    original_start = int(start_ts)
+    original_end = int(end_ts)
+    resolved_start = int(start_ts)
+    resolved_end = int(end_ts)
+    limit_state = limits or RegimeOutputLimits()
+
+    if limit_state.output_start_ts is not None:
+        resolved_start = max(resolved_start, ceil_to_ceiling(int(limit_state.output_start_ts), int(band.ceiling)))
+    if limit_state.output_end_ts is not None:
+        resolved_end = min(resolved_end, floor_to_ceiling(int(limit_state.output_end_ts), int(band.ceiling)))
+    if limit_state.max_output_months is not None:
+        resolved_end = min(
+            resolved_end,
+            _month_limited_end_ts(
+                start_ts=int(resolved_start),
+                max_months=int(limit_state.max_output_months),
+                ceiling_min=int(band.ceiling),
+            ),
+        )
+
+    meta = {
+        **limit_state.to_json_ready(),
+        "original_start_ts": int(original_start),
+        "original_end_ts": int(original_end),
+        "resolved_start_ts": int(resolved_start),
+        "resolved_end_ts": int(resolved_end),
+        "clamped": bool(resolved_start != original_start or resolved_end != original_end),
+        "empty_after_limits": bool(int(resolved_start) > int(resolved_end)),
+    }
+    return int(resolved_start), int(resolved_end), meta
+
+
 BANDS = [
     BandSpec("micro", 30, [1, 5, 15, 30], 30),
     BandSpec("meso", 240, [60, 240], 180),
     BandSpec("macro", 1440, [720, 1440], 360),
 ]
+
+_FEATURE_COLUMN_DISCOVERY_CACHE: Dict[Tuple[str, str, int, str, int, int], List[str]] = {}
+_FEATURE_COLUMN_DISCOVERY_CACHE_MAX = 512
 
 
 def log(msg: str) -> None:
@@ -169,6 +656,7 @@ def log(msg: str) -> None:
     line = f"[{ts}] {msg}"
     print(line)
     try:
+        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with LOG_FILE.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
@@ -177,17 +665,16 @@ def log(msg: str) -> None:
 
 
 def read_json(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    return regime_artifacts.read_json(path)
 
 
 def write_json(path: Path, obj: dict) -> None:
-    tmp = sibling_temp_path(path)
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, sort_keys=True)
-    atomic_replace(tmp, path)
+    regime_artifacts.write_json(
+        path,
+        obj,
+        write_kind="diagnostics",
+        sandbox_roots=REGIME_LABEL_SANDBOX_ROOTS,
+    )
 
 
 def month_range(start_ts: int, end_ts: int) -> List[Tuple[int, int]]:
@@ -215,6 +702,162 @@ def assets_present_in_features(interval_min: int, root: Optional[Path] = None) -
         if asset:
             assets.append(asset)
     return sorted(set(assets))
+
+
+def _band_specs_for_names(bands: Optional[Sequence[str]]) -> List[BandSpec]:
+    requested = {str(b).strip().lower() for b in bands or [] if str(b).strip()}
+    if not requested:
+        return list(BANDS)
+    known = {str(b.name).lower(): b for b in BANDS}
+    unknown = sorted(requested.difference(known))
+    if unknown:
+        raise ValueError(f"unknown regime band(s): {unknown}; expected one or more of {sorted(known)}")
+    return [known[name] for name in sorted(requested, key=lambda n: [b.name for b in BANDS].index(n))]
+
+
+def _required_feature_intervals_for_bands(band_specs: Sequence[BandSpec]) -> List[int]:
+    intervals: Set[int] = set()
+    for band in band_specs:
+        intervals.update(int(v) for v in band.member_intervals)
+        intervals.add(int(band.ceiling))
+    return sorted(intervals)
+
+
+def _asset_interval_feature_summary(asset: str, interval_min: int, root: Optional[Path] = None) -> Dict[str, Any]:
+    root_dir = Path(root) if root else PARQUET_ROOT
+    asset_dir = root_dir / f"scalar_features_{int(interval_min)}" / f"asset={asset}"
+    month_partitions = 0
+    parquet_files = 0
+    row_count_estimate = 0
+    row_count_complete = True
+    if asset_dir.exists():
+        for year_dir in asset_dir.glob("year=*"):
+            if not year_dir.is_dir():
+                continue
+            for month_dir in year_dir.glob("month=*"):
+                if not month_dir.is_dir():
+                    continue
+                files = sorted(month_dir.glob("*.parquet"))
+                if files:
+                    month_partitions += 1
+                    parquet_files += len(files)
+                for part in files:
+                    rows = _parquet_metadata_rows(part)
+                    if rows is None:
+                        row_count_complete = False
+                    else:
+                        row_count_estimate += int(rows)
+    first_ts, last_ts = feature_bounds_from_parquet(int(interval_min), str(asset), root=root_dir)
+    return {
+        "interval_minutes": int(interval_min),
+        "asset_partition": str(asset_dir),
+        "asset_partition_exists": bool(asset_dir.exists()),
+        "month_partitions": int(month_partitions),
+        "parquet_files": int(parquet_files),
+        "row_count_estimate": int(row_count_estimate) if row_count_complete else None,
+        "row_count_estimate_complete": bool(row_count_complete),
+        "first_ts": int(first_ts) if first_ts is not None else None,
+        "last_ts": int(last_ts) if last_ts is not None else None,
+    }
+
+
+def _parquet_metadata_rows(path: Path) -> Optional[int]:
+    try:
+        import pyarrow.parquet as pq  # type: ignore
+
+        metadata = pq.ParquetFile(path).metadata
+        return int(metadata.num_rows) if metadata is not None else None
+    except Exception:
+        return None
+
+
+def resolve_regime_clustering_preflight(
+    args: argparse.Namespace,
+    *,
+    workers: int,
+    assets: Optional[Sequence[str]] = None,
+    bands: Optional[Sequence[str]] = None,
+    runtime_profile: Optional[RegimeClusteringRuntimeProfile] = None,
+) -> Dict[str, Any]:
+    profile = runtime_profile or resolve_regime_clustering_runtime_profile(args)
+    band_specs = _band_specs_for_names(bands)
+    required_intervals = _required_feature_intervals_for_bands(band_specs)
+    if assets:
+        requested_assets = sorted({str(a).strip() for a in assets if str(a).strip()})
+        asset_source = "cli"
+    else:
+        discovery_interval = max(required_intervals) if required_intervals else DEFAULT_INTERVALS[-1]
+        requested_assets = assets_present_in_features(discovery_interval)
+        asset_source = f"discovered:scalar_features_{int(discovery_interval)}"
+
+    rows: List[Dict[str, Any]] = []
+    missing_assets: List[Dict[str, Any]] = []
+    total_parquet_files = 0
+    total_month_partitions = 0
+    total_rows: Optional[int] = 0
+    for asset in requested_assets:
+        interval_summaries = [
+            _asset_interval_feature_summary(asset=str(asset), interval_min=int(interval_min))
+            for interval_min in required_intervals
+        ]
+        missing_intervals = [
+            int(row["interval_minutes"])
+            for row in interval_summaries
+            if not bool(row["asset_partition_exists"]) or int(row["parquet_files"]) <= 0
+        ]
+        for row in interval_summaries:
+            total_parquet_files += int(row["parquet_files"])
+            total_month_partitions += int(row["month_partitions"])
+            if total_rows is not None:
+                if row["row_count_estimate"] is None:
+                    total_rows = None
+                else:
+                    total_rows += int(row["row_count_estimate"])
+        asset_row = {
+            "asset": str(asset),
+            "ok": not bool(missing_intervals),
+            "missing_intervals": missing_intervals,
+            "intervals": interval_summaries,
+        }
+        rows.append(asset_row)
+        if missing_intervals:
+            missing_assets.append({"asset": str(asset), "missing_intervals": missing_intervals})
+
+    return {
+        "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "module_slug": "regime_clustering",
+        "status": "ok" if not missing_assets else "missing_source_partitions",
+        "asset_source": asset_source,
+        "requested_assets": requested_assets,
+        "bands": [str(b.name) for b in band_specs],
+        "required_feature_intervals": required_intervals,
+        "workers": max(1, int(workers)),
+        "source_feature_root": str(PARQUET_ROOT),
+        "output_root": str(REGIME_PARQUET_ROOT),
+        "diagnostic_root": str(LOG_DIR),
+        "label_generation_io": REGIME_LABEL_IO_CONFIG.to_json_ready(),
+        "runtime_profile": _runtime_profile_snapshot(profile),
+        "output_limits": resolve_regime_output_limits(args, runtime_profile=profile).to_json_ready(),
+        "feature_window_cache_policy": {
+            "column_discovery_cache_max_entries": int(_FEATURE_COLUMN_DISCOVERY_CACHE_MAX),
+        },
+        "totals": {
+            "assets": len(requested_assets),
+            "ok_assets": len(requested_assets) - len(missing_assets),
+            "missing_assets": len(missing_assets),
+            "month_partitions": int(total_month_partitions),
+            "parquet_files": int(total_parquet_files),
+            "row_count_estimate": int(total_rows) if total_rows is not None else None,
+            "row_count_estimate_complete": total_rows is not None,
+        },
+        "missing_assets": missing_assets,
+        "assets_detail": rows,
+        "runtime_snapshot": resolve_regime_clustering_runtime_snapshot(
+            args,
+            workers=max(1, int(workers)),
+            runtime_profile=profile,
+        ),
+    }
 
 
 def ceiling_seconds(ceiling_min: int) -> int:
@@ -506,14 +1149,7 @@ class DiagnosticCollector:
 
 
 def parquet_path_for(ceiling_interval: int, asset: str, year: int, month: int, root: Path) -> Path:
-    return (
-        root
-        / f"regimes_{ceiling_interval}"
-        / f"asset={asset}"
-        / f"year={year}"
-        / f"month={month:02d}"
-        / "part-000.parquet"
-    )
+    return regime_artifacts.parquet_path_for(ceiling_interval, asset, year, month, root)
 
 
 def _lock_path_for(dst: Path) -> Path:
@@ -547,81 +1183,37 @@ def _release_lock(fd: Optional[int], lock_path: Path) -> None:
 
 
 def write_parquet_atomic(df: pd.DataFrame, dst: Path, retries: int = 6, sleep_base_sec: float = 0.25) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = _lock_path_for(dst)
-    lock_fd = _acquire_lock(lock_path)
-    if lock_fd is None:
-        raise TimeoutError(f"Could not acquire parquet lock: {lock_path}")
-    last_exc: Optional[Exception] = None
-    try:
-        for attempt in range(retries):
-            tmp = sibling_temp_path(dst, suffix=".parquet.tmp")
-            try:
-                out_df = df
-                if dst.exists():
-                    try:
-                        existing = pd.read_parquet(dst)
-                        out_df = pd.concat([existing, df], ignore_index=True)
-                        if set(["asset", "ts", "band"]).issubset(out_df.columns):
-                            out_df = out_df.drop_duplicates(subset=["asset", "ts", "band"], keep="last")
-                    except Exception:
-                        out_df = df
-                out_df.to_parquet(tmp, engine="pyarrow", compression=PARQUET_COMPRESSION, index=False, row_group_size=PARQUET_ROW_GROUP)
-                atomic_replace(tmp, dst)
-                return
-            except PermissionError as exc:
-                last_exc = exc
-                try:
-                    if tmp.exists():
-                        tmp.unlink()
-                except Exception:
-                    pass
-                if attempt == retries - 1:
-                    break
-                time.sleep(sleep_base_sec * (attempt + 1))
-            except Exception:
-                try:
-                    if tmp.exists():
-                        tmp.unlink()
-                except Exception:
-                    pass
-                raise
-        if last_exc is not None:
-            raise last_exc
-    finally:
-        _release_lock(lock_fd, lock_path)
+    regime_artifacts.write_parquet_atomic(
+        df,
+        dst,
+        retries=retries,
+        sleep_base_sec=sleep_base_sec,
+        compression=PARQUET_COMPRESSION,
+        row_group_size=PARQUET_ROW_GROUP,
+        write_kind="parquet",
+        sandbox_roots=REGIME_LABEL_SANDBOX_ROOTS,
+    )
 
 
 def definition_paths(asset: str, band: str, category: str) -> Tuple[Path, Path]:
-    safe_asset = asset.replace("/", "_")
-    safe_band = str(band).replace("/", "_")
-    safe_category = str(category).replace("/", "_")
-    stem = f"{safe_asset}__{safe_band}__{safe_category}"
-    return DEFINITION_ROOT / f"{stem}.pkl", DEFINITION_ROOT / f"{stem}.json"
+    return regime_artifacts.definition_paths(DEFINITION_ROOT, asset, band, category)
 
 
 def load_definition(asset: str, band: str, category: str) -> Optional[dict]:
-    model_path, meta_path = definition_paths(asset, band, category)
-    if not model_path.exists() or not meta_path.exists():
-        return None
-    try:
-        with model_path.open("rb") as f:
-            model_obj = pickle.load(f)
-        meta = read_json(meta_path)
-        if not isinstance(model_obj, dict):
-            return None
-        model_obj["meta"] = meta
-        return model_obj
-    except Exception as exc:
-        log(f"[definition][warn] failed loading asset={asset} band={band} category={category}: {exc}")
-        return None
+    return regime_artifacts.load_definition(DEFINITION_ROOT, asset, band, category, log_fn=log)
 
 
 def save_definition(asset: str, band: str, category: str, model_obj: dict, meta: dict) -> None:
-    model_path, meta_path = definition_paths(asset, band, category)
-    with model_path.open("wb") as f:
-        pickle.dump(model_obj, f)
-    write_json(meta_path, meta)
+    regime_artifacts.save_definition(
+        DEFINITION_ROOT,
+        asset,
+        band,
+        category,
+        model_obj,
+        meta,
+        write_kind="regime_definition",
+        sandbox_roots=REGIME_LABEL_SANDBOX_ROOTS,
+    )
 
 
 def load_scalar_features_window(
@@ -832,6 +1424,23 @@ def select_feature_columns(
     return keep
 
 
+def _feature_column_cache_key(interval_min: int, asset: str, parquet_path: Path) -> Tuple[str, str, int, str, int, int]:
+    stat = parquet_path.stat()
+    return (
+        str(Path(PARQUET_ROOT).resolve()).lower(),
+        str(asset),
+        int(interval_min),
+        str(parquet_path.resolve()).lower(),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+    )
+
+
+def _read_feature_columns_from_probe(parquet_path: Path) -> List[str]:
+    cols = list(pd.read_parquet(parquet_path, columns=None).columns)
+    return [c for c in cols if c not in ("ts", "asset")]
+
+
 def discover_feature_columns(interval_min: int, asset: str) -> List[str]:
     base = PARQUET_ROOT / f"scalar_features_{interval_min}"
     if not base.exists():
@@ -864,19 +1473,25 @@ def discover_feature_columns(interval_min: int, asset: str) -> List[str]:
             f"scalar_features parquet missing for interval={interval_min} asset={asset}; checked={checked}; "
             f"regime clustering requires asset-partitioned scalar_features."
         )
+    cache_key = _feature_column_cache_key(int(interval_min), str(asset), pq)
+    cached = _FEATURE_COLUMN_DISCOVERY_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
     try:
-        cols = list(pd.read_parquet(pq, columns=None).columns)
+        discovered = _read_feature_columns_from_probe(pq)
     except Exception as exc:
         raise RuntimeError(
             f"scalar_features parquet unreadable for interval={interval_min} asset={asset}; path={pq}; error={exc}; "
             f"regime clustering requires asset-partitioned scalar_features."
         ) from exc
-    discovered = [c for c in cols if c not in ("ts", "asset")]
     if not discovered:
         raise RuntimeError(
             f"scalar_features schema empty for interval={interval_min} asset={asset}; checked={checked}; "
             f"expected feature columns beyond ts/asset under asset-partitioned layout."
         )
+    if len(_FEATURE_COLUMN_DISCOVERY_CACHE) >= _FEATURE_COLUMN_DISCOVERY_CACHE_MAX:
+        _FEATURE_COLUMN_DISCOVERY_CACHE.clear()
+    _FEATURE_COLUMN_DISCOVERY_CACHE[cache_key] = list(discovered)
     return discovered
 
 
@@ -1541,7 +2156,9 @@ def walk_forward_asset_band(
     min_samples: int,
     diagnostics: Optional[DiagnosticCollector] = None,
     standardize: bool = False,
+    output_limits: Optional[RegimeOutputLimits] = None,
 ) -> dict:
+    wall_start = time.perf_counter()
     min_ts, max_ts = feature_bounds_from_parquet(band.ceiling, asset)
     if min_ts is None or max_ts is None:
         log(f"[walk][skip] no source data asset={asset} band={band.name}")
@@ -1564,9 +2181,26 @@ def walk_forward_asset_band(
     step = ceiling_seconds(band.ceiling)
     start_ts = ceil_to_ceiling(src_min, band.ceiling) if dst_tail_raw is None else int(dst_tail_raw) + int(step)
     end_ts = int(source_tail)
+    start_ts, end_ts, output_limit_state = apply_regime_output_limits(start_ts, end_ts, band, output_limits)
     if int(start_ts) > int(end_ts):
         log(f"[walk][skip] empty range asset={asset} band={band.name} start={int(start_ts)} end={int(end_ts)}")
-        return {"last_assigned_ceiling_ts": int(dst_tail_raw or 0), "last_refit_ceiling_ts": int(dst_tail_raw or 0)}
+        return {
+            "last_assigned_ceiling_ts": int(dst_tail_raw or 0),
+            "last_refit_ceiling_ts": int(dst_tail_raw or 0),
+            "rows_written": 0,
+            "refit_events": 0,
+            "definition_write_events": 0,
+            "parquet_write_events": 0,
+            "timings_s": {
+                "total": round(float(time.perf_counter() - wall_start), 6),
+                "feature_read": 0.0,
+                "fit": 0.0,
+                "definition_write": 0.0,
+                "assign": 0.0,
+                "parquet_write": 0.0,
+            },
+            "output_limits": output_limit_state,
+        }
 
     models_by_category: Dict[str, Optional[dict]] = {}
     for category in CATEGORY_ORDER:
@@ -1577,6 +2211,14 @@ def walk_forward_asset_band(
     last_refit_ts = int(dst_tail_raw) if dst_tail_raw is not None else int(start_ts)
     last_reason = "reused"
     band_mcs = int(min_cluster_size_override) if min_cluster_size_override is not None else int(mcs_for_band(band.name))
+    refit_events = 0
+    definition_write_events = 0
+    parquet_write_events = 0
+    feature_read_s = 0.0
+    fit_s = 0.0
+    definition_write_s = 0.0
+    assign_s = 0.0
+    parquet_write_s = 0.0
 
     while int(cursor) <= int(end_ts):
         cursor_refit_key = cadence_refit_key(int(cursor), band)
@@ -1599,13 +2241,17 @@ def walk_forward_asset_band(
             train_start = ceil_to_ceiling(int(train_start_raw), band.ceiling)
             if int(train_start) > int(train_end):
                 train_start = int(train_end)
+            read_start = time.perf_counter()
             raw_train = build_aligned_features(asset, band, train_start, train_end, ALL_CATEGORY_BASES)
+            feature_read_s += float(time.perf_counter() - read_start)
             reason = "fit_unavailable"
             if not raw_train.empty:
                 refit_key = cadence_refit_key(int(refit_ts), band)
                 model_valid_until = definition_valid_until_for_refit(int(refit_ts), band)
                 any_ok = False
                 for category in categories_to_refit:
+                    refit_events += 1
+                    fit_start = time.perf_counter()
                     model = fit_cluster_model(
                         asset,
                         band,
@@ -1622,6 +2268,7 @@ def walk_forward_asset_band(
                         diagnostics=diagnostics,
                         standardize=bool(standardize),
                     )
+                    fit_s += float(time.perf_counter() - fit_start)
                     if model is not None:
                         any_ok = True
                         meta = {
@@ -1638,7 +2285,10 @@ def walk_forward_asset_band(
                         }
                         model["meta"] = meta
                         models_by_category[category] = model
+                        definition_write_start = time.perf_counter()
                         save_definition(asset, band.name, category, model, meta)
+                        definition_write_s += float(time.perf_counter() - definition_write_start)
+                        definition_write_events += 1
                     else:
                         models_by_category[category] = None
                 if any_ok:
@@ -1648,6 +2298,7 @@ def walk_forward_asset_band(
                     reason = "no_clusters"
 
         if any(m is not None and bool(m.get("has_clusters", False)) for m in models_by_category.values()):
+            assign_start = time.perf_counter()
             outputs = assign_range_outputs(
                 asset,
                 band,
@@ -1656,7 +2307,9 @@ def walk_forward_asset_band(
                 int(chunk_end),
                 diagnostics=diagnostics,
             )
+            assign_s += float(time.perf_counter() - assign_start)
         else:
+            assign_start = time.perf_counter()
             outputs = build_unknown_outputs(
                 asset,
                 band,
@@ -1664,6 +2317,7 @@ def walk_forward_asset_band(
                 int(chunk_end),
                 feature_schema_hash=combined_feature_schema_hash(models_by_category),
             )
+            assign_s += float(time.perf_counter() - assign_start)
             if diagnostics is not None and not outputs.empty:
                 bars = int(len(outputs))
                 for category in CATEGORY_ORDER:
@@ -1681,14 +2335,21 @@ def walk_forward_asset_band(
                         incomplete_feature_rows=0,
                         confidence_values=None,
                     )
+        def _record_parquet_commit(_tail_ts: int) -> None:
+            nonlocal parquet_write_events
+            parquet_write_events += 1
+
+        parquet_write_start = time.perf_counter()
         rows = write_regime_outputs(
             outputs,
             band.ceiling,
             REGIME_PARQUET_ROOT,
+            on_chunk_committed=_record_parquet_commit,
             expected_start_ts=int(cursor),
             expected_end_ts=int(chunk_end),
             expected_asset=asset,
         )
+        parquet_write_s += float(time.perf_counter() - parquet_write_start)
         total_rows += int(rows)
         tail_written = int(outputs["ts"].max()) if not outputs.empty else int(cursor) - int(step)
         if int(tail_written) != int(chunk_end):
@@ -1700,9 +2361,27 @@ def walk_forward_asset_band(
 
     log(
         f"[walk] asset={asset} band={band.name} source_tail={int(source_tail)} dst_tail={dst_tail_raw} "
-        f"range=[{int(start_ts)},{int(end_ts)}] rows={int(total_rows)} reason={last_reason}"
+        f"range=[{int(start_ts)},{int(end_ts)}] rows={int(total_rows)} refits={int(refit_events)} "
+        f"writes={int(parquet_write_events)} reason={last_reason}"
     )
-    return {"last_assigned_ceiling_ts": int(end_ts), "last_refit_ceiling_ts": int(last_refit_ts)}
+    return {
+        "last_assigned_ceiling_ts": int(end_ts),
+        "last_refit_ceiling_ts": int(last_refit_ts),
+        "rows_written": int(total_rows),
+        "refit_events": int(refit_events),
+        "definition_write_events": int(definition_write_events),
+        "parquet_write_events": int(parquet_write_events),
+        "reason": str(last_reason),
+        "timings_s": {
+            "total": round(float(time.perf_counter() - wall_start), 6),
+            "feature_read": round(float(feature_read_s), 6),
+            "fit": round(float(fit_s), 6),
+            "definition_write": round(float(definition_write_s), 6),
+            "assign": round(float(assign_s), 6),
+            "parquet_write": round(float(parquet_write_s), 6),
+        },
+        "output_limits": output_limit_state,
+    }
 
 
 def process_asset(
@@ -1715,11 +2394,16 @@ def process_asset(
     min_cluster_size_override: Optional[int],
     min_samples: int,
     standardize: bool = False,
+    output_limits: Optional[RegimeOutputLimits] = None,
 ) -> dict:
     if hdbscan is None:
         raise RuntimeError("hdbscan is required for regime clustering.")
+    asset_start = time.perf_counter()
     band_states: dict = {}
+    band_errors: List[Dict[str, str]] = []
     diagnostics = DiagnosticCollector(asset=str(asset))
+    diagnostic_write_events = 0
+    diagnostic_write_s = 0.0
     for band in band_specs:
         try:
             band_state = walk_forward_asset_band(
@@ -1733,11 +2417,13 @@ def process_asset(
                 min_samples,
                 diagnostics=diagnostics,
                 standardize=bool(standardize),
+                output_limits=output_limits,
             )
             if band_state:
                 band_states[band.name] = band_state
         except Exception as exc:
             log(f"[worker][error] asset={asset} band={band.name}: {exc}")
+            band_errors.append({"band": str(band.name), "error": str(exc)})
     diagnostics_rows = diagnostics.to_json_ready()
     if diagnostics_rows:
         payload = {
@@ -1745,10 +2431,12 @@ def process_asset(
             "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "rows": diagnostics_rows,
         }
-        diagnostics_dir = REGIME_PARQUET_ROOT / "diagnostics"
-        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        diagnostics_dir = Path(REGIME_LABEL_IO_CONFIG.diagnostic_root) / "regime_clustering"
         diagnostics_path = diagnostics_dir / f"{asset}_regime_diagnostics.json"
+        diagnostic_write_start = time.perf_counter()
         write_json(diagnostics_path, payload)
+        diagnostic_write_s += float(time.perf_counter() - diagnostic_write_start)
+        diagnostic_write_events += 1
         for row in diagnostics_rows:
             log(
                 "[diag] "
@@ -1758,7 +2446,22 @@ def process_asset(
                 f"final_unknown_fraction={float(row.get('assignments', {}).get('final_unknown_fraction', 1.0)):.6f}"
             )
         log(f"[diag] asset={asset} wrote {len(diagnostics_rows)} category records -> {diagnostics_path}")
-    return {"asset": asset, "band_states": band_states}
+    return {
+        "asset": asset,
+        "band_states": band_states,
+        "errors": band_errors,
+        "timings_s": {
+            "total": round(float(time.perf_counter() - asset_start), 6),
+            "diagnostic_write": round(float(diagnostic_write_s), 6),
+        },
+        "rows_written": int(sum(int(state.get("rows_written", 0)) for state in band_states.values())),
+        "refit_events": int(sum(int(state.get("refit_events", 0)) for state in band_states.values())),
+        "definition_write_events": int(
+            sum(int(state.get("definition_write_events", 0)) for state in band_states.values())
+        ),
+        "parquet_write_events": int(sum(int(state.get("parquet_write_events", 0)) for state in band_states.values())),
+        "diagnostic_write_events": int(diagnostic_write_events),
+    }
 
 
 def run(
@@ -1772,30 +2475,42 @@ def run(
     min_samples: int = HDBSCAN_MIN_SAMPLES,
     standardize: bool = False,
     workers: int = 1,
-) -> None:
+    output_limits: Optional[RegimeOutputLimits] = None,
+    label_io_args: Optional[argparse.Namespace] = None,
+) -> Dict[str, Any]:
     if hdbscan is None:
         raise RuntimeError("hdbscan is required for regime clustering.")
+    configure_regime_label_generation_io(label_io_args)
+    run_start = time.perf_counter()
     feature_subset = feature_subset or DEFAULT_FEATURE_SUBSET
-    band_specs = [b for b in BANDS if not bands or b.name in bands]
+    band_specs = _band_specs_for_names(bands)
     if not assets:
         assets = sorted(assets_present_in_features(DEFAULT_INTERVALS[-1]))
+    asset_results: List[Dict[str, Any]] = []
     if workers <= 1:
         for asset in assets:
-            process_asset(
-                asset,
-                band_specs,
-                feature_strategy,
-                feature_subset,
-                corr_thresh,
-                n_per_interval,
-                min_cluster_size_override,
-                min_samples,
-                standardize,
+            asset_results.append(
+                process_asset(
+                    asset,
+                    band_specs,
+                    feature_strategy,
+                    feature_subset,
+                    corr_thresh,
+                    n_per_interval,
+                    min_cluster_size_override,
+                    min_samples,
+                    standardize,
+                    output_limits,
+                )
             )
     else:
         pending_assets: List[str] = list(assets)
         try:
-            with ProcessPoolExecutor(max_workers=workers) as pool:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_configure_worker_regime_label_generation_io,
+                initargs=(REGIME_LABEL_IO_CONFIG, REGIME_LABEL_SANDBOX_ROOTS),
+            ) as pool:
                 future_map = {}
                 for asset in assets:
                     fut = pool.submit(
@@ -1809,12 +2524,13 @@ def run(
                         min_cluster_size_override,
                         min_samples,
                         standardize,
+                        output_limits,
                     )
                     future_map[fut] = asset
                 for fut in as_completed(future_map):
                     asset = future_map[fut]
                     try:
-                        fut.result()
+                        asset_results.append(fut.result())
                         if asset in pending_assets:
                             pending_assets.remove(asset)
                     except BrokenProcessPool as exc:
@@ -1829,19 +2545,50 @@ def run(
         if pending_assets:
             for asset in pending_assets:
                 try:
-                    process_asset(
-                        asset,
-                        band_specs,
-                        feature_strategy,
-                        feature_subset,
-                        corr_thresh,
-                        n_per_interval,
-                        min_cluster_size_override,
-                        min_samples,
-                        standardize,
+                    asset_results.append(
+                        process_asset(
+                            asset,
+                            band_specs,
+                            feature_strategy,
+                            feature_subset,
+                            corr_thresh,
+                            n_per_interval,
+                            min_cluster_size_override,
+                            min_samples,
+                            standardize,
+                            output_limits,
+                        )
                     )
                 except Exception as exc:
                     log(f"[run][serial-error] asset={asset} err={exc}")
+                    asset_results.append({"asset": str(asset), "band_states": {}, "errors": [{"error": str(exc)}]})
+    summary = {
+        "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "module_slug": "regime_clustering",
+        "assets": [str(asset) for asset in assets],
+        "bands": [str(band.name) for band in band_specs],
+        "workers": max(1, int(workers)),
+        "label_generation_io": REGIME_LABEL_IO_CONFIG.to_json_ready(),
+        "output_limits": (output_limits or RegimeOutputLimits()).to_json_ready(),
+        "elapsed_seconds": round(float(time.perf_counter() - run_start), 6),
+        "rows_written": int(sum(int(result.get("rows_written", 0)) for result in asset_results)),
+        "refit_events": int(sum(int(result.get("refit_events", 0)) for result in asset_results)),
+        "definition_write_events": int(
+            sum(int(result.get("definition_write_events", 0)) for result in asset_results)
+        ),
+        "parquet_write_events": int(sum(int(result.get("parquet_write_events", 0)) for result in asset_results)),
+        "diagnostic_write_events": int(
+            sum(int(result.get("diagnostic_write_events", 0)) for result in asset_results)
+        ),
+        "asset_results": asset_results,
+    }
+    log(
+        "[summary] "
+        f"assets={len(assets)} bands={len(band_specs)} workers={max(1, int(workers))} "
+        f"elapsed_s={float(summary['elapsed_seconds']):.3f} rows={int(summary['rows_written'])} "
+        f"refits={int(summary['refit_events'])} parquet_writes={int(summary['parquet_write_events'])}"
+    )
+    return summary
 
 
 def parse_list(val: Optional[str]) -> Optional[List[str]]:
@@ -1870,8 +2617,74 @@ def main() -> None:
         help="Centroid confidence mapping rule",
     )
     parser.add_argument("--standardize", action="store_true", help="Use z-score standardization instead of robust scaling")
+    parser.add_argument(
+        "--runtime-profile",
+        type=str,
+        default="runtime_config",
+        choices=sorted(REGIME_CLUSTERING_RUNTIME_PROFILES),
+        help="Named Regime label-generation runtime profile; defaults to module-keyed runtime config.",
+    )
+    parser.add_argument(
+        "--sandbox-output-root",
+        type=str,
+        default=None,
+        help="Route Regime label-generation writes under this sandbox root.",
+    )
     parser.add_argument("--workers", type=int, default=None, help="Parallel worker count")
+    parser.add_argument(
+        "--output-start",
+        type=str,
+        default=None,
+        help="Optional UTC timestamp/date lower bound for labels written by this run.",
+    )
+    parser.add_argument(
+        "--output-end",
+        type=str,
+        default=None,
+        help="Optional UTC timestamp/date upper bound for labels written by this run.",
+    )
+    parser.add_argument(
+        "--max-output-months",
+        type=int,
+        default=None,
+        help="Optional calendar-month cap per asset/band, counted from the resolved output start.",
+    )
+    parser.add_argument(
+        "--runtime-summary-json",
+        type=str,
+        default=None,
+        help="Optional path for resolved runtime and in-process timing/write counters.",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Validate requested assets/bands and estimate scalar feature inputs without fitting or writing regimes.",
+    )
+    parser.add_argument(
+        "--preflight-json",
+        type=str,
+        default=None,
+        help="Optional path for the preflight JSON report.",
+    )
+    parser.add_argument(
+        "--allow-missing-preflight-assets",
+        action="store_true",
+        help="Allow preflight-only mode to exit successfully when requested assets are missing source partitions.",
+    )
     args = parser.parse_args()
+    io_config = configure_regime_label_generation_io(args)
+    try:
+        runtime_profile = resolve_regime_clustering_runtime_profile(args)
+        workers = resolve_regime_clustering_workers(args, runtime_profile=runtime_profile)
+        output_limits = resolve_regime_output_limits(args, runtime_profile=runtime_profile)
+        validate_regime_clustering_runtime_guardrails(
+            args,
+            workers=workers,
+            runtime_profile=runtime_profile,
+            output_limits=output_limits,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     env_mcs = os.getenv("REGIME_MCS", "").strip()
     resolved_mcs: Optional[int] = None
     if env_mcs:
@@ -1904,18 +2717,46 @@ def main() -> None:
     CONFIDENCE_MAPPING = resolved_conf_map
     env_standardize = str(os.getenv("REGIME_STANDARDIZE", "0")).strip().lower() in {"1", "true", "yes", "on"}
     resolved_standardize = bool(args.standardize) or bool(env_standardize)
-    workers = int(args.workers) if args.workers is not None else get_workers("regime_clustering", "asset_workers")
-    log_resolved_runtime(
-        "regime_clustering",
-        resolved={
-            "asset_workers": int(max(1, workers)),
-            "writer_workers": 1,
-            "model_threads": "n/a",
-        },
+    runtime_snapshot = resolve_regime_clustering_runtime_snapshot(
+        args,
+        workers=workers,
+        runtime_profile=runtime_profile,
+        output_limits=output_limits,
     )
-    run(
-        assets=parse_list(args.assets),
-        bands=parse_list(args.bands),
+    log_resolved_runtime("regime_clustering", resolved=runtime_snapshot)
+    requested_assets = parse_list(args.assets)
+    requested_bands = parse_list(args.bands)
+    preflight: Optional[Dict[str, Any]] = None
+    if args.preflight_only or args.preflight_json or requested_assets:
+        preflight = resolve_regime_clustering_preflight(
+            args,
+            workers=workers,
+            assets=requested_assets,
+            bands=requested_bands,
+            runtime_profile=runtime_profile,
+        )
+    if (args.preflight_only or args.preflight_json) and preflight is not None:
+        payload_text = json.dumps(preflight, indent=2, sort_keys=True)
+        if args.preflight_json:
+            preflight_path = Path(args.preflight_json)
+            regime_artifacts.write_json(
+                preflight_path,
+                preflight,
+                write_kind="diagnostics",
+                sandbox_roots=REGIME_LABEL_SANDBOX_ROOTS,
+            )
+            log(f"[preflight] wrote runtime preflight report -> {preflight_path}")
+        if args.preflight_only:
+            print(payload_text)
+            if preflight["status"] != "ok" and not bool(args.allow_missing_preflight_assets):
+                raise SystemExit(2)
+            return
+    if requested_assets and preflight is not None and preflight["status"] != "ok":
+        log(f"[preflight][error] missing requested source partitions: {preflight['missing_assets']}")
+        raise SystemExit(2)
+    run_summary = run(
+        assets=requested_assets,
+        bands=requested_bands,
         feature_strategy=args.feature_strategy,
         feature_subset=parse_list(args.feature_subset),
         corr_thresh=args.corr_thresh,
@@ -1924,7 +2765,23 @@ def main() -> None:
         min_samples=args.min_samples,
         standardize=resolved_standardize,
         workers=workers,
+        output_limits=output_limits,
+        label_io_args=args,
     )
+    if args.runtime_summary_json:
+        summary_path = Path(args.runtime_summary_json)
+        payload = {
+            "runtime_snapshot": runtime_snapshot,
+            "run_summary": run_summary,
+            "label_generation_io": io_config.to_json_ready(),
+        }
+        regime_artifacts.write_json(
+            summary_path,
+            payload,
+            write_kind="runtime",
+            sandbox_roots=REGIME_LABEL_SANDBOX_ROOTS,
+        )
+        log(f"[summary] wrote runtime summary -> {summary_path}")
 
 
 if __name__ == "__main__":

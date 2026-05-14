@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 import math
 import os
@@ -7,6 +8,7 @@ import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -33,6 +35,139 @@ from src.forecasting.common.stats_module_utils import (
 SEED = int(os.getenv("FORECAST_FAMILY_SEED", "42"))
 random.seed(SEED)
 np.random.seed(SEED)
+
+_PARQUET_SCHEMA_NAMES_CACHE: Dict[Tuple[str, int, int, int], set[str]] = {}
+_PARQUET_SCHEMA_NAMES_CACHE_MAX = 4096
+_FEATURE_WINDOW_READ_CACHE_MAX_ENTRIES = 128
+_FEATURE_WINDOW_READ_CACHE_MAX_BYTES = 256 * 1024 * 1024
+
+_FeatureWindowFileStatKey = Tuple[str, int, int, int]
+_FeatureWindowReadKey = Tuple[_FeatureWindowFileStatKey, Tuple[str, ...]]
+
+
+@dataclass
+class _FeatureWindowReadCacheEntry:
+    file_key: _FeatureWindowFileStatKey
+    columns: Tuple[str, ...]
+    frame: pd.DataFrame
+    byte_size: int
+
+
+class _FeatureWindowReadCache:
+    def __init__(self, *, max_entries: int, max_bytes: int) -> None:
+        self._max_entries = max(1, int(max_entries))
+        self._max_bytes = max(1, int(max_bytes))
+        self._entries: "OrderedDict[_FeatureWindowReadKey, _FeatureWindowReadCacheEntry]" = OrderedDict()
+        self._bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._puts = 0
+        self._evictions = 0
+        self._oversize_skips = 0
+        self._lock = RLock()
+
+    @staticmethod
+    def file_key(path: Path) -> _FeatureWindowFileStatKey:
+        resolved = Path(path).resolve()
+        stat = resolved.stat()
+        ctime_ns = getattr(stat, "st_ctime_ns", None)
+        if ctime_ns is None:
+            ctime_ns = int(float(getattr(stat, "st_ctime", 0.0)) * 1_000_000_000)
+        return (
+            str(resolved).lower(),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+            int(ctime_ns),
+        )
+
+    @staticmethod
+    def _frame_bytes(frame: pd.DataFrame) -> int:
+        try:
+            return int(frame.memory_usage(index=True, deep=True).sum())
+        except Exception:
+            return int(getattr(frame, "size", 0)) * 8
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._bytes = 0
+            self._hits = 0
+            self._misses = 0
+            self._puts = 0
+            self._evictions = 0
+            self._oversize_skips = 0
+
+    def get(self, file_key: _FeatureWindowFileStatKey, present_cols: Sequence[str]) -> Optional[pd.DataFrame]:
+        requested = tuple(str(col) for col in present_cols)
+        requested_set = set(requested)
+        with self._lock:
+            for key, entry in reversed(self._entries.items()):
+                if entry.file_key != file_key:
+                    continue
+                if not requested_set.issubset(set(entry.columns)):
+                    continue
+                self._entries.move_to_end(key)
+                self._hits += 1
+                return entry.frame.loc[:, list(requested)].copy()
+            self._misses += 1
+        return None
+
+    def put(self, file_key: _FeatureWindowFileStatKey, present_cols: Sequence[str], frame: pd.DataFrame) -> None:
+        columns = tuple(str(col) for col in present_cols)
+        if not columns:
+            return
+        stored = frame.loc[:, list(columns)].copy()
+        byte_size = self._frame_bytes(stored)
+        if byte_size > self._max_bytes:
+            with self._lock:
+                self._oversize_skips += 1
+            return
+        key = (file_key, columns)
+        with self._lock:
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self._bytes -= int(old.byte_size)
+            self._entries[key] = _FeatureWindowReadCacheEntry(
+                file_key=file_key,
+                columns=columns,
+                frame=stored,
+                byte_size=byte_size,
+            )
+            self._bytes += byte_size
+            self._puts += 1
+            self._evict()
+
+    def _evict(self) -> None:
+        while self._entries and (len(self._entries) > self._max_entries or self._bytes > self._max_bytes):
+            _, entry = self._entries.popitem(last=False)
+            self._bytes -= int(entry.byte_size)
+            self._evictions += 1
+
+    def stats(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "cache_entries": int(len(self._entries)),
+                "cache_bytes_estimate": int(self._bytes),
+                "cache_hit_count": int(self._hits),
+                "cache_miss_count": int(self._misses),
+                "cache_put_count": int(self._puts),
+                "cache_eviction_count": int(self._evictions),
+                "cache_oversize_skip_count": int(self._oversize_skips),
+            }
+
+
+_FEATURE_WINDOW_READ_CACHE = _FeatureWindowReadCache(
+    max_entries=_FEATURE_WINDOW_READ_CACHE_MAX_ENTRIES,
+    max_bytes=_FEATURE_WINDOW_READ_CACHE_MAX_BYTES,
+)
+
+
+def _clear_feature_window_columns_cache_for_tests() -> None:
+    _FEATURE_WINDOW_READ_CACHE.clear()
+
+
+def feature_window_read_cache_stats() -> Dict[str, int]:
+    return _FEATURE_WINDOW_READ_CACHE.stats()
 
 
 def utc_now_iso() -> str:
@@ -158,11 +293,24 @@ def _read_parquet_present_columns(path: Path, needed: Sequence[str], required: S
     except ImportError:
         return _read_parquet_present_columns_without_schema(path, read_cols, required_cols)
 
-    schema_names = set(str(name) for name in pq.read_schema(path).names)
+    path = Path(path)
+    file_key = _FEATURE_WINDOW_READ_CACHE.file_key(path)
+    cache_key = file_key
+    schema_names = _PARQUET_SCHEMA_NAMES_CACHE.get(cache_key)
+    if schema_names is None:
+        schema_names = set(str(name) for name in pq.read_schema(path).names)
+        if len(_PARQUET_SCHEMA_NAMES_CACHE) >= _PARQUET_SCHEMA_NAMES_CACHE_MAX:
+            _PARQUET_SCHEMA_NAMES_CACHE.clear()
+        _PARQUET_SCHEMA_NAMES_CACHE[cache_key] = set(schema_names)
     present_cols = [c for c in read_cols if c in schema_names]
     if any(c not in present_cols for c in required_cols):
         return None
-    return pd.read_parquet(path, columns=present_cols)
+    cached = _FEATURE_WINDOW_READ_CACHE.get(file_key, present_cols)
+    if cached is not None:
+        return cached
+    frame = pd.read_parquet(path, columns=present_cols)
+    _FEATURE_WINDOW_READ_CACHE.put(file_key, present_cols, frame)
+    return frame
 
 
 def _read_parquet_present_columns_without_schema(

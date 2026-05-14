@@ -47,6 +47,14 @@ def _train_bars_for_window(interval_minutes: int, training_window_months: int) -
     return max(MIN_STAGE2_TRAIN_BARS, int(requested_bars))
 
 
+def _model_stage2_min_train_bars(module: Any) -> int:
+    runtime_params = getattr(getattr(module, "MODULE_SPEC", None), "runtime_params", {}) or {}
+    try:
+        return max(MIN_STAGE2_TRAIN_BARS, int(runtime_params.get("stage2_min_train_bars", MIN_STAGE2_TRAIN_BARS)))
+    except Exception:
+        return MIN_STAGE2_TRAIN_BARS
+
+
 def _stage2_history_start_ts(
     *,
     common_edge: int,
@@ -54,10 +62,11 @@ def _stage2_history_start_ts(
     training_window_months: int,
     max_horizon_minutes: int,
     forecast_days: float,
+    min_train_bars: int = MIN_STAGE2_TRAIN_BARS,
 ) -> int:
     interval = max(1, int(interval_minutes))
     interval_seconds = interval * 60
-    train_bars = _train_bars_for_window(interval, int(training_window_months))
+    train_bars = max(_train_bars_for_window(interval, int(training_window_months)), int(min_train_bars))
     horizon_bars = max(1, int(math.ceil(float(max_horizon_minutes) / float(interval))))
     eval_bars = max(1, int(math.ceil(float(forecast_days) * 24.0 * 60.0 / float(interval))))
     required_seconds = int(train_bars + horizon_bars + eval_bars + 1) * interval_seconds
@@ -345,6 +354,7 @@ def _origin_metrics(
     model_key: str = "",
     asset: str = "",
     forecast_days: float = DEFAULT_FORECAST_DAYS,
+    min_train_bars: int = MIN_STAGE2_TRAIN_BARS,
 ) -> Tuple[List[float], List[float], List[int]]:
     asset_name = str(asset or (frame["asset"].iloc[0] if not frame.empty and "asset" in frame.columns else ""))
     base_event = {
@@ -401,7 +411,7 @@ def _origin_metrics(
     )
     edge_ts = int(ts_vec[-1]) if len(ts_vec) else 0
     eval_start_ts = int(edge_ts - float(forecast_days) * 86400)
-    train_bars = _train_bars_for_window(int(interval), int(training_window_months))
+    train_bars = max(_train_bars_for_window(int(interval), int(training_window_months)), int(min_train_bars))
     preds: List[float] = []
     actuals: List[float] = []
     pred_ts: List[int] = []
@@ -618,6 +628,7 @@ def _score_combo_shard(payload: Dict[str, Any]) -> Dict[str, Any]:
                 model_key=str(payload["model_key"]),
                 asset=str(asset),
                 forecast_days=float(payload.get("forecast_days", DEFAULT_FORECAST_DAYS)),
+                min_train_bars=int(payload.get("min_train_bars", MIN_STAGE2_TRAIN_BARS)),
             )
             if not preds:
                 emit_event_for_path(
@@ -705,6 +716,7 @@ def run_stage_for_model(model_key: str) -> Path:
     if str(model_key) not in BAYESIAN_NUMERIC_BRANCHES:
         raise RuntimeError(f"unsupported Bayesian model key: {model_key}")
     module = _load_module(model_key)
+    min_train_bars = _model_stage2_min_train_bars(module)
     output_dir = Path(args.output_dir).resolve()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     feature_profile_json = args.feature_profile_json.resolve() if args.feature_profile_json else None
@@ -794,6 +806,7 @@ def run_stage_for_model(model_key: str) -> Path:
                 training_window_months=int(training_window_months),
                 max_horizon_minutes=int(max_horizon_minutes),
                 forecast_days=float(args.forecast_days),
+                min_train_bars=int(min_train_bars),
             )
             insufficient_assets = [asset for asset, min_ts in asset_min_ts.items() if int(min_ts) > int(history_start_ts)]
             if insufficient_assets:
@@ -818,6 +831,7 @@ def run_stage_for_model(model_key: str) -> Path:
                         "model_threads": (max(1, int(args.model_threads)) if args.model_threads is not None else None),
                         "telemetry_path": str(run_root),
                         "forecast_days": float(args.forecast_days),
+                        "min_train_bars": int(min_train_bars),
                     }
                     for shard in combo_shards
                 ]
@@ -840,6 +854,7 @@ def run_stage_for_model(model_key: str) -> Path:
                             "model_threads": (max(1, int(args.model_threads)) if args.model_threads is not None else None),
                             "telemetry_path": str(run_root),
                             "forecast_days": float(args.forecast_days),
+                            "min_train_bars": int(min_train_bars),
                         }
                     )
                     for shard in combo_shards

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 from dataclasses import dataclass, field
@@ -132,6 +133,66 @@ def _matching_table_roots(parquet_root: Path, prefixes: Iterable[str]) -> List[P
     except Exception:
         return roots
     return roots
+
+
+class _ContractScanCache:
+    def __init__(self) -> None:
+        self._descendants: Dict[str, List[Path]] = {}
+
+    @staticmethod
+    def _key(root: Path) -> str:
+        return str(Path(root).resolve()).lower()
+
+    def descendants(self, root: Path) -> List[Path]:
+        root = Path(root)
+        key = self._key(root)
+        if key not in self._descendants:
+            if not root.exists() or not root.is_dir():
+                self._descendants[key] = []
+            else:
+                self._descendants[key] = list(root.rglob("*"))
+        return self._descendants[key]
+
+    def has_nonempty_file_under(self, root: Path, suffix: str) -> bool:
+        if not root.exists():
+            return False
+        pattern = f"*{suffix}"
+        for path in self.descendants(root):
+            try:
+                if fnmatch.fnmatch(path.name, pattern) and path.is_file() and path.stat().st_size > 0:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def rglob_matches(self, root: Path, pattern: str) -> List[str]:
+        root = Path(root)
+        if not root.exists() or not root.is_dir():
+            return []
+        raw_pattern = str(pattern)
+        normalized = raw_pattern.replace("\\", "/")
+        pattern_has_separator = "/" in normalized
+        matches: List[str] = []
+        for path in self.descendants(root):
+            if self._matches_rglob_pattern(root, path, raw_pattern, normalized, pattern_has_separator):
+                matches.append(str(path))
+        return matches
+
+    @staticmethod
+    def _matches_rglob_pattern(
+        root: Path,
+        path: Path,
+        raw_pattern: str,
+        normalized_pattern: str,
+        pattern_has_separator: bool,
+    ) -> bool:
+        if not pattern_has_separator:
+            return fnmatch.fnmatch(path.name, raw_pattern)
+        try:
+            rel = path.relative_to(root).as_posix()
+        except Exception:
+            return False
+        return fnmatch.fnmatch(rel, normalized_pattern)
 
 
 def _env_get(env: Mapping[str, str], key: str, default: str = "") -> str:
@@ -316,6 +377,8 @@ def snapshot_payload(
 def validate_contract(contract_spec: ContractSpec) -> tuple[str, Optional[str], Dict[str, Any]]:
     checks: List[ContractCheck] = []
     failure_type: Optional[str] = None
+    scan_cache = _ContractScanCache()
+    table_roots: List[Path] = []
     for path in contract_spec.required_files:
         ok = path.exists()
         checks.append(ContractCheck(name="required_file_exists", target=str(path), ok=bool(ok)))
@@ -340,13 +403,13 @@ def validate_contract(contract_spec: ContractSpec) -> tuple[str, Optional[str], 
             failure_type = "malformed_manifest"
     for root in contract_spec.required_nonempty_roots:
         suffix = ".parquet" if str(contract_spec.output_root) == str(root) else (".pkl" if "model_states" in str(root) else ".parquet")
-        ok = _has_nonempty_file_under(root, suffix)
+        ok = scan_cache.has_nonempty_file_under(root, suffix)
         checks.append(ContractCheck(name="required_nonempty_root", target=str(root), ok=bool(ok), detail=suffix))
         if not ok and failure_type is None:
             failure_type = "unexpected_empty_output"
     if contract_spec.output_table_prefixes:
         table_roots = _matching_table_roots(contract_spec.output_root, contract_spec.output_table_prefixes)
-        ok = any(_has_nonempty_file_under(root, ".parquet") for root in table_roots)
+        ok = any(scan_cache.has_nonempty_file_under(root, ".parquet") for root in table_roots)
         checks.append(
             ContractCheck(
                 name="required_nonempty_output_tables",
@@ -361,15 +424,15 @@ def validate_contract(contract_spec: ContractSpec) -> tuple[str, Optional[str], 
         if not root.exists():
             continue
         for pattern in contract_spec.forbidden_globs:
-            matches = [str(path) for path in root.rglob(pattern)]
+            matches = scan_cache.rglob_matches(root, pattern)
             ok = len(matches) == 0
             checks.append(ContractCheck(name="forbidden_glob_absent", target=f"{root}::{pattern}", ok=bool(ok), detail=(matches[0] if matches else None)))
             if not ok and failure_type is None:
                 failure_type = "contract_failed"
     if contract_spec.output_table_prefixes:
-        for root in _matching_table_roots(contract_spec.output_root, contract_spec.output_table_prefixes):
+        for root in table_roots:
             for pattern in contract_spec.forbidden_globs:
-                matches = [str(path) for path in root.rglob(pattern)]
+                matches = scan_cache.rglob_matches(root, pattern)
                 ok = len(matches) == 0
                 checks.append(
                     ContractCheck(

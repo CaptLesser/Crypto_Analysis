@@ -107,7 +107,7 @@ STAGE1_FORMULATION_OPTIONS = {
     "exceedance_rule": ["rolling_tail_window"],
 }
 
-RUNTIME_PARAMS: Dict[str, Any] = {"fit_days": 365, "refit_cadence": "auto"}
+RUNTIME_PARAMS: Dict[str, Any] = {"fit_days": 365, "refit_cadence": "auto", "stage2_min_train_bars": 96}
 
 
 PRODUCTION_DEFAULT_COMBOS = tuple(

@@ -472,6 +472,15 @@ def _safe_float(value: Any) -> Optional[float]:
     return out if math.isfinite(out) else None
 
 
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
 def _duration_seconds(started: Any, finished: Any) -> Optional[float]:
     start_dt = _parse_utc(started)
     finish_dt = _parse_utc(finished)
@@ -544,17 +553,23 @@ def process_health_from_log(log_path: Path) -> Dict[str, Any]:
     if not payload:
         return {"process_meta_path": str(meta_path), "exists": False}
     duration_s = _duration_seconds(payload.get("started_utc"), payload.get("finished_utc"))
+    returncode = _safe_int(payload.get("returncode"))
+    status = str(payload.get("status") or "").strip().lower()
+    final_failed = status in {"failed", "error"} or (returncode is not None and int(returncode) != 0)
+    final_succeeded = status == "completed" and (returncode is None or int(returncode) == 0)
     return {
         "process_meta_path": str(meta_path),
         "exists": True,
         "status": payload.get("status"),
         "pid": payload.get("pid"),
-        "returncode": payload.get("returncode"),
+        "returncode": returncode,
         "started_utc": payload.get("started_utc"),
         "finished_utc": payload.get("finished_utc"),
         "duration_s": duration_s,
         "error": payload.get("error"),
         "env_hints": payload.get("env_hints") if isinstance(payload.get("env_hints"), dict) else {},
+        "final_failed": bool(final_failed),
+        "final_succeeded": bool(final_succeeded),
     }
 
 
@@ -886,6 +901,35 @@ def _compare_stage2_work_across_models(model_health: Dict[str, Any], *, limit: i
     )[: max(1, int(limit))]
 
 
+STAGE_ERROR_PATTERN_KEYS = (
+    "traceback",
+    "contract_error",
+    "schema_error",
+    "atomic_replace_error",
+)
+
+
+def _stage_complete_from_payload(payload: Dict[str, Any]) -> Optional[bool]:
+    if not isinstance(payload, dict) or "complete" not in payload:
+        return None
+    return bool(payload.get("complete"))
+
+
+def _stage_failure_context(log_scan: Dict[str, Any]) -> Dict[str, Any]:
+    pattern_counts = log_scan.get("pattern_counts") if isinstance(log_scan.get("pattern_counts"), dict) else {}
+    counts = {str(key): int(pattern_counts.get(key, 0) or 0) for key in STAGE_ERROR_PATTERN_KEYS}
+    exit_nonzero_count = int(log_scan.get("exit_nonzero_count", 0) or 0)
+    signal_count = int(exit_nonzero_count + sum(int(value) for value in counts.values()))
+    return {
+        "has_signal": bool(signal_count > 0),
+        "signal_count": int(signal_count),
+        "exit_nonzero_count": int(exit_nonzero_count),
+        "exit_codes": list(log_scan.get("exit_codes") or []),
+        "counts": counts,
+        "samples": list(log_scan.get("samples") or []),
+    }
+
+
 def collect_test_branch_health(*, run_root: Path, family: str, stage0_status: Dict[str, Any], models: Dict[str, Any]) -> Dict[str, Any]:
     issues: List[Dict[str, Any]] = []
     bottlenecks: List[Dict[str, Any]] = []
@@ -894,18 +938,90 @@ def collect_test_branch_health(*, run_root: Path, family: str, stage0_status: Di
         log_path_raw = payload.get("log_path") if isinstance(payload, dict) else None
         log_scan = scan_log_health(Path(str(log_path_raw))) if log_path_raw else {}
         process_scan = process_health_from_log(Path(str(log_path_raw))) if log_path_raw else {}
+        stage_complete = _stage_complete_from_payload(payload)
+        final_process_failed = bool(process_scan.get("final_failed"))
+        final_success_authoritative = bool(stage_complete is True)
         elapsed = process_scan.get("duration_s") if process_scan.get("duration_s") is not None else log_scan.get("duration_s")
         if elapsed is not None:
             bottlenecks.append({"model_key": model_key, "stage": stage_name, "elapsed_s": round(float(elapsed), 3), "log_path": log_path_raw})
         pattern_counts = log_scan.get("pattern_counts") if isinstance(log_scan.get("pattern_counts"), dict) else {}
-        if int(log_scan.get("exit_nonzero_count", 0) or 0) > 0 or int(pattern_counts.get("traceback", 0) or 0) > 0:
-            issues.append({"severity": "error", "model_key": model_key, "stage": stage_name, "kind": "stage_failure_signal", "log_path": log_path_raw, "counts": pattern_counts})
-        for key in ("contract_error", "schema_error", "atomic_replace_error"):
-            if int(pattern_counts.get(key, 0) or 0) > 0:
-                issues.append({"severity": "error", "model_key": model_key, "stage": stage_name, "kind": key, "log_path": log_path_raw, "count": int(pattern_counts.get(key, 0) or 0)})
+        failure_context = _stage_failure_context(log_scan)
+        retry_history: Dict[str, Any] = {}
+        has_retry_history = bool(failure_context.get("has_signal")) or bool(final_process_failed)
+        if final_success_authoritative and has_retry_history:
+            retry_history = {
+                **failure_context,
+                "process_final_failed": bool(final_process_failed),
+                "process_status": process_scan.get("status"),
+                "process_returncode": process_scan.get("returncode"),
+                "process_error": process_scan.get("error"),
+            }
+            issues.append(
+                {
+                    "severity": "warning",
+                    "model_key": model_key,
+                    "stage": stage_name,
+                    "kind": "stage_retry_history",
+                    "log_path": log_path_raw,
+                    "retry_signal_count": int(failure_context.get("signal_count", 0) or 0),
+                    "exit_nonzero_count": int(failure_context.get("exit_nonzero_count", 0) or 0),
+                    "counts": failure_context.get("counts"),
+                    "samples": failure_context.get("samples"),
+                    "process_final_failed": bool(final_process_failed),
+                    "process_returncode": process_scan.get("returncode"),
+                    "process_status": process_scan.get("status"),
+                }
+            )
+        elif bool(failure_context.get("has_signal")):
+            issues.append(
+                {
+                    "severity": "error",
+                    "model_key": model_key,
+                    "stage": stage_name,
+                    "kind": "stage_failure_signal",
+                    "log_path": log_path_raw,
+                    "exit_nonzero_count": int(failure_context.get("exit_nonzero_count", 0) or 0),
+                    "counts": failure_context.get("counts"),
+                    "samples": failure_context.get("samples"),
+                }
+            )
+            for key in ("contract_error", "schema_error", "atomic_replace_error"):
+                if int(pattern_counts.get(key, 0) or 0) > 0:
+                    issues.append({"severity": "error", "model_key": model_key, "stage": stage_name, "kind": key, "log_path": log_path_raw, "count": int(pattern_counts.get(key, 0) or 0)})
+        if final_process_failed and not final_success_authoritative:
+            issues.append(
+                {
+                    "severity": "error",
+                    "model_key": model_key,
+                    "stage": stage_name,
+                    "kind": "stage_final_process_failure",
+                    "log_path": log_path_raw,
+                    "process_meta_path": process_scan.get("process_meta_path"),
+                    "returncode": process_scan.get("returncode"),
+                    "status": process_scan.get("status"),
+                    "error": process_scan.get("error"),
+                }
+            )
+        if stage_complete is False:
+            issues.append(
+                {
+                    "severity": "error",
+                    "model_key": model_key,
+                    "stage": stage_name,
+                    "kind": "stage_incomplete",
+                    "log_path": log_path_raw,
+                    "complete": False,
+                }
+            )
         if int(pattern_counts.get("convergence_warning", 0) or 0) > 0:
             issues.append({"severity": "warning", "model_key": model_key, "stage": stage_name, "kind": "convergence_warning", "log_path": log_path_raw, "count": int(pattern_counts.get("convergence_warning", 0) or 0)})
-        return {"log": log_scan, "process": process_scan}
+        return {
+            "log": log_scan,
+            "process": process_scan,
+            "artifacts_complete": stage_complete,
+            "final_success_authoritative": bool(final_success_authoritative),
+            "retry_history": retry_history,
+        }
 
     stage0_health = _stage_health("family", "stage0", stage0_status)
     model_health: Dict[str, Any] = {}

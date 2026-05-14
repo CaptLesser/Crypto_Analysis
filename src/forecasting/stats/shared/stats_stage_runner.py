@@ -249,6 +249,8 @@ def _stage_eval_quality_rows(manifest: Dict[str, Any]) -> Dict[Tuple[int, int, s
     eval_declared_rows: Dict[Tuple[int, int, str], int] = {}
     eval_expected_cols: Dict[Tuple[int, int, str], List[str]] = {}
     eval_paths: Dict[Tuple[int, int, str], List[str]] = {}
+    eval_parts: List[Tuple[Tuple[int, int, str], Path]] = []
+    read_counters: Dict[Tuple[int, int, str], Dict[str, int]] = {}
     for part in list(manifest.get("parts") or []):
         if not isinstance(part, dict) or str(part.get("store", "forecast")) != "eval":
             continue
@@ -269,11 +271,63 @@ def _stage_eval_quality_rows(manifest: Dict[str, Any]) -> Dict[Tuple[int, int, s
             eval_declared_rows[key] = int(eval_declared_rows.get(key, 0)) + int(part.get("rows", 0) or 0)
         except Exception:
             pass
+        eval_parts.append((key, path))
+
+    def _contract_metric_column(key: Tuple[int, int, str], generic: str) -> Optional[str]:
+        expected_cols = eval_expected_cols.get(key, [])
+        candidates = [
+            str(col)
+            for col in expected_cols
+            if str(col) == generic or str(col).endswith(f"_{generic}") or f"_{generic}_" in str(col)
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        return None
+
+    def _resolve_eval_quality_projection_columns(key: Tuple[int, int, str]) -> Optional[List[str]]:
+        squared_col = _contract_metric_column(key, "squared_error_p50")
+        absolute_col = _contract_metric_column(key, "abs_error_p50")
+        if squared_col is None or absolute_col is None:
+            return None
+        columns: List[str] = []
+        for col in ("ts", squared_col, absolute_col):
+            if col not in columns:
+                columns.append(str(col))
+        return columns
+
+    def _read_eval_quality_part(path: Path, key: Tuple[int, int, str]) -> Optional[pd.DataFrame]:
+        counters = read_counters.setdefault(
+            key,
+            {
+                "projected_read_count": 0,
+                "fallback_full_read_count": 0,
+                "projection_failure_count": 0,
+                "columns_read_count": 0,
+            },
+        )
         if not path.exists():
-            continue
+            return None
+        projected_columns = _resolve_eval_quality_projection_columns(key)
+        if projected_columns is not None:
+            try:
+                frame = pd.read_parquet(path, columns=projected_columns)
+                counters["projected_read_count"] += 1
+                counters["columns_read_count"] += int(len(projected_columns))
+                return frame
+            except Exception:
+                counters["projection_failure_count"] += 1
+                pass
         try:
             frame = pd.read_parquet(path)
+            counters["fallback_full_read_count"] += 1
+            counters["columns_read_count"] += int(len(frame.columns))
+            return frame
         except Exception:
+            return None
+
+    for key, path in eval_parts:
+        frame = _read_eval_quality_part(path, key)
+        if frame is None:
             continue
         if not frame.empty:
             grouped_frames.setdefault(key, []).append(frame)
@@ -287,16 +341,23 @@ def _stage_eval_quality_rows(manifest: Dict[str, Any]) -> Dict[Tuple[int, int, s
             return values
         return pd.Series(values, dtype="float64")
 
-    def _contract_metric_column(key: Tuple[int, int, str], generic: str) -> Optional[str]:
-        expected_cols = eval_expected_cols.get(key, [])
-        candidates = [
-            str(col)
-            for col in expected_cols
-            if str(col) == generic or str(col).endswith(f"_{generic}") or f"_{generic}_" in str(col)
-        ]
-        if len(candidates) == 1:
-            return candidates[0]
-        return None
+    def _read_counter_fields(key: Tuple[int, int, str]) -> Dict[str, Any]:
+        counters = read_counters.get(
+            key,
+            {
+                "projected_read_count": 0,
+                "fallback_full_read_count": 0,
+                "projection_failure_count": 0,
+                "columns_read_count": 0,
+            },
+        )
+        return {
+            "projected_read_used": bool(int(counters.get("projected_read_count", 0) or 0) > 0),
+            "projected_read_count": int(counters.get("projected_read_count", 0) or 0),
+            "fallback_full_read_count": int(counters.get("fallback_full_read_count", 0) or 0),
+            "projection_failure_count": int(counters.get("projection_failure_count", 0) or 0),
+            "columns_read_count": int(counters.get("columns_read_count", 0) or 0),
+        }
 
     for key, part_count in eval_part_counts.items():
         if key not in grouped_frames:
@@ -306,6 +367,7 @@ def _stage_eval_quality_rows(manifest: Dict[str, Any]) -> Dict[Tuple[int, int, s
                 "eval_part_count": int(part_count),
                 "eval_declared_rows": int(eval_declared_rows.get(key, 0)),
                 "quality_rows": 0,
+                **_read_counter_fields(key),
             }
 
     for key, frames in grouped_frames.items():
@@ -317,6 +379,7 @@ def _stage_eval_quality_rows(manifest: Dict[str, Any]) -> Dict[Tuple[int, int, s
                 "eval_part_count": int(eval_part_counts.get(key, 0)),
                 "eval_declared_rows": int(eval_declared_rows.get(key, 0)),
                 "quality_rows": 0,
+                **_read_counter_fields(key),
             }
             continue
         if not eval_expected_cols.get(key):
@@ -351,6 +414,7 @@ def _stage_eval_quality_rows(manifest: Dict[str, Any]) -> Dict[Tuple[int, int, s
                 "eval_declared_rows": int(eval_declared_rows.get(key, 0)),
                 "eval_observed_rows": int(len(frame)),
                 "quality_rows": 0,
+                **_read_counter_fields(key),
             }
             continue
         ts_values = _numeric_series(frame, "ts").dropna()
@@ -367,6 +431,7 @@ def _stage_eval_quality_rows(manifest: Dict[str, Any]) -> Dict[Tuple[int, int, s
             "eval_observed_rows": int(len(frame)),
             "first_prediction_ts": int(ts_values.min()) if not ts_values.empty else None,
             "last_prediction_ts": int(ts_values.max()) if not ts_values.empty else None,
+            **_read_counter_fields(key),
         }
     return out
 

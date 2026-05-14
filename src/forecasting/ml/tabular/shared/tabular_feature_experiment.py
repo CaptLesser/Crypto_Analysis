@@ -487,8 +487,36 @@ def run_fold(
         x_train_raw = train.loc[:, x_cols]
         x_val_raw = val.loc[:, x_cols]
         selector = VarianceThreshold(threshold=float(args.variance_threshold))
-        x_train_screen = pd.DataFrame(selector.fit_transform(x_train_raw), columns=x_train_raw.columns[selector.get_support()].tolist())
-        x_val_screen = pd.DataFrame(selector.transform(x_val_raw), columns=x_train_screen.columns.tolist())
+        with telemetry_scope_for_path(
+            telemetry_path,
+            input_obj=x_train_raw,
+            family="Tabular_Numeric",
+            model=str(model_key),
+            stage="stage1",
+            combo_key=spec.key,
+            interval_minutes=int(spec.interval_minutes),
+            horizon_minutes=int(spec.horizon_minutes),
+            task=str(spec.task),
+            asset=str(asset),
+            training_window_months=int(spec.training_window_months),
+            function_name="VarianceThreshold.fit_transform",
+            module_name=__name__,
+            phase_name="candidate_feature_prep",
+            parent_phase="feature_selection",
+            input_columns_count=len(x_cols),
+            candidate_feature_count=len(x_cols),
+        ) as variance_scope:
+            x_train_screen = pd.DataFrame(
+                selector.fit_transform(x_train_raw),
+                columns=x_train_raw.columns[selector.get_support()].tolist(),
+            )
+            x_val_screen = pd.DataFrame(selector.transform(x_val_raw), columns=x_train_screen.columns.tolist())
+            variance_scope.set_output(
+                x_train_screen,
+                output_columns_count=len(x_train_screen.columns),
+                candidate_feature_count=len(x_train_screen.columns),
+                reason_code=("required_columns_missing" if x_train_screen.empty else ""),
+            )
         if x_train_screen.empty:
             emit_event_for_path(
                 telemetry_path,
@@ -502,7 +530,7 @@ def run_fold(
                 asset=str(asset),
                 function_name="VarianceThreshold.fit_transform",
                 module_name=__name__,
-                phase_name="feature_selection",
+                phase_name="candidate_feature_prep",
                 parent_phase="feature_selection",
                 status="skipped",
                 reason_code="required_columns_missing",
@@ -510,6 +538,7 @@ def run_fold(
                 output_rows=0,
                 input_columns_count=len(x_cols),
                 output_columns_count=0,
+                candidate_feature_count=0,
             )
             continue
         y_train = pd.to_numeric(train[y_col], errors='coerce').to_numpy(dtype=float)
@@ -523,6 +552,10 @@ def run_fold(
             "horizon_minutes": int(spec.horizon_minutes),
             "task": str(spec.task),
             "asset": str(asset),
+            "training_window_months": int(spec.training_window_months),
+            "thread_count": int(model_threads),
+            "candidate_feature_count": int(len(x_train_screen.columns)),
+            "dynamic_feature_count": int(len(x_train_screen.columns)),
         }
         full_pred, full_model = fit_and_predict(
             module,
@@ -532,16 +565,65 @@ def run_fold(
             x_val_screen,
             model_threads,
             telemetry_path=telemetry_path,
-            telemetry_base=telemetry_base,
+            telemetry_base={
+                **telemetry_base,
+                "fit_role": "full_model",
+                "selected_feature_count": int(len(x_train_screen.columns)),
+            },
         )
         full_rmse = float(np.sqrt(np.mean((full_pred - y_val) ** 2)))
         base_rmse = baseline_rmse(y_train, y_val)
         full_skill = float(1.0 - (full_rmse / base_rmse)) if base_rmse not in (None, 0.0) else None
-        mi_arr = mutual_info_regression(x_train_screen, y_train, random_state=17)
+        with telemetry_scope_for_path(
+            telemetry_path,
+            input_obj=x_train_screen,
+            **telemetry_base,
+            function_name="mutual_info_regression",
+            module_name=__name__,
+            phase_name="feature_scoring",
+            parent_phase="feature_selection",
+            input_rows=len(x_train_screen),
+            input_columns_count=len(x_train_screen.columns),
+        ) as mi_scope:
+            mi_arr = mutual_info_regression(x_train_screen, y_train, random_state=17)
+            mi_scope.set_output(
+                output_rows=len(mi_arr),
+                output_columns_count=len(mi_arr),
+                selected_feature_count=0,
+            )
         mi_map = {str(col): float(val) for col, val in zip(x_train_screen.columns.tolist(), mi_arr.tolist())}
         gains = model_gain_map(full_model, x_train_screen.columns.tolist())
         candidate_cols = rank_candidate_columns(gains, mi_map, top_k=min(int(args.top_k_features) * 2, max(4, len(x_train_screen.columns))))
-        perm_map = permutation_scores(full_model, x_val_screen, y_val, full_rmse, repeats=int(args.permutation_repeats), columns=candidate_cols) if candidate_cols else {}
+        with telemetry_scope_for_path(
+            telemetry_path,
+            input_obj=x_val_screen.loc[:, candidate_cols] if candidate_cols else x_val_screen.iloc[:, 0:0],
+            **telemetry_base,
+            function_name="permutation_scores",
+            module_name=__name__,
+            phase_name="feature_scoring",
+            parent_phase="feature_selection",
+            input_rows=len(x_val_screen),
+            input_columns_count=len(candidate_cols),
+            selected_feature_count=len(candidate_cols),
+            output_rows=0,
+        ) as permutation_scope:
+            perm_map = (
+                permutation_scores(
+                    full_model,
+                    x_val_screen,
+                    y_val,
+                    full_rmse,
+                    repeats=int(args.permutation_repeats),
+                    columns=candidate_cols,
+                )
+                if candidate_cols
+                else {}
+            )
+            permutation_scope.set_output(
+                output_rows=len(perm_map),
+                output_columns_count=len(perm_map),
+                selected_feature_count=len(candidate_cols),
+            )
         selected_cols = [col for col, score in sorted(perm_map.items(), key=lambda item: (-item[1], item[0])) if float(score) > 0.0]
         if not selected_cols:
             selected_cols = candidate_cols[: max(1, int(args.top_k_features))]
@@ -554,7 +636,11 @@ def run_fold(
             x_val_screen.loc[:, selected_cols],
             model_threads,
             telemetry_path=telemetry_path,
-            telemetry_base=telemetry_base,
+            telemetry_base={
+                **telemetry_base,
+                "fit_role": "subset_model",
+                "selected_feature_count": int(len(selected_cols)),
+            },
         )
         subset_rmse = float(np.sqrt(np.mean((subset_pred - y_val) ** 2)))
         subset_skill = float(1.0 - (subset_rmse / base_rmse)) if base_rmse not in (None, 0.0) else None
@@ -590,7 +676,20 @@ def run_fold(
             remaining = [col for col in selected_cols if col not in set(family_cols)]
             if not remaining:
                 continue
-            ablated_pred, _ablated_model = fit_and_predict(module, spec.task, x_train_screen.loc[:, remaining], y_train, x_val_screen.loc[:, remaining], model_threads)
+            ablated_pred, _ablated_model = fit_and_predict(
+                module,
+                spec.task,
+                x_train_screen.loc[:, remaining],
+                y_train,
+                x_val_screen.loc[:, remaining],
+                model_threads,
+                telemetry_path=telemetry_path,
+                telemetry_base={
+                    **telemetry_base,
+                    "fit_role": f"ablation:{family}",
+                    "selected_feature_count": int(len(remaining)),
+                },
+            )
             ablated_rmse = float(np.sqrt(np.mean((ablated_pred - y_val) ** 2)))
             ablated_skill = float(1.0 - (ablated_rmse / base_rmse)) if base_rmse not in (None, 0.0) else None
             family_rows.append({
@@ -722,6 +821,11 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
             input_rows=len(assets),
             output_rows=0,
             asset_count=len(assets),
+            training_window_months=int(training_window_months),
+            thread_count=int(args.model_threads),
+            candidate_feature_count=0,
+            selected_feature_count=0,
+            dynamic_feature_count=0,
         )
         return None
     top_features = [name for name, _count in feature_votes.most_common(int(args.top_k_features))]
@@ -770,6 +874,11 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
         output_rows=len(all_fold_results),
         asset_count=len(assets),
         output_columns_count=len(top_features),
+        training_window_months=int(training_window_months),
+        thread_count=int(args.model_threads),
+        candidate_feature_count=int(round(mean(row.full_feature_count for row in all_fold_results) or 0)),
+        selected_feature_count=int(len(top_features)),
+        dynamic_feature_count=int(round(mean(row.full_feature_count for row in all_fold_results) or 0)),
     )
     return {
         'combo_key': combo_spec.key,
