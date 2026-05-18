@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from src.forecasting.common.path_config import resolve_path, selected_profile
 from src.forecasting.ml.shared.feature_profile_common import combo_selection_key
+from src.forecasting.ml.shared.stage1_candidate_universe import build_stage1_candidate_universe
 from src.forecasting.ml.shared.stage1_dynamic_feature_selection import select_stage1_dynamic_feature_columns
 from src.forecasting.ml.neural.shared.neural_numeric_cohort import resolve_neural_cohort_assets
 from src.forecasting.ml.neural.shared.neural_numeric_model_registry import NEURAL_NUMERIC_BRANCHES
@@ -51,6 +52,17 @@ def parse_args() -> argparse.Namespace:
 
 def _split_csv(raw: str) -> List[str]:
     return [part.strip() for part in str(raw).split(",") if part.strip()]
+
+
+def _resolved_source_roots(parquet_root: Path) -> Dict[str, str]:
+    root = Path(parquet_root).expanduser().resolve()
+    return {
+        "parquet_root": str(root),
+        "ohlcvt_root": str(root),
+        "scalar_feature_root": str(root),
+        "edge_discovery_root": str(root),
+        "target_label_root": str(root),
+    }
 
 
 def _parse_int_csv(raw: str) -> List[int]:
@@ -109,6 +121,45 @@ def _default_formulation_options(stage1_spec: NeuralStage1Spec) -> Dict[str, Lis
     return {str(name): [str(v) for v in values if str(v)] for name, values in stage1_spec.stage1_formulation_options.items()}
 
 
+def _structural_stage1_contract(stage1_spec: NeuralStage1Spec) -> Dict[str, Any]:
+    if str(stage1_spec.model_key) == "nbeats":
+        return {
+            "scalar_feature_search_performed": False,
+            "scalar_feature_search_reason": "N-BEATS is configured as target-history-only backcast/forecast; scalar exogenous columns are not part of its active input contract.",
+            "stage1_decision_basis": {
+                "kind": "fixed_default_recorded",
+                "data_derived_in_stage1": False,
+                "deferred_to": ["stage2_validation", "stage3_validation"],
+                "note": "Stage 1 records the active target-history-only input schema and cohort/combo scope; model-quality selection is deferred to later validation stages.",
+            },
+            "stage1_selected_instead": ["target_history_only", "input_schema", "lookback_design"],
+            "candidates_options_considered": _default_formulation_options(stage1_spec),
+            "model_specific_stage1_intent": {
+                "target_history_only": "confirm univariate target-history input path",
+                "input_schema": "choose the univariate backcast/forecast schema",
+                "lookback_design": "choose the basis-aligned lookback/input schema family",
+            },
+            "data_derived_evidence_used": {
+                "evidence_kind": "cohort_and_combo_scope_only",
+                "note": "Slim Stage 1 records the univariate input contract; model performance is validated downstream, not through scalar feature search.",
+            },
+        }
+    return {
+        "scalar_feature_search_performed": True,
+        "scalar_feature_search_reason": "dynamic NeuralTS model searches scalar/raw sequence inputs",
+        "stage1_selected_instead": ["dynamic_sequence_feature_subset"],
+        "candidates_options_considered": _default_formulation_options(stage1_spec),
+        "model_specific_stage1_intent": {"dynamic_features": "select sequence-capable scalar/raw inputs for this task/interval/horizon"},
+        "data_derived_evidence_used": {"evidence_kind": "dynamic_feature_relationship_scores"},
+        "stage1_decision_basis": {
+            "kind": "data_derived_feature_relationship_scores",
+            "data_derived_in_stage1": True,
+            "deferred_to": [],
+            "note": "Dynamic NeuralTS Stage 1 scores scalar/raw sequence inputs for the requested task/interval/horizon.",
+        },
+    }
+
+
 def _resolve_stage1_payload(stage1_spec: NeuralStage1Spec) -> Dict[str, Any]:
     feature_blocks = _default_feature_blocks(stage1_spec)
     formulation_options = _default_formulation_options(stage1_spec)
@@ -127,6 +178,7 @@ def _resolve_stage1_payload(stage1_spec: NeuralStage1Spec) -> Dict[str, Any]:
             "selected_features": selected_features or ["target_history"],
             "formulation_options": formulation_options,
             "selected_formulation": formulation_choice,
+            **_structural_stage1_contract(stage1_spec),
         }
     formulation_choice = {name: values[0] for name, values in formulation_options.items() if values}
     return {
@@ -136,6 +188,7 @@ def _resolve_stage1_payload(stage1_spec: NeuralStage1Spec) -> Dict[str, Any]:
         "selected_features": ["target_history"],
         "formulation_options": formulation_options,
         "selected_formulation": formulation_choice,
+        **_structural_stage1_contract(stage1_spec),
     }
 
 
@@ -156,6 +209,8 @@ def main_for_model(model_key: str) -> Path:
     if str(model_key) not in NEURAL_NUMERIC_BRANCHES:
         raise ValueError(f"Unsupported Neural model key: {model_key}")
     args = parse_args()
+    args.parquet_root = Path(args.parquet_root).expanduser().resolve()
+    source_roots = _resolved_source_roots(args.parquet_root)
     stage1_spec = _load_stage1_spec(str(model_key))
     module = importlib.import_module(f"src.forecasting.ml.neural.{model_key}.numerics")
     output_dir = Path(args.output_dir)
@@ -186,6 +241,7 @@ def main_for_model(model_key: str) -> Path:
         output_rows=len(cohort_assets),
         reason_code=("no_assets" if not cohort_assets else ""),
         source_path=str(args.parquet_root),
+        **source_roots,
     )
     generated_at = datetime.now(timezone.utc).isoformat()
 
@@ -195,21 +251,36 @@ def main_for_model(model_key: str) -> Path:
         payload_bits = _resolve_stage1_payload(stage1_spec)
         selected_dynamic_feature_columns: List[str] = []
         selected_features = list(payload_bits["selected_features"])
-        if bool(getattr(module.MODULE_SPEC, "needs_dynamic_features", False)) and getattr(module.MODULE_SPEC, "dynamic_feature_candidates", ()):
-            selected_dynamic_feature_columns = select_stage1_dynamic_feature_columns(
+        candidate_universe = None
+        dynamic_selection_report = None
+        if bool(getattr(module.MODULE_SPEC, "needs_dynamic_features", False)):
+            candidate_universe = build_stage1_candidate_universe(
+                model_family="neural_numeric",
+                model_key=str(model_key),
+                preferred_feature_names=tuple(str(value) for value in getattr(module.MODULE_SPEC, "dynamic_feature_candidates", ())),
+                feature_blocks=stage1_spec.stage1_feature_blocks,
+                include_raw_source=True,
+            )
+            selection_result = select_stage1_dynamic_feature_columns(
                 parquet_root=Path(args.parquet_root).resolve(),
                 asset_list=cohort_assets,
                 interval_minutes=int(interval_minutes),
                 horizon_minutes=int(horizon_minutes),
                 task=str(task),
                 training_window_months=int(args.train_window_months),
-                requested_feature_names=tuple(str(value) for value in getattr(module.MODULE_SPEC, "dynamic_feature_candidates", ())),
+                requested_feature_names=candidate_universe.candidate_columns,
                 telemetry_path=output_dir,
                 family="Neural_Numeric",
                 model=str(model_key),
                 stage="stage1",
                 combo_key=combo_selection_key(int(interval_minutes), int(horizon_minutes), str(task)),
+                return_report=True,
             )
+            if hasattr(selection_result, "selected_features"):
+                dynamic_selection_report = selection_result
+                selected_dynamic_feature_columns = [str(value) for value in getattr(selection_result, "selected_features")]
+            else:
+                selected_dynamic_feature_columns = [str(value) for value in selection_result]
             if selected_dynamic_feature_columns:
                 selected_features = list(selected_dynamic_feature_columns)
         combo_key = combo_selection_key(int(interval_minutes), int(horizon_minutes), str(task))
@@ -228,11 +299,35 @@ def main_for_model(model_key: str) -> Path:
             "selected_dynamic_feature_columns": list(selected_dynamic_feature_columns),
             "formulation_options": dict(payload_bits["formulation_options"]),
             "selected_formulation": dict(payload_bits["selected_formulation"]),
+            "scalar_feature_search_performed": bool(payload_bits.get("scalar_feature_search_performed", False)),
+            "scalar_feature_search_reason": str(payload_bits.get("scalar_feature_search_reason", "")),
+            "stage1_selected_instead": list(payload_bits.get("stage1_selected_instead") or []),
+            "candidates_options_considered": dict(payload_bits.get("candidates_options_considered") or payload_bits.get("formulation_options") or {}),
+            "stage1_decision_basis": dict(payload_bits.get("stage1_decision_basis") or {}),
+            "data_derived_evidence_used": {
+                **dict(payload_bits.get("data_derived_evidence_used") or {}),
+                "asset_count": int(len(cohort_assets)),
+                "training_window_months": int(args.train_window_months),
+                "combo_key": combo_selection_key(int(interval_minutes), int(horizon_minutes), str(task)),
+            },
+            "final_selected_formulation_settings": dict(payload_bits["selected_formulation"]),
+            "model_specific_stage1_intent": dict(payload_bits.get("model_specific_stage1_intent") or {}),
             "asset_count_used": int(len(cohort_assets)),
             "cohort_assets": list(cohort_assets),
             "training_window_months": int(args.train_window_months),
             "selection_status": "complete",
+            "resolved_roots": source_roots,
         }
+        if candidate_universe is not None:
+            entry["candidate_universe"] = candidate_universe.to_artifact()
+            entry["stale_or_missing_candidates"] = list(candidate_universe.stale_or_missing_candidates)
+            entry["alias_resolutions"] = list(candidate_universe.alias_resolutions)
+        if dynamic_selection_report is not None:
+            report_payload = dynamic_selection_report.to_artifact()
+            entry["dynamic_selection_report"] = report_payload
+            entry["dynamic_feature_scores"] = list(report_payload.get("feature_scores") or [])
+            entry["dynamic_dropped_candidates"] = list(report_payload.get("dropped_candidates") or [])
+            entry["dynamic_redundancy_groups"] = list(report_payload.get("redundancy_groups") or [])
         selections[combo_key] = entry
         summary_rows.append(entry)
 
@@ -247,6 +342,7 @@ def main_for_model(model_key: str) -> Path:
         "tasks": sorted({str(task) for _, _, task in combos}),
         "horizon_minutes": sorted({int(horizon) for _, horizon, _ in combos}),
         "cohort_assets": list(cohort_assets),
+        "resolved_roots": source_roots,
         "selections": selections,
     }
     (output_dir / "feature_profile_selection.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -295,6 +391,7 @@ def main_for_model(model_key: str) -> Path:
         "expected_combo_count": int(len(combos)),
         "completed_combo_count": int(len(combos)),
         "missing_combo_keys": [],
+        "resolved_roots": source_roots,
         "generated_at": generated_at,
     }
     (output_dir / "feature_experiment_progress.json").write_text(json.dumps(progress_payload, indent=2), encoding="utf-8")
@@ -309,6 +406,7 @@ def main_for_model(model_key: str) -> Path:
         "missing_combo_keys": [],
         "cohort_assets": list(cohort_assets),
         "training_window_months": int(args.train_window_months),
+        "resolved_roots": source_roots,
         "generated_at": generated_at,
     }
     (output_dir / "feature_experiment_run_meta.json").write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")

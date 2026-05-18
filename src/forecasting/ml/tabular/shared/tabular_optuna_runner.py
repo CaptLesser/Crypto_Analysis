@@ -7,7 +7,7 @@ import os
 import sqlite3
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass
@@ -31,6 +31,8 @@ from src.forecasting.ml.shared.test_branch_function_telemetry import (
 
 CLAMP_START_YEAR = 2025
 CLAMP_START_MONTH = 1
+TABULAR_REPOSITORY_CACHE_MAX_ENTRIES = 64
+TABULAR_REPOSITORY_CACHE_MAX_BYTES = 512 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -170,13 +172,187 @@ class TimingBook:
 
 
 class DatasetRepository:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_entries: int = TABULAR_REPOSITORY_CACHE_MAX_ENTRIES,
+        max_bytes: int = TABULAR_REPOSITORY_CACHE_MAX_BYTES,
+    ) -> None:
         self._lock = threading.Lock()
         self.timings = TimingBook()
-        self._window_cache: Dict[Tuple[int, Tuple[str, ...], int, int], Tuple[int, int, List[str], MonthKey]] = {}
-        self._feature_cache: Dict[Tuple[str, int, int, int], pd.DataFrame] = {}
-        self._label_cache: Dict[Tuple[str, int, int, int, int], pd.DataFrame] = {}
-        self._dataset_cache: Dict[Tuple[str, Tuple[int, int, str, int, Optional[str]], int, int], Dataset] = {}
+        self._max_entries = max(1, int(max_entries))
+        self._max_bytes = max(1, int(max_bytes))
+        self._window_cache: OrderedDict[Tuple[Any, ...], Tuple[int, int, List[str], MonthKey]] = OrderedDict()
+        self._feature_cache: OrderedDict[Tuple[Any, ...], pd.DataFrame] = OrderedDict()
+        self._feature_cache_bytes = 0
+        self._label_cache: OrderedDict[Tuple[Any, ...], pd.DataFrame] = OrderedDict()
+        self._label_cache_bytes = 0
+        self._dataset_cache: OrderedDict[Tuple[Any, ...], Dataset] = OrderedDict()
+        self._dataset_cache_bytes = 0
+        self._cache_evictions = 0
+
+    @staticmethod
+    def _frame_bytes(frame: pd.DataFrame) -> int:
+        return int(frame.memory_usage(index=True, deep=True).sum())
+
+    @classmethod
+    def _dataset_bytes(cls, dataset: Dataset) -> int:
+        return (
+            cls._frame_bytes(dataset.df)
+            + int(dataset.x.nbytes)
+            + int(dataset.ts.nbytes)
+            + int(dataset.y.nbytes)
+        )
+
+    @staticmethod
+    def _clone_frame(frame: pd.DataFrame) -> pd.DataFrame:
+        return frame.copy(deep=True)
+
+    @classmethod
+    def _clone_dataset(cls, dataset: Dataset) -> Dataset:
+        return Dataset(
+            asset=str(dataset.asset),
+            spec=dataset.spec,
+            df=cls._clone_frame(dataset.df),
+            source_start_ts=int(dataset.source_start_ts),
+            source_end_ts=int(dataset.source_end_ts),
+            seed_ts=int(dataset.seed_ts),
+            accuracy_end_ts=int(dataset.accuracy_end_ts),
+            x_cols=tuple(dataset.x_cols),
+            x=np.array(dataset.x, copy=True),
+            ts=np.array(dataset.ts, copy=True),
+            y=np.array(dataset.y, copy=True),
+        )
+
+    @staticmethod
+    def _path_identity(path: Any) -> Tuple[str, Optional[int], Optional[int], Optional[int]]:
+        if path is None:
+            return ("", None, None, None)
+        resolved = Path(path).expanduser()
+        try:
+            resolved = resolved.resolve()
+        except Exception:
+            resolved = resolved.absolute()
+        try:
+            stat = resolved.stat()
+            return (str(resolved), int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns))
+        except Exception:
+            return (str(resolved), None, None, None)
+
+    @classmethod
+    def _source_identity(cls) -> Tuple[Any, ...]:
+        io_config = getattr(CURRENT_NUMERICS, "IO_CONFIG", None)
+        scalar_root = getattr(io_config, "scalar_root", None) or getattr(CURRENT_NUMERICS, "PARQUET_ROOT", "")
+        ohlc_root = getattr(io_config, "ohlc_root", None) or getattr(CURRENT_NUMERICS, "PARQUET_ROOT", "")
+        parquet_root = getattr(CURRENT_NUMERICS, "PARQUET_ROOT", "")
+        return (
+            cls._path_identity(parquet_root),
+            cls._path_identity(scalar_root),
+            cls._path_identity(ohlc_root),
+        )
+
+    @staticmethod
+    def _model_identity() -> Tuple[Any, ...]:
+        return (
+            "tabular",
+            str(getattr(CURRENT_MODEL_SPEC, "model_key", "")),
+            str(getattr(CURRENT_MODEL_SPEC, "display_name", "")),
+            str(getattr(CURRENT_NUMERICS, "__name__", CURRENT_NUMERICS.__class__.__name__)),
+        )
+
+    @classmethod
+    def _feature_profile_identity(cls) -> Tuple[Any, ...]:
+        fn = getattr(CURRENT_NUMERICS, "select_feature_columns", None)
+        fn_identity = getattr(fn, "__func__", fn)
+        module = str(getattr(fn_identity, "__module__", ""))
+        qualname = str(getattr(fn_identity, "__qualname__", ""))
+        code = getattr(fn_identity, "__code__", None)
+        code_fingerprint = (
+            getattr(code, "co_filename", None),
+            getattr(code, "co_firstlineno", None),
+            getattr(code, "co_code", b""),
+        )
+        return (module, qualname, id(fn_identity), code_fingerprint)
+
+    @staticmethod
+    def _label_identity() -> Tuple[Any, ...]:
+        fn = getattr(CURRENT_NUMERICS, "_compute_future_labels", None)
+        fn_identity = getattr(fn, "__func__", fn)
+        code = getattr(fn_identity, "__code__", None)
+        return (
+            tuple(str(col) for col in getattr(CURRENT_NUMERICS, "FUTURE_LABEL_COLUMNS", ())),
+            tuple(sorted((str(k), str(v)) for k, v in getattr(CURRENT_NUMERICS, "TASK_LABEL", {}).items())),
+            str(getattr(fn_identity, "__module__", "")),
+            str(getattr(fn_identity, "__qualname__", "")),
+            id(fn_identity),
+            (
+                getattr(code, "co_filename", None),
+                getattr(code, "co_firstlineno", None),
+                getattr(code, "co_code", b""),
+            ),
+        )
+
+    def _evict_lru(
+        self,
+        cache: OrderedDict[Tuple[Any, ...], Any],
+        byte_attr: str,
+        size_fn,
+    ) -> None:
+        while len(cache) > self._max_entries or int(getattr(self, byte_attr)) > self._max_bytes:
+            _old_key, old_value = cache.popitem(last=False)
+            setattr(self, byte_attr, max(0, int(getattr(self, byte_attr)) - int(size_fn(old_value))))
+            self._cache_evictions += 1
+
+    def _cache_get(self, cache: OrderedDict[Tuple[Any, ...], Any], key: Tuple[Any, ...]) -> Any:
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
+
+    def _cache_put(
+        self,
+        cache: OrderedDict[Tuple[Any, ...], Any],
+        key: Tuple[Any, ...],
+        value: Any,
+        *,
+        byte_attr: Optional[str] = None,
+        size_fn=None,
+    ) -> None:
+        if key in cache:
+            old_value = cache.pop(key)
+            if byte_attr is not None and size_fn is not None:
+                setattr(self, byte_attr, max(0, int(getattr(self, byte_attr)) - int(size_fn(old_value))))
+        cache[key] = value
+        if byte_attr is not None and size_fn is not None:
+            setattr(self, byte_attr, int(getattr(self, byte_attr)) + int(size_fn(value)))
+            self._evict_lru(cache, byte_attr, size_fn)
+        else:
+            while len(cache) > self._max_entries:
+                cache.popitem(last=False)
+                self._cache_evictions += 1
+
+    def cache_stats(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "window_cache_entries": int(len(self._window_cache)),
+                "feature_cache_entries": int(len(self._feature_cache)),
+                "feature_cache_bytes_estimate": int(self._feature_cache_bytes),
+                "label_cache_entries": int(len(self._label_cache)),
+                "label_cache_bytes_estimate": int(self._label_cache_bytes),
+                "dataset_cache_entries": int(len(self._dataset_cache)),
+                "dataset_cache_bytes_estimate": int(self._dataset_cache_bytes),
+                "cache_evictions": int(self._cache_evictions),
+            }
+
+    def clear(self) -> None:
+        with self._lock:
+            self._window_cache.clear()
+            self._feature_cache.clear()
+            self._label_cache.clear()
+            self._dataset_cache.clear()
+            self._feature_cache_bytes = 0
+            self._label_cache_bytes = 0
+            self._dataset_cache_bytes = 0
 
     def eval_window_for_interval(
         self,
@@ -186,12 +362,20 @@ class DatasetRepository:
         history_window_months: int,
         search_back_months: int,
     ) -> Tuple[int, int, List[str], MonthKey]:
-        cache_key = (int(interval_minutes), tuple(sorted(str(asset) for asset in explicit_assets)), int(history_window_months), int(search_back_months))
+        cache_key = (
+            self._model_identity(),
+            self._source_identity(),
+            int(interval_minutes),
+            tuple(str(asset) for asset in explicit_assets),
+            int(history_window_months),
+            int(search_back_months),
+        )
         with self._lock:
-            cached = self._window_cache.get(cache_key)
+            cached = self._cache_get(self._window_cache, cache_key)
         if cached is not None:
             self.timings.add_count('eval_window_cache_hits')
-            return cached
+            seed_ts, accuracy_end_ts, assets, month = cached
+            return int(seed_ts), int(accuracy_end_ts), list(assets), month
         t0 = time.monotonic()
         value = compute_eval_window(
             interval_minutes=int(interval_minutes),
@@ -202,16 +386,28 @@ class DatasetRepository:
         self.timings.add_time('eval_window_s', time.monotonic() - t0)
         self.timings.add_count('eval_window_builds')
         with self._lock:
-            self._window_cache[cache_key] = value
+            self._cache_put(
+                self._window_cache,
+                cache_key,
+                (int(value[0]), int(value[1]), list(value[2]), value[3]),
+            )
         return value
 
     def _load_feature_frame(self, asset: str, spec: ComboSpec, source_start_ts: int, accuracy_end_ts: int) -> pd.DataFrame:
-        cache_key = (str(asset), int(spec.interval), int(source_start_ts), int(accuracy_end_ts))
+        cache_key = (
+            self._model_identity(),
+            self._source_identity(),
+            self._feature_profile_identity(),
+            str(asset),
+            int(spec.interval),
+            int(source_start_ts),
+            int(accuracy_end_ts),
+        )
         with self._lock:
-            cached = self._feature_cache.get(cache_key)
+            cached = self._cache_get(self._feature_cache, cache_key)
         if cached is not None:
             self.timings.add_count('feature_cache_hits')
-            return cached
+            return self._clone_frame(cached)
         t0 = time.monotonic()
         feature_df, _stats = CURRENT_NUMERICS._load_unit_feature_frame(
             asset=asset,
@@ -223,17 +419,35 @@ class DatasetRepository:
             raise RuntimeError(f'Empty feature frame for asset={asset} combo={spec.tuple_label}')
         self.timings.add_time('feature_load_s', time.monotonic() - t0)
         self.timings.add_count('feature_loads')
+        stored = self._clone_frame(feature_df)
         with self._lock:
-            self._feature_cache[cache_key] = feature_df
-        return feature_df
+            self._cache_put(
+                self._feature_cache,
+                cache_key,
+                stored,
+                byte_attr="_feature_cache_bytes",
+                size_fn=self._frame_bytes,
+            )
+        return self._clone_frame(stored)
 
     def _load_labels(self, asset: str, spec: ComboSpec, source_start_ts: int, accuracy_end_ts: int, feature_df: pd.DataFrame) -> pd.DataFrame:
-        cache_key = (str(asset), int(spec.interval), int(spec.horizon_bars), int(source_start_ts), int(accuracy_end_ts))
+        cache_key = (
+            self._model_identity(),
+            self._source_identity(),
+            self._label_identity(),
+            str(asset),
+            int(spec.interval),
+            int(spec.horizon_minutes),
+            int(spec.horizon_bars),
+            str(spec.task),
+            int(source_start_ts),
+            int(accuracy_end_ts),
+        )
         with self._lock:
-            cached = self._label_cache.get(cache_key)
+            cached = self._cache_get(self._label_cache, cache_key)
         if cached is not None:
             self.timings.add_count('label_cache_hits')
-            return cached
+            return self._clone_frame(cached)
         t0 = time.monotonic()
         labels, _detail = CURRENT_NUMERICS._compute_future_labels(
             feature_df.loc[:, ['open', 'high', 'low', 'close', 'volume', 'trades']].reset_index(drop=True),
@@ -241,9 +455,16 @@ class DatasetRepository:
         )
         self.timings.add_time('label_build_s', time.monotonic() - t0)
         self.timings.add_count('label_builds')
+        stored = self._clone_frame(labels)
         with self._lock:
-            self._label_cache[cache_key] = labels
-        return labels
+            self._cache_put(
+                self._label_cache,
+                cache_key,
+                stored,
+                byte_attr="_label_cache_bytes",
+                size_fn=self._frame_bytes,
+            )
+        return self._clone_frame(stored)
 
     def build_dataset(self, asset: str, spec: ComboSpec, seed_ts: int, accuracy_end_ts: int) -> Dataset:
         source_start_ts = trailing_source_start_ts(
@@ -252,12 +473,28 @@ class DatasetRepository:
             train_window_bars=int(spec.training_window_bars),
             max_horizon_bars=int(spec.horizon_bars),
         )
-        cache_key = (str(asset), (int(spec.interval), int(spec.horizon_minutes), str(spec.task), int(spec.training_window_months), spec.refit_cadence), int(source_start_ts), int(accuracy_end_ts))
+        cache_key = (
+            self._model_identity(),
+            self._source_identity(),
+            self._feature_profile_identity(),
+            self._label_identity(),
+            str(asset),
+            spec.tuple_label,
+            int(spec.interval),
+            int(spec.horizon_minutes),
+            int(spec.horizon_bars),
+            str(spec.task),
+            int(spec.training_window_months),
+            spec.refit_cadence,
+            int(seed_ts),
+            int(source_start_ts),
+            int(accuracy_end_ts),
+        )
         with self._lock:
-            cached = self._dataset_cache.get(cache_key)
+            cached = self._cache_get(self._dataset_cache, cache_key)
         if cached is not None:
             self.timings.add_count('dataset_cache_hits')
-            return cached
+            return self._clone_dataset(cached)
         t0 = time.monotonic()
         feature_df = self._load_feature_frame(asset, spec, int(source_start_ts), int(accuracy_end_ts))
         labels = self._load_labels(asset, spec, int(source_start_ts), int(accuracy_end_ts), feature_df)
@@ -281,9 +518,16 @@ class DatasetRepository:
         )
         self.timings.add_time('dataset_build_s', time.monotonic() - t0)
         self.timings.add_count('dataset_builds')
+        stored = self._clone_dataset(dataset)
         with self._lock:
-            self._dataset_cache[cache_key] = dataset
-        return dataset
+            self._cache_put(
+                self._dataset_cache,
+                cache_key,
+                stored,
+                byte_attr="_dataset_cache_bytes",
+                size_fn=self._dataset_bytes,
+            )
+        return self._clone_dataset(stored)
 
 
 def is_memory_failure(exc: BaseException) -> bool:
@@ -1282,9 +1526,14 @@ def write_outputs(
     (output_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def run_single_combo(combo: ComboSpec, args_dict: Dict[str, Any], model_spec: TabularOptunaModelSpec) -> Dict[str, Any]:
+def run_single_combo(
+    combo: ComboSpec,
+    args_dict: Dict[str, Any],
+    model_spec: TabularOptunaModelSpec,
+    repository: Optional[DatasetRepository] = None,
+) -> Dict[str, Any]:
     configure_for_model(model_spec)
-    repository = DatasetRepository()
+    local_repository = repository if repository is not None else DatasetRepository()
     telemetry_path = Path(str(args_dict["telemetry_path"])) if str(args_dict.get("telemetry_path") or "").strip() else None
 
     def _run_once() -> Dict[str, Any]:
@@ -1307,7 +1556,7 @@ def run_single_combo(combo: ComboSpec, args_dict: Dict[str, Any], model_spec: Ta
             final_month_dt = datetime.fromisoformat(str(context.forecast_target_month_start_utc))
             final_month = MonthKey(int(final_month_dt.year), int(final_month_dt.month))
         else:
-            seed_ts, accuracy_end_ts, assets, final_month = repository.eval_window_for_interval(
+            seed_ts, accuracy_end_ts, assets, final_month = local_repository.eval_window_for_interval(
                 interval_minutes=int(combo.interval),
                 explicit_assets=explicit_assets,
                 history_window_months=int(args_dict['history_window_months']),
@@ -1332,7 +1581,7 @@ def run_single_combo(combo: ComboSpec, args_dict: Dict[str, Any], model_spec: Ta
             asset_count=len(assets),
         ) as dataset_scope:
             for asset in assets:
-                dataset = repository.build_dataset(asset, combo, int(seed_ts), int(accuracy_end_ts))
+                dataset = local_repository.build_dataset(asset, combo, int(seed_ts), int(accuracy_end_ts))
                 combo_datasets.append(dataset)
                 sample_rows.append(
                     {
@@ -1371,7 +1620,7 @@ def run_single_combo(combo: ComboSpec, args_dict: Dict[str, Any], model_spec: Ta
             'combo_row': combo_row,
             'metric_rows': [asdict(metric) for metric in baseline_metrics] + [asdict(metric) for metric in tuned_metrics],
             'trial_rows': combo_trials,
-            'runtime_row': {'combo': combo.tuple_label, 'asset_count': len(assets), 'trial_workers': int(args_dict['trial_workers']), 'model_threads': int(args_dict['model_threads']), **repository.timings.snapshot()},
+            'runtime_row': {'combo': combo.tuple_label, 'asset_count': len(assets), 'trial_workers': int(args_dict['trial_workers']), 'model_threads': int(args_dict['model_threads']), **local_repository.timings.snapshot()},
         }
 
     return run_with_transient_retry(_run_once, label=combo.tuple_label)
@@ -1446,13 +1695,17 @@ def main_for_model(model_spec: TabularOptunaModelSpec) -> None:
         'telemetry_path': str(output_dir),
     }
     if int(plan.combo_workers) <= 1:
-        for combo in combos:
-            payload = run_single_combo(combo, args_dict, CURRENT_MODEL_SPEC)
-            sample_rows.extend(list(payload['sample_rows']))
-            combo_rows.append(dict(payload['combo_row']))
-            metric_rows.extend(list(payload['metric_rows']))
-            trial_rows.extend(list(payload['trial_rows']))
-            runtime_rows.append(dict(payload['runtime_row']))
+        repository = DatasetRepository()
+        try:
+            for combo in combos:
+                payload = run_single_combo(combo, args_dict, CURRENT_MODEL_SPEC, repository=repository)
+                sample_rows.extend(list(payload['sample_rows']))
+                combo_rows.append(dict(payload['combo_row']))
+                metric_rows.extend(list(payload['metric_rows']))
+                trial_rows.extend(list(payload['trial_rows']))
+                runtime_rows.append(dict(payload['runtime_row']))
+        finally:
+            repository.clear()
     else:
         try:
             with ProcessPoolExecutor(max_workers=int(plan.combo_workers)) as executor:
@@ -1465,13 +1718,17 @@ def main_for_model(model_spec: TabularOptunaModelSpec) -> None:
                     trial_rows.extend(list(payload['trial_rows']))
                     runtime_rows.append(dict(payload['runtime_row']))
         except (PermissionError, BrokenProcessPool):
-            for combo in combos:
-                payload = run_single_combo(combo, args_dict, CURRENT_MODEL_SPEC)
-                sample_rows.extend(list(payload['sample_rows']))
-                combo_rows.append(dict(payload['combo_row']))
-                metric_rows.extend(list(payload['metric_rows']))
-                trial_rows.extend(list(payload['trial_rows']))
-                runtime_rows.append(dict(payload['runtime_row']))
+            repository = DatasetRepository()
+            try:
+                for combo in combos:
+                    payload = run_single_combo(combo, args_dict, CURRENT_MODEL_SPEC, repository=repository)
+                    sample_rows.extend(list(payload['sample_rows']))
+                    combo_rows.append(dict(payload['combo_row']))
+                    metric_rows.extend(list(payload['metric_rows']))
+                    trial_rows.extend(list(payload['trial_rows']))
+                    runtime_rows.append(dict(payload['runtime_row']))
+            finally:
+                repository.clear()
     write_outputs(
         output_dir=output_dir,
         sample_rows=sample_rows,

@@ -29,7 +29,9 @@ from src.forecasting.common.stats_module_utils import (
     DEFAULT_CONF_ALPHA,
     DEFAULT_WORKERS,
     NUMERIC_TASK_TO_TARGET_COLUMN,
+    configure_stats_source_roots,
     make_stats_unit_key,
+    resolved_stats_source_roots,
     resolve_assets,
     utc_now_iso,
     write_forecast_parts as _shared_write_forecast_parts,
@@ -55,7 +57,9 @@ from src.forecasting.ml.shared.numeric_runner_common import (
     plan_asset_work_span,
     prediction_eval_row,
     raise_writer_fatal,
+    require_production_stream_scope_contract,
     resolve_dispatch_slots,
+    resolve_production_stream_scope_contract,
     spill_rows_chunk,
     staging_root,
     start_partitioned_prediction_writer,
@@ -366,6 +370,36 @@ def _configure_runtime(args: argparse.Namespace) -> int:
     return int(resolved_model_threads)
 
 
+def _apply_explicit_source_roots(args: argparse.Namespace, spec: StatsNumericModuleSpec) -> Dict[str, str]:
+    if getattr(args, "parquet_root", None) is None:
+        roots = resolved_stats_source_roots()
+        setattr(args, "resolved_source_roots", roots)
+        return roots
+
+    source_root = Path(args.parquet_root).expanduser().resolve()
+    args.parquet_root = source_root
+    for name in (
+        "PIPELINE_SOURCE_PARQUET_ROOT",
+        "PIPELINE_SOURCE_OHLCVT_ROOT",
+        "PIPELINE_SOURCE_FEATURES_ROOT",
+        "PIPELINE_PARQUET_FEATURES_ROOT",
+    ):
+        os.environ[name] = str(source_root)
+    roots = configure_stats_source_roots(parquet_root=source_root, feature_root=source_root)
+    try:
+        module = importlib.import_module(str(spec.process_unit_fn.__module__))
+    except Exception:
+        module = None
+    if module is not None:
+        for attr in ("PARQUET_ROOT", "FEATURE_ROOT"):
+            try:
+                setattr(module, attr, source_root)
+            except Exception:
+                pass
+    setattr(args, "resolved_source_roots", roots)
+    return roots
+
+
 def _append_diagnostic_event(path: Path, event: str, payload: Dict[str, Any]) -> None:
     append_diagnostic_event(path, event, payload, timestamp_fn=utc_now_iso)
 
@@ -605,6 +639,7 @@ def _snapshot_manifest(
         "family_root_env": spec.family_root_env,
         "forecast_output_root": str(spec.forecast_root),
         "eval_output_root": str(spec.forecast_root / "eval"),
+        "source_roots": dict(getattr(args, "resolved_source_roots", {}) or {}),
         "intervals": [int(x) for x in intervals],
         "horizon_minutes": [int(x) for x in horizons],
         "tasks": [str(x) for x in tasks],
@@ -951,6 +986,7 @@ def run_stats_numeric_module(spec: StatsNumericModuleSpec) -> None:
     parser = argparse.ArgumentParser(description=f"{spec.family} frequentist numeric forecaster.")
     _add_common_args(parser, spec)
     args = parser.parse_args()
+    source_roots = _apply_explicit_source_roots(args, spec)
     resolved_model_threads = _configure_runtime(args)
 
     missing_dependency = spec.dependency_check_fn()
@@ -970,6 +1006,12 @@ def run_stats_numeric_module(spec: StatsNumericModuleSpec) -> None:
         state_root=spec.state_root,
         log_fn=spec.log_fn,
     )
+    spec.log_fn(
+        f"[{spec.branch}] source_roots ohlcvt={source_roots.get('ohlcvt_root', '')} "
+        f"scalar={source_roots.get('scalar_feature_root', '')} "
+        f"edge={source_roots.get('edge_discovery_root', '')} "
+        f"target={source_roots.get('target_label_root', '')}"
+    )
     requested_combos = parse_combo_list(args.combo_list) if str(args.combo_list).strip() else []
     using_default_combo_selection = (
         not requested_combos
@@ -978,31 +1020,46 @@ def run_stats_numeric_module(spec: StatsNumericModuleSpec) -> None:
         and str(args.tasks) == ",".join(_default_tasks(spec))
     )
     production_scope = discover_existing_production_scope(spec, canonical_io_config=canonical_io_config) if using_default_combo_selection else None
-    tested_scope = discover_tested_production_artifact_scope(spec) if using_default_combo_selection and production_scope is None else None
-    if production_scope is not None:
-        spec.log_fn(
-            f"[{spec.branch}] production-defaults root={production_scope.source_root} "
-            f"combos={len(production_scope.combo_specs)} asset_scope=existing_production_scope"
+    tested_scope = None
+    tested_scope_error = None
+    stream_contract = None
+    if using_default_combo_selection:
+        try:
+            tested_scope = discover_tested_production_artifact_scope(spec)
+        except BaseException as exc:
+            tested_scope_error = exc
+        stream_contract = require_production_stream_scope_contract(
+            resolve_production_stream_scope_contract(
+                family="stats",
+                model=spec.branch,
+                existing_scope=production_scope,
+                tested_scope=tested_scope,
+                tested_scope_error=tested_scope_error,
+                production_paths_inspected=(spec.forecast_root, spec.state_root),
+            )
         )
-    elif tested_scope is not None:
+    if stream_contract is not None and stream_contract.mode == "locked_to_existing_production":
+        spec.log_fn(
+            f"[{spec.branch}] production-defaults root={production_scope.source_root if production_scope is not None else spec.forecast_root} "
+            f"combos={len(stream_contract.combo_specs)} asset_scope=existing_production_scope "
+            f"scope_mode={stream_contract.mode} warnings={';'.join(stream_contract.warnings)}"
+        )
+    elif stream_contract is not None and stream_contract.mode == "bootstrap_from_test" and tested_scope is not None:
         spec.log_fn(
             f"[{spec.branch}] tested-defaults handoff={tested_scope.handoff_path} "
             f"feature_profile_json={tested_scope.feature_profile_json} cohort_assets={len(tested_scope.cohort_assets)} "
             f"combo_source={'stage3' if tested_scope.stage3_combo_specs else 'stage2'} "
             f"combos={len(tested_scope.stage3_combo_specs or tested_scope.combo_specs)} "
-            f"stage3_combo_results={tested_scope.stage3_combo_results_path} asset_scope=full_production_universe"
+            f"stage3_combo_results={tested_scope.stage3_combo_results_path} asset_scope=full_production_universe "
+            f"scope_mode={stream_contract.mode}"
         )
     if requested_combos:
         combos = [(int(iv), int(hm), str(task)) for iv, hm, task in requested_combos if str(task) in supported]
         intervals = sorted({int(iv) for iv, _, _ in combos})
         horizons = sorted({int(hm) for _, hm, _ in combos})
         tasks = sorted({str(task) for _, _, task in combos})
-    elif production_scope is not None or tested_scope is not None:
-        scoped_combos = (
-            production_scope.combo_specs
-            if production_scope is not None
-            else (tested_scope.stage3_combo_specs or tested_scope.combo_specs if tested_scope is not None else ())
-        )
+    elif stream_contract is not None:
+        scoped_combos = stream_contract.combo_specs
         combos = [(int(iv), int(hm), str(task)) for iv, hm, task in scoped_combos if str(task) in supported]
         intervals = sorted({int(iv) for iv, _, _ in combos})
         horizons = sorted({int(hm) for _, hm, _ in combos})
@@ -1049,6 +1106,7 @@ def run_stats_numeric_module(spec: StatsNumericModuleSpec) -> None:
                 "backfill_days": int(args.backfill_days),
                 "predict_latest_only": bool(args.predict_latest_only),
                 "force": bool(args.force),
+                "source_roots": dict(source_roots),
                 "resource": resource_snapshot(),
             },
         )
@@ -1077,7 +1135,10 @@ def run_stats_numeric_module(spec: StatsNumericModuleSpec) -> None:
                         force=bool(args.force),
                         fit_days=int(args.fit_days or DEFAULT_BACKFILL_DAYS),
                         forecast_root=spec.forecast_root,
-                        discover_edge_and_min_fn=discover_edge_and_min,
+                        discover_edge_and_min_fn=lambda **edge_kwargs: discover_edge_and_min(
+                            root=Path(str(source_roots.get("edge_discovery_root") or source_roots.get("ohlcvt_root") or args.parquet_root)),
+                            **edge_kwargs,
+                        ),
                         forecast_output_tail_ts_fn=lambda **tail_kwargs: canonical_physical_output_tail_ts(
                             io_config=canonical_io_config,
                             interval_minutes=int(tail_kwargs["interval_minutes"]),

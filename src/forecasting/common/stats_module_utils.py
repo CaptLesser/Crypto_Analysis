@@ -44,6 +44,76 @@ DEFAULT_WORKERS = max(1, (os.cpu_count() or 4) // 2)
 DEFAULT_CONF_ALPHA = float(os.getenv("STATS_CONF_ALPHA", "0.1"))
 DEFAULT_SEASONALITY_REFRESH_DAYS = int(os.getenv("PIPELINE_SEASONALITY_REFRESH_DAYS", "30"))
 
+_ACTIVE_SOURCE_PARQUET_ROOT: Optional[Path] = None
+_ACTIVE_SOURCE_FEATURE_ROOT: Optional[Path] = None
+
+
+def _resolve_root(root: Optional[Path]) -> Optional[Path]:
+    if root is None:
+        return None
+    return Path(root).expanduser().resolve()
+
+
+def _env_root(*names: str) -> Optional[Path]:
+    for name in names:
+        raw = str(os.getenv(str(name), "") or "").strip()
+        if raw:
+            return Path(raw).expanduser().resolve()
+    return None
+
+
+def current_stats_ohlcvt_root(root: Optional[Path] = None) -> Path:
+    explicit = _resolve_root(root)
+    if explicit is not None:
+        return explicit
+    return (
+        _ACTIVE_SOURCE_PARQUET_ROOT
+        or _env_root("PIPELINE_SOURCE_OHLCVT_ROOT", "PIPELINE_SOURCE_PARQUET_ROOT", "PIPELINE_PARQUET_ROOT")
+        or OHLCVT_PARQUET_ROOT
+    ).resolve()
+
+
+def current_stats_feature_root(root: Optional[Path] = None) -> Path:
+    explicit = _resolve_root(root)
+    if explicit is not None:
+        return explicit
+    return (
+        _ACTIVE_SOURCE_FEATURE_ROOT
+        or _env_root("PIPELINE_SOURCE_FEATURES_ROOT", "PIPELINE_PARQUET_FEATURES_ROOT")
+        or DEFAULT_FEATURE_ROOT
+    ).resolve()
+
+
+def resolved_stats_source_roots(
+    *,
+    parquet_root: Optional[Path] = None,
+    feature_root: Optional[Path] = None,
+) -> Dict[str, str]:
+    ohlcvt_root = current_stats_ohlcvt_root(parquet_root)
+    scalar_root = current_stats_feature_root(feature_root if feature_root is not None else parquet_root)
+    return {
+        "parquet_root": str(ohlcvt_root),
+        "ohlcvt_root": str(ohlcvt_root),
+        "scalar_feature_root": str(scalar_root),
+        "edge_discovery_root": str(ohlcvt_root),
+        "target_label_root": str(ohlcvt_root),
+    }
+
+
+def configure_stats_source_roots(
+    *,
+    parquet_root: Optional[Path] = None,
+    feature_root: Optional[Path] = None,
+) -> Dict[str, str]:
+    global _ACTIVE_SOURCE_PARQUET_ROOT, _ACTIVE_SOURCE_FEATURE_ROOT
+    resolved_parquet = _resolve_root(parquet_root)
+    resolved_feature = _resolve_root(feature_root if feature_root is not None else parquet_root)
+    if resolved_parquet is not None:
+        _ACTIVE_SOURCE_PARQUET_ROOT = resolved_parquet
+    if resolved_feature is not None:
+        _ACTIVE_SOURCE_FEATURE_ROOT = resolved_feature
+    return resolved_stats_source_roots()
+
 NUMERIC_TASK_TO_TARGET_COLUMN: Dict[str, str] = {
     "log_return": "future_log_return",
     "realized_vol": "future_realized_vol",
@@ -107,6 +177,9 @@ def _sandbox_env_path(roots: SandboxOutputRoots, env_name: str, fallback: Path, 
 
 def default_stats_source_parquet_root(family_root_env: str, fallback: Path) -> Path:
     roots = _sandbox_roots()
+    explicit_source_root = _env_root("PIPELINE_SOURCE_OHLCVT_ROOT", "PIPELINE_SOURCE_PARQUET_ROOT")
+    if explicit_source_root is not None:
+        return explicit_source_root
     if roots.enabled:
         return Path(os.getenv("PIPELINE_SOURCE_PARQUET_ROOT") or os.getenv("PIPELINE_PARQUET_ROOT", str(fallback))).resolve()
     return Path(os.getenv(str(family_root_env), str(fallback)))
@@ -218,7 +291,7 @@ def make_stats_unit_key(
 
 
 def list_assets_from_features(interval_minutes: int, root: Optional[Path] = None) -> List[str]:
-    base = Path(root or DEFAULT_FEATURE_ROOT) / f"scalar_features_{int(interval_minutes)}"
+    base = current_stats_feature_root(root) / f"scalar_features_{int(interval_minutes)}"
     if not base.exists():
         return []
     assets: set[str] = set()
@@ -233,18 +306,18 @@ def resolve_assets(intervals: Sequence[int], assets_arg: str) -> List[str]:
         return sorted({a.strip() for a in str(assets_arg).split(",") if a.strip()})
     assets: set[str] = set()
     for interval in intervals:
-        assets.update(list_assets_from_ohlcvt(int(interval)))
+        assets.update(list_assets_from_ohlcvt(int(interval), root=current_stats_ohlcvt_root()))
         assets.update(list_assets_from_features(int(interval)))
     return sorted(assets)
 
 
-def interval_edge_ts(asset: str, interval_minutes: int) -> Optional[int]:
-    _mn, mx = ohlcvt_bounds(int(interval_minutes), str(asset), root=OHLCVT_PARQUET_ROOT)
+def interval_edge_ts(asset: str, interval_minutes: int, root: Optional[Path] = None) -> Optional[int]:
+    _mn, mx = ohlcvt_bounds(int(interval_minutes), str(asset), root=current_stats_ohlcvt_root(root))
     return int(mx) if mx is not None else None
 
 
-def interval_min_ts(asset: str, interval_minutes: int) -> Optional[int]:
-    mn, _mx = ohlcvt_bounds(int(interval_minutes), str(asset), root=OHLCVT_PARQUET_ROOT)
+def interval_min_ts(asset: str, interval_minutes: int, root: Optional[Path] = None) -> Optional[int]:
+    mn, _mx = ohlcvt_bounds(int(interval_minutes), str(asset), root=current_stats_ohlcvt_root(root))
     return int(mn) if mn is not None else None
 
 
@@ -354,7 +427,7 @@ def _runtime_future_label_window(
         return pd.DataFrame(columns=["ts", "asset", str(column)])
     resolved_horizon_bars = max(1, int(horizon_bars if horizon_bars is not None else os.getenv("STATS_RUNTIME_LABEL_HORIZON_BARS", "1")))
     return runtime_target_label_window(
-        parquet_root=OHLCVT_PARQUET_ROOT,
+        parquet_root=current_stats_ohlcvt_root(),
         asset=str(asset),
         interval=int(interval_minutes),
         horizon_bars=int(resolved_horizon_bars),

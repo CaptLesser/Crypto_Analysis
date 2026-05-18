@@ -41,18 +41,64 @@ def load_runtime_config() -> Dict[str, Any]:
     return {"modules": {}}
 
 
-def get_workers(module_name: str, key: str, fallback: Optional[int] = None) -> int:
+def _worker_env_names(module_name: str, key: str) -> tuple[str, ...]:
+    module_env = "".join(ch if ch.isalnum() else "_" for ch in str(module_name).upper())
+    key_env = "".join(ch if ch.isalnum() else "_" for ch in str(key).upper())
+    return (f"PIPELINE_{module_env}_{key_env}", f"{module_env}_{key_env}")
+
+
+def resolve_worker_setting(
+    module_name: str,
+    key: str,
+    fallback: Optional[int] = None,
+    *,
+    env_names: Optional[tuple[str, ...]] = None,
+) -> Dict[str, Any]:
+    for env_name in env_names or _worker_env_names(module_name, key):
+        raw_env = os.getenv(env_name)
+        if raw_env is None or not str(raw_env).strip():
+            continue
+        try:
+            value = max(1, int(raw_env))
+        except Exception:
+            continue
+        return {
+            "value": int(value),
+            "source": "env",
+            "source_detail": env_name,
+            "runtime_config_path": str(RUNTIME_CONFIG_PATH),
+        }
+
     cfg = load_runtime_config()
     modules = cfg.get("modules", {}) if isinstance(cfg, dict) else {}
     module_cfg = modules.get(module_name, {}) if isinstance(modules, dict) else {}
     val = module_cfg.get(key) if isinstance(module_cfg, dict) else None
-    if val is None:
-        val = fallback if fallback is not None else _derived_default(module_name, key)
+    if val is not None:
+        try:
+            return {
+                "value": max(1, int(val)),
+                "source": "active config",
+                "source_detail": str(RUNTIME_CONFIG_PATH),
+                "runtime_config_path": str(RUNTIME_CONFIG_PATH),
+            }
+        except Exception:
+            pass
+
+    default_val = fallback if fallback is not None else _derived_default(module_name, key)
     try:
-        out = int(val)
+        out = int(default_val)
     except Exception:
-        out = fallback if fallback is not None else _derived_default(module_name, key)
-    return max(1, int(out))
+        out = _derived_default(module_name, key)
+    return {
+        "value": max(1, int(out)),
+        "source": "derived default",
+        "source_detail": ("fallback" if fallback is not None else "cpu-derived"),
+        "runtime_config_path": str(RUNTIME_CONFIG_PATH),
+    }
+
+
+def get_workers(module_name: str, key: str, fallback: Optional[int] = None) -> int:
+    return int(resolve_worker_setting(module_name, key, fallback=fallback)["value"])
 
 
 def get_model_threads(module_name: str, fallback: Optional[int] = None) -> int:
@@ -174,10 +220,10 @@ def log_resolved_runtime(module_name: str, resolved: Optional[Dict[str, Any]] = 
         if isinstance(resolved, dict) and resolved:
             resolved_items = ", ".join(f"{k}={resolved[k]}" for k in sorted(resolved))
             extra = f"; resolved: {resolved_items}"
-        print(f"[runtime:{module_name}] {items}{extra}; cpu_count={cpu_count}; {mem_text}")
+        print(f"[runtime:{module_name}] config_path={RUNTIME_CONFIG_PATH}; {items}{extra}; cpu_count={cpu_count}; {mem_text}")
     else:
         extra = ""
         if isinstance(resolved, dict) and resolved:
             resolved_items = ", ".join(f"{k}={resolved[k]}" for k in sorted(resolved))
             extra = f"; resolved: {resolved_items}"
-        print(f"[runtime:{module_name}] using derived defaults{extra}; cpu_count={cpu_count}; {mem_text}")
+        print(f"[runtime:{module_name}] config_path={RUNTIME_CONFIG_PATH}; using derived defaults{extra}; cpu_count={cpu_count}; {mem_text}")

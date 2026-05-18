@@ -1478,6 +1478,184 @@ class NumericExistingProductionScope:
     combo_specs: Tuple[Tuple[int, int, str], ...]
 
 
+@dataclass(frozen=True)
+class ProductionStreamScopeContract:
+    mode: str
+    family: str
+    model: str
+    source_of_truth: str
+    combo_specs: Tuple[Tuple[int, int, str], ...]
+    combo_windows: Tuple[Tuple[int, int, str, int], ...]
+    resolved_output_columns: Tuple[str, ...]
+    handoff_paths: Tuple[Path, ...]
+    production_paths_inspected: Tuple[Path, ...]
+    reason: str
+    runtime_only_updates_allowed: bool
+    output_contract_updates_allowed: bool
+    warnings: Tuple[str, ...] = ()
+    missing_artifacts: Tuple[str, ...] = ()
+    existing_scope: Optional[Any] = None
+    tested_scope: Optional[Any] = None
+
+
+def _scope_combo_specs(scope: Optional[Any]) -> Tuple[Tuple[int, int, str], ...]:
+    if scope is None:
+        return tuple()
+    raw_stage3 = tuple(getattr(scope, "stage3_combo_specs", ()) or ())
+    raw_specs = raw_stage3 or tuple(getattr(scope, "combo_specs", ()) or ())
+    if not raw_specs and isinstance(scope, (list, tuple)):
+        raw_specs = tuple((int(row[0]), int(row[1]), str(row[2])) for row in scope if len(row) >= 3)
+    return tuple(sorted({(int(i), int(h), str(t)) for i, h, t in raw_specs}, key=lambda item: (item[0], item[1], item[2])))
+
+
+def _scope_combo_windows(scope: Optional[Any]) -> Tuple[Tuple[int, int, str, int], ...]:
+    if scope is None:
+        return tuple()
+    raw_windows = tuple(getattr(scope, "combo_windows", ()) or ())
+    if not raw_windows and isinstance(scope, (list, tuple)):
+        raw_windows = tuple(row for row in scope if len(row) >= 4)
+    return tuple(
+        sorted(
+            {(int(i), int(h), str(t), int(m)) for i, h, t, m, *_rest in raw_windows},
+            key=lambda item: (item[0], item[1], item[2], item[3]),
+        )
+    )
+
+
+def _scope_handoff_paths(scope: Optional[Any]) -> Tuple[Path, ...]:
+    if scope is None:
+        return tuple()
+    paths: List[Path] = []
+    for name in ("handoff_path", "stage3_combo_results_path", "feature_profile_json"):
+        value = getattr(scope, name, None)
+        if value:
+            paths.append(Path(value).resolve())
+    return tuple(paths)
+
+
+def resolve_production_stream_scope_contract(
+    *,
+    family: str,
+    model: str,
+    existing_scope: Optional[Any],
+    tested_scope: Optional[Any],
+    production_paths_inspected: Sequence[Path] = (),
+    expected_handoff_paths: Sequence[Path] = (),
+    existing_output_columns: Sequence[str] = (),
+    tested_output_columns: Sequence[str] = (),
+    tested_scope_error: Optional[BaseException] = None,
+) -> ProductionStreamScopeContract:
+    inspected = tuple(Path(path).resolve() for path in production_paths_inspected if path is not None)
+    expected_handoff = tuple(Path(path).resolve() for path in expected_handoff_paths if path is not None)
+    existing_specs = _scope_combo_specs(existing_scope)
+    existing_windows = _scope_combo_windows(existing_scope)
+    tested_specs = _scope_combo_specs(tested_scope)
+    tested_windows = _scope_combo_windows(tested_scope)
+    handoff_paths = _scope_handoff_paths(tested_scope)
+    existing_columns = tuple(str(col) for col in existing_output_columns if str(col).strip())
+    tested_columns = tuple(str(col) for col in tested_output_columns if str(col).strip())
+    warnings: List[str] = []
+
+    if existing_scope is not None and existing_specs:
+        if tested_scope_error is not None:
+            warnings.append(f"test_handoff_not_applied:{tested_scope_error}")
+        elif tested_scope is None:
+            warnings.append("test_handoff_not_found_existing_production_scope_locked")
+        else:
+            extra = sorted(set(tested_specs) - set(existing_specs), key=lambda item: (item[0], item[1], item[2]))
+            missing = sorted(set(existing_specs) - set(tested_specs), key=lambda item: (item[0], item[1], item[2]))
+            if extra:
+                warnings.append(f"test_handoff_extra_combos_not_applied:{len(extra)}")
+            if missing:
+                warnings.append(f"test_handoff_missing_existing_combos_not_applied:{len(missing)}")
+            if existing_columns and tested_columns and tuple(existing_columns) != tuple(tested_columns):
+                warnings.append("test_handoff_output_columns_not_applied")
+        return ProductionStreamScopeContract(
+            mode="locked_to_existing_production",
+            family=str(family),
+            model=str(model),
+            source_of_truth="existing_production_scope",
+            combo_specs=existing_specs,
+            combo_windows=existing_windows,
+            resolved_output_columns=existing_columns,
+            handoff_paths=handoff_paths,
+            production_paths_inspected=inspected,
+            reason="existing Production stream scope found; Test handoff cannot alter output contract without explicit migration",
+            runtime_only_updates_allowed=True,
+            output_contract_updates_allowed=False,
+            warnings=tuple(warnings),
+            existing_scope=existing_scope,
+            tested_scope=tested_scope,
+        )
+
+    if tested_scope_error is not None:
+        missing = [str(path) for path in expected_handoff] or ["valid Test handoff/profile artifacts"]
+        return ProductionStreamScopeContract(
+            mode="blocked_missing_contract",
+            family=str(family),
+            model=str(model),
+            source_of_truth="blocked",
+            combo_specs=tuple(),
+            combo_windows=tuple(),
+            resolved_output_columns=tuple(),
+            handoff_paths=handoff_paths or expected_handoff,
+            production_paths_inspected=inspected,
+            reason=f"no existing Production stream scope found and required Test handoff/profile artifacts are invalid: {tested_scope_error}",
+            runtime_only_updates_allowed=False,
+            output_contract_updates_allowed=False,
+            missing_artifacts=tuple(missing),
+            tested_scope=tested_scope,
+        )
+
+    if tested_scope is not None and tested_specs:
+        return ProductionStreamScopeContract(
+            mode="bootstrap_from_test",
+            family=str(family),
+            model=str(model),
+            source_of_truth="test_handoff",
+            combo_specs=tested_specs,
+            combo_windows=tested_windows,
+            resolved_output_columns=tested_columns,
+            handoff_paths=handoff_paths,
+            production_paths_inspected=inspected,
+            reason="no existing Production stream scope found; first-run output contract derived from validated Test handoff",
+            runtime_only_updates_allowed=True,
+            output_contract_updates_allowed=True,
+            existing_scope=None,
+            tested_scope=tested_scope,
+        )
+
+    missing = [str(path) for path in expected_handoff] or ["valid Test handoff/profile artifacts"]
+    return ProductionStreamScopeContract(
+        mode="blocked_missing_contract",
+        family=str(family),
+        model=str(model),
+        source_of_truth="blocked",
+        combo_specs=tuple(),
+        combo_windows=tuple(),
+        resolved_output_columns=tuple(),
+        handoff_paths=expected_handoff,
+        production_paths_inspected=inspected,
+        reason="no existing Production stream scope found and required Test handoff/profile artifacts are missing; Production bootstrap cannot fall back to defaults",
+        runtime_only_updates_allowed=False,
+        output_contract_updates_allowed=False,
+        missing_artifacts=tuple(missing),
+    )
+
+
+def require_production_stream_scope_contract(contract: ProductionStreamScopeContract) -> ProductionStreamScopeContract:
+    if str(contract.mode) != "blocked_missing_contract":
+        return contract
+    inspected = ", ".join(str(path) for path in contract.production_paths_inspected) or "none"
+    expected = ", ".join(str(path) for path in contract.handoff_paths or contract.missing_artifacts) or "valid Test handoff/profile artifacts"
+    raise SystemExit(
+        f"[{contract.family}:{contract.model}] no existing Production stream scope found; "
+        f"required Test handoff/profile artifacts missing or invalid; "
+        f"Production bootstrap cannot fall back to defaults/static combos. "
+        f"production_paths_inspected={inspected}; expected_handoff_or_profile={expected}; reason={contract.reason}"
+    )
+
+
 def resolve_model_state_root(forecast_root: Path, module_tag: str) -> Path:
     return (Path(forecast_root).resolve().parents[1] / "model_states" / str(module_tag)).resolve()
 

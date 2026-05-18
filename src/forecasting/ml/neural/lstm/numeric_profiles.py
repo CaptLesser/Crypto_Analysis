@@ -25,7 +25,16 @@ DEFAULT_HORIZONS = (30, 240, 720, 1440, 4320, 10080, 20160)
 DEFAULT_TASKS = ("log_return", "realized_vol", "true_range", "max_drawdown", "max_runup", "range_efficiency")
 MODEL_PARAMS = {"seq_len_floor": 64, "hidden_size": 64, "num_layers": 2, "dropout": 0.10, "weight_decay": 1e-4}
 NEEDS_DYNAMIC_FEATURES = True
-DYNAMIC_FEATURE_CANDIDATES = ("log_return", "ret_std_14", "ret_std_30", "atr_14", "rsi_14", "macd", "range_efficiency_30", "volume_zscore_30")
+DYNAMIC_FEATURE_CANDIDATES = (
+    "log_return",
+    "ret_std_20",
+    "atr_14",
+    "rsi_14",
+    "macd_12_26_9",
+    "range_efficiency_20",
+    "range_efficiency_50",
+    "volume_zscore_20",
+)
 STAGE1_MODE = "full"
 STAGE1_FEATURE_BLOCKS = {
     "target_history_core": ["target_history", "lag_1", "lag_2", "lag_3", "lag_6"],

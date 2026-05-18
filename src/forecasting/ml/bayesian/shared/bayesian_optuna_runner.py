@@ -49,6 +49,14 @@ _STAGE3_SETUP_CACHE_MAX_ENTRIES = 64
 _STAGE3_SETUP_CACHE_MAX_BYTES = 512 * 1024 * 1024
 
 
+def _positive_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
+
+
 def configure_for_model(model_spec: BayesianOptunaModelSpec) -> None:
     global CURRENT_MODEL_SPEC, CURRENT_NUMERICS, CURRENT_OPTUNA_PROFILE
     CURRENT_MODEL_SPEC = model_spec
@@ -61,10 +69,13 @@ class ComboSpec:
     interval: int
     horizon_minutes: int
     task: str
+    training_window_months: Optional[int] = None
 
     @property
     def tuple_label(self) -> str:
-        return f"{int(self.interval)}:{int(self.horizon_minutes)}:{self.task}"
+        base = f"{int(self.interval)}:{int(self.horizon_minutes)}:{self.task}"
+        months = _positive_int(getattr(self, "training_window_months", None))
+        return f"{base}@{int(months)}m" if months is not None else base
 
     @property
     def horizon_bars(self) -> int:
@@ -101,6 +112,7 @@ class MetricResult:
     first_prediction_ts: Optional[int]
     last_prediction_ts: Optional[int]
     params_label: str
+    training_window_months: Optional[int] = None
 
 
 class _Stage3SetupCache:
@@ -224,6 +236,16 @@ def _parse_str_csv(raw: str, default: Sequence[str]) -> List[str]:
     return [str(v) for v in values] if values else [str(v) for v in default]
 
 
+def _parse_task_and_window(raw_task: str, default_training_window_months: Optional[int] = None) -> Tuple[str, Optional[int]]:
+    task = str(raw_task).strip()
+    months = _positive_int(default_training_window_months)
+    if "@" not in task:
+        return task, months
+    task_part, window_part = task.rsplit("@", 1)
+    parsed_months = _positive_int(str(window_part).strip().removesuffix("m"))
+    return str(task_part).strip(), parsed_months if parsed_months is not None else months
+
+
 def _load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -261,15 +283,31 @@ def resolve_combo_specs(args: argparse.Namespace) -> List[ComboSpec]:
         combos: List[ComboSpec] = []
         for token in [part.strip() for part in str(args.combo_list).split(",") if part.strip()]:
             interval, horizon, task = token.split(":", 2)
-            combos.append(ComboSpec(interval=int(interval), horizon_minutes=int(horizon), task=str(task)))
+            parsed_task, parsed_months = _parse_task_and_window(str(task), None)
+            combos.append(ComboSpec(interval=int(interval), horizon_minutes=int(horizon), task=str(parsed_task), training_window_months=parsed_months))
         return combos
     if bool(getattr(args, "staged", False)):
         payload = _load_stage2_survivors(args)
-        combos = [
-            ComboSpec(interval=int(item["interval_minutes"]), horizon_minutes=int(item["horizon_minutes"]), task=str(item["task"]))
-            for item in (payload.get("survivors") or [])
-        ]
-        return sorted({(combo.interval, combo.horizon_minutes, combo.task): combo for combo in combos}.values(), key=lambda combo: (combo.interval, combo.horizon_minutes, combo.task))
+        combos: List[ComboSpec] = []
+        for item in (payload.get("survivors") or []):
+            months = _positive_int(item.get("training_window_months") if isinstance(item, dict) else None)
+            if months is None:
+                raise RuntimeError("staged Bayesian Stage-3 survivor is missing positive training_window_months")
+            combos.append(
+                ComboSpec(
+                    interval=int(item["interval_minutes"]),
+                    horizon_minutes=int(item["horizon_minutes"]),
+                    task=str(item["task"]),
+                    training_window_months=int(months),
+                )
+            )
+        return sorted(
+            {
+                (combo.interval, combo.horizon_minutes, combo.task, int(combo.training_window_months or 0)): combo
+                for combo in combos
+            }.values(),
+            key=lambda combo: (combo.interval, combo.horizon_minutes, combo.task, int(combo.training_window_months or 0)),
+        )
     intervals = _parse_int_csv(args.intervals, CURRENT_NUMERICS.MODULE_SPEC.default_intervals)
     horizons = _parse_int_csv(getattr(args, "horizon_minutes"), CURRENT_NUMERICS.MODULE_SPEC.default_horizons)
     tasks = _parse_str_csv(args.tasks, CURRENT_NUMERICS.MODULE_SPEC.default_tasks)
@@ -327,6 +365,7 @@ def _setup_common_key(
     selected_feature_columns: Optional[Sequence[str]],
     history_start_ts: int,
     eval_end_ts: int,
+    history_window_months: int,
     use_dynamic_features: bool,
     use_seasonality: bool,
 ) -> Tuple[Any, ...]:
@@ -340,10 +379,11 @@ def _setup_common_key(
         int(combo.interval),
         int(combo.horizon_minutes),
         str(combo.task),
+        int(_positive_int(combo.training_window_months) or 0),
         int(history_start_ts),
         int(eval_end_ts),
         int(getattr(args, "recent_eval_days", 0)),
-        int(getattr(args, "history_window_months", 0)),
+        int(history_window_months),
         int(getattr(args, "max_eval_origins", 0)),
         str(ohlc_root),
         str(feature_root),
@@ -360,6 +400,17 @@ def _evaluate_window(edge_ts: int, recent_eval_days: int, history_window_months:
     eval_start_ts = int(edge_ts) - int(recent_eval_days) * 86400
     history_start_ts = int(edge_ts) - int(history_window_months) * 31 * 86400
     return history_start_ts, eval_end_ts
+
+
+def _combo_history_window_months(combo: ComboSpec, args: Optional[argparse.Namespace] = None) -> int:
+    months = _positive_int(getattr(combo, "training_window_months", None))
+    if months is not None:
+        return int(months)
+    if args is not None:
+        arg_months = _positive_int(getattr(args, "history_window_months", None))
+        if arg_months is not None:
+            return int(arg_months)
+    return int(CURRENT_MODEL_SPEC.default_history_window_months)
 
 
 def _load_asset_frame(asset: str, combo: ComboSpec, history_start_ts: int, eval_end_ts: int, selected_dynamic_feature_columns: Optional[Sequence[str]] = None) -> pd.DataFrame:
@@ -428,6 +479,7 @@ def build_datasets(
     telemetry_path: Optional[Path] = None,
     setup_cache: Optional[_Stage3SetupCache] = None,
 ) -> List[Dataset]:
+    history_window_months = _combo_history_window_months(combo, args)
     with telemetry_scope_for_path(
         telemetry_path,
         family="Bayesian_Numeric",
@@ -440,6 +492,7 @@ def build_datasets(
         combo_key=combo.tuple_label,
         interval_minutes=int(combo.interval),
         horizon_minutes=int(combo.horizon_minutes),
+        training_window_months=int(history_window_months),
         task=str(combo.task),
         input_rows=len(assets),
         asset_count=len(assets),
@@ -453,7 +506,7 @@ def build_datasets(
             scope.update(reason_code="objective_dataset_empty", output_rows=0)
             raise RuntimeError(f"No edge timestamps available for combo={combo.tuple_label}")
         common_edge = min(edges)
-        history_start_ts, eval_end_ts = _evaluate_window(common_edge, int(args.recent_eval_days), int(args.history_window_months))
+        history_start_ts, eval_end_ts = _evaluate_window(common_edge, int(args.recent_eval_days), int(history_window_months))
         eval_start_ts = int(common_edge) - int(args.recent_eval_days) * 86400
         feature_profile_json = _resolve_stage1_feature_profile_json(args)
         combo_profile = (
@@ -494,6 +547,7 @@ def build_datasets(
                 selected_feature_columns=selected_dynamic_feature_columns,
                 history_start_ts=int(history_start_ts),
                 eval_end_ts=int(eval_end_ts),
+                history_window_months=int(history_window_months),
                 use_dynamic_features=use_dynamic_features,
                 use_seasonality=use_seasonality,
             )
@@ -547,7 +601,7 @@ def build_datasets(
                 combo_key=combo.tuple_label,
                 interval_minutes=int(combo.interval),
                 horizon_minutes=int(combo.horizon_minutes),
-                training_window_months=int(combo.training_window_months),
+                training_window_months=int(history_window_months),
                 task=str(combo.task),
                 elapsed_seconds=time.perf_counter() - factor_started,
                 input_rows=sum(len(frame) for frame in frames.values()),
@@ -571,7 +625,7 @@ def build_datasets(
                 combo_key=combo.tuple_label,
                 interval_minutes=int(combo.interval),
                 horizon_minutes=int(combo.horizon_minutes),
-                training_window_months=int(combo.training_window_months),
+                training_window_months=int(history_window_months),
                 task=str(combo.task),
                 elapsed_seconds=0.0,
                 input_rows=sum(len(frame) for frame in frames.values()),
@@ -656,6 +710,7 @@ def _build_datasets_with_telemetry(
 
 def evaluate_dataset(dataset: Dataset, params: Dict[str, Any], params_label: str) -> MetricResult:
     frame = dataset.frame.reset_index(drop=True)
+    training_window_months = _positive_int(getattr(dataset.combo, "training_window_months", None))
     ts_vec = pd.to_numeric(frame["ts"], errors="coerce").fillna(-1).astype("int64").to_numpy()
     y_vec = pd.to_numeric(frame[dataset.target_col], errors="coerce").to_numpy(dtype=float)
     valid_target_idx = np.flatnonzero(np.isfinite(y_vec))
@@ -719,10 +774,10 @@ def evaluate_dataset(dataset: Dataset, params: Dict[str, Any], params_label: str
         actuals.append(float(y_true))
         pred_ts.append(int(origin_ts))
     if not predictions:
-        return MetricResult(combo=dataset.combo.tuple_label, asset=dataset.asset, rows=0, rmse=None, mae=None, first_prediction_ts=None, last_prediction_ts=None, params_label=params_label)
+        return MetricResult(combo=dataset.combo.tuple_label, asset=dataset.asset, rows=0, rmse=None, mae=None, first_prediction_ts=None, last_prediction_ts=None, params_label=params_label, training_window_months=training_window_months)
     pred = np.asarray(predictions, dtype=float)
     act = np.asarray(actuals, dtype=float)
-    return MetricResult(combo=dataset.combo.tuple_label, asset=dataset.asset, rows=int(len(predictions)), rmse=float(np.sqrt(np.mean((pred - act) ** 2))), mae=float(np.mean(np.abs(pred - act))), first_prediction_ts=min(pred_ts), last_prediction_ts=max(pred_ts), params_label=params_label)
+    return MetricResult(combo=dataset.combo.tuple_label, asset=dataset.asset, rows=int(len(predictions)), rmse=float(np.sqrt(np.mean((pred - act) ** 2))), mae=float(np.mean(np.abs(pred - act))), first_prediction_ts=min(pred_ts), last_prediction_ts=max(pred_ts), params_label=params_label, training_window_months=training_window_months)
 
 
 def summarize_metrics(metrics: Sequence[MetricResult]) -> Dict[str, Any]:
@@ -750,6 +805,7 @@ def finalize_model_params(params: Dict[str, Any], combo: ComboSpec) -> Dict[str,
 
 
 def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials_per_combo: int, sampler_seed: int, storage: Optional[str], study_name_prefix: str, resume_study: bool, model_threads: int, telemetry_path: Optional[Path] = None) -> Tuple[Dict[str, Any], List[MetricResult], List[MetricResult], List[Dict[str, Any]]]:
+    training_window_months = _positive_int(getattr(combo, "training_window_months", None))
     baseline_params = finalize_model_params(baseline_params_with_threads(combo, model_threads), combo)
     with telemetry_scope_for_path(
         telemetry_path,
@@ -763,6 +819,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         combo_key=combo.tuple_label,
         interval_minutes=int(combo.interval),
         horizon_minutes=int(combo.horizon_minutes),
+        training_window_months=training_window_months,
         task=str(combo.task),
         input_rows=sum(len(dataset.frame) for dataset in datasets),
         asset_count=len(datasets),
@@ -785,6 +842,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
             combo_key=combo.tuple_label,
             interval_minutes=int(combo.interval),
             horizon_minutes=int(combo.horizon_minutes),
+            training_window_months=training_window_months,
             task=str(combo.task),
             input_rows=len(datasets),
             output_rows=0,
@@ -794,6 +852,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
             "interval": int(combo.interval),
             "horizon_minutes": int(combo.horizon_minutes),
             "task": combo.task,
+            "training_window_months": training_window_months,
             "status": "ineligible",
             "reason": "no_finite_evaluation_rows",
             "baseline_rmse": None,
@@ -831,6 +890,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
                 trial_rows.append(
                     {
                         "combo": combo.tuple_label,
+                        "training_window_months": training_window_months,
                         "trial_number": int(trial.number),
                         "objective_rmse": (None if not math.isfinite(interim_rmse) else float(interim_rmse)),
                         "weighted_mae": (float(mae_num / rows) if rows > 0 else None),
@@ -845,6 +905,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         trial_rows.append(
             {
                 "combo": combo.tuple_label,
+                "training_window_months": training_window_months,
                 "trial_number": int(trial.number),
                 "objective_rmse": (None if not math.isfinite(objective_value) else float(objective_value)),
                 "weighted_mae": (float(mae_num / rows) if rows > 0 else None),
@@ -870,9 +931,13 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         combo_key=combo.tuple_label,
         interval_minutes=int(combo.interval),
         horizon_minutes=int(combo.horizon_minutes),
+        training_window_months=training_window_months,
         task=str(combo.task),
         source_path=str(storage_url or ""),
     ) as study_scope:
+        study_name_suffix = f"{combo.interval}_{combo.horizon_minutes}_{combo.task}"
+        if training_window_months is not None:
+            study_name_suffix = f"{study_name_suffix}_w{int(training_window_months)}m"
         study = optuna.create_study(
             direction="minimize",
             sampler=optuna.samplers.TPESampler(seed=int(sampler_seed)),
@@ -880,7 +945,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
                 n_startup_trials=int(pruner_startup_trials),
                 n_warmup_steps=int(pruner_warmup_steps),
             ),
-            study_name=f"{study_name_prefix}_{combo.interval}_{combo.horizon_minutes}_{combo.task}",
+            study_name=f"{study_name_prefix}_{study_name_suffix}",
             storage=(storage_url or None),
             load_if_exists=bool(resume_study or storage_url),
         )
@@ -899,6 +964,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
             combo_key=combo.tuple_label,
             interval_minutes=int(combo.interval),
             horizon_minutes=int(combo.horizon_minutes),
+            training_window_months=training_window_months,
             task=str(combo.task),
             input_rows=int(trials_per_combo),
             asset_count=len(datasets),
@@ -927,6 +993,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         combo_key=combo.tuple_label,
         interval_minutes=int(combo.interval),
         horizon_minutes=int(combo.horizon_minutes),
+        training_window_months=training_window_months,
         task=str(combo.task),
         input_rows=sum(len(dataset.frame) for dataset in datasets),
         asset_count=len(datasets),
@@ -948,6 +1015,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         combo_key=combo.tuple_label,
         interval_minutes=int(combo.interval),
         horizon_minutes=int(combo.horizon_minutes),
+        training_window_months=training_window_months,
         task=str(combo.task),
         input_rows=len(tuned_metrics),
         output_rows=int(tuned_summary.get("rows", 0) or 0),
@@ -961,6 +1029,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         combo_key=combo.tuple_label,
         interval_minutes=int(combo.interval),
         horizon_minutes=int(combo.horizon_minutes),
+        training_window_months=training_window_months,
         task=str(combo.task),
         elapsed_seconds=float(study_elapsed_s),
         trial_rows=trial_rows,
@@ -979,6 +1048,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         "interval": int(combo.interval),
         "horizon_minutes": int(combo.horizon_minutes),
         "task": combo.task,
+        "training_window_months": training_window_months,
         "baseline_rmse": baseline_summary.get("weighted_rmse"),
         "baseline_mae": baseline_summary.get("weighted_mae"),
         "tuned_rmse": tuned_summary.get("weighted_rmse"),
@@ -1078,7 +1148,7 @@ def main_for_model(model_spec: BayesianOptunaModelSpec) -> None:
                 )
                 continue
             for dataset in datasets:
-                sample_rows.append({"combo": combo.tuple_label, "asset": dataset.asset, "eval_start_ts": int(dataset.eval_start_ts), "eval_end_ts": int(dataset.eval_end_ts), "rows": int(len(dataset.frame)), "origin_count": int(len(dataset.origins))})
+                sample_rows.append({"combo": combo.tuple_label, "asset": dataset.asset, "training_window_months": _positive_int(getattr(combo, "training_window_months", None)), "eval_start_ts": int(dataset.eval_start_ts), "eval_end_ts": int(dataset.eval_end_ts), "rows": int(len(dataset.frame)), "origin_count": int(len(dataset.origins))})
             combo_row, baseline_metrics, tuned_metrics, combo_trials = run_study_for_combo(combo, datasets, trials_per_combo=int(args.trials_per_combo), sampler_seed=int(args.sampler_seed), storage=(str(args.storage).strip() or None), study_name_prefix=str(args.study_name_prefix), resume_study=bool(args.resume_study), model_threads=int(args.model_threads), telemetry_path=output_dir)
             combo_rows.append(combo_row)
             metric_rows.extend(list(baseline_metrics))

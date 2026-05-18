@@ -97,6 +97,17 @@ def _split_csv(raw: str) -> List[str]:
     return [part.strip() for part in str(raw).split(",") if part.strip()]
 
 
+def _stage1_source_roots(args: argparse.Namespace) -> Dict[str, str]:
+    root = Path(args.parquet_root).expanduser().resolve()
+    return {
+        "parquet_root": str(root),
+        "ohlcvt_root": str(root),
+        "scalar_feature_root": str(root),
+        "edge_discovery_root": str(root),
+        "target_label_root": str(root),
+    }
+
+
 def _load_feature_profile(path: Optional[Path]) -> Dict[str, Any]:
     if path is None:
         return {}
@@ -163,6 +174,13 @@ def _stage_combo_rows(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "selected_window_bars": [],
                 "aic_values": [],
                 "bic_values": [],
+                "order_values": [],
+                "seasonal_order_values": [],
+                "seasonality_used_values": [],
+                "seasonality_sources": [],
+                "seasonal_period_bars": [],
+                "quantile_sets": [],
+                "spec_search_window_count": 0,
                 "first_ts": None,
                 "last_ts": None,
             },
@@ -187,6 +205,22 @@ def _stage_combo_rows(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
             value = fit_meta.get(metric_name)
             if value is not None:
                 row[target_key].append(value)
+        if fit_meta.get("order") is not None:
+            row["order_values"].append(tuple(int(v) for v in list(fit_meta.get("order") or [])))
+        if fit_meta.get("seasonal_order") is not None:
+            row["seasonal_order_values"].append(tuple(int(v) for v in list(fit_meta.get("seasonal_order") or [])))
+        if fit_meta.get("seasonality_used") is not None:
+            row["seasonality_used_values"].append(bool(fit_meta.get("seasonality_used")))
+        if fit_meta.get("seasonality_source") is not None:
+            row["seasonality_sources"].append(str(fit_meta.get("seasonality_source")))
+        if fit_meta.get("seasonal_period_bars") is not None:
+            row["seasonal_period_bars"].append(int(fit_meta.get("seasonal_period_bars")))
+        if fit_meta.get("quantiles") is not None:
+            try:
+                row["quantile_sets"].append(tuple(float(q) for q in list(fit_meta.get("quantiles") or [])))
+            except Exception:
+                pass
+        row["spec_search_window_count"] += int(fit_meta.get("spec_search_window_count", 0) or 0)
     for part in list(manifest.get("parts") or []):
         if not isinstance(part, dict) or str(part.get("store", "forecast")) != "forecast":
             continue
@@ -212,6 +246,10 @@ def _stage_combo_rows(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
         unit_elapsed = [float(v) for v in row["unit_elapsed_s"] if v is not None]
         aic_values = [float(v) for v in row["aic_values"] if v is not None]
         bic_values = [float(v) for v in row["bic_values"] if v is not None]
+        order_values = sorted(set(row["order_values"]))
+        seasonal_order_values = sorted(set(row["seasonal_order_values"]))
+        seasonal_periods = sorted(set(int(v) for v in row["seasonal_period_bars"] if v is not None))
+        quantile_sets = sorted(set(row["quantile_sets"]))
         out.append(
             {
                 "interval_minutes": int(row["interval_minutes"]),
@@ -235,6 +273,13 @@ def _stage_combo_rows(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "median_selected_window_bars": int(sorted(selected_windows)[len(selected_windows) // 2]) if selected_windows else None,
                 "mean_aic": (sum(aic_values) / len(aic_values)) if aic_values else None,
                 "mean_bic": (sum(bic_values) / len(bic_values)) if bic_values else None,
+                "selected_orders": [list(order) for order in order_values],
+                "selected_seasonal_orders": [list(order) for order in seasonal_order_values],
+                "seasonality_used": any(bool(v) for v in row["seasonality_used_values"]) if row["seasonality_used_values"] else False,
+                "seasonality_sources": sorted(set(str(v) for v in row["seasonality_sources"] if str(v))),
+                "seasonal_period_bars": seasonal_periods,
+                "quantile_sets": [list(qs) for qs in quantile_sets],
+                "spec_search_window_count": int(row["spec_search_window_count"]),
                 "first_prediction_ts": row["first_ts"],
                 "last_prediction_ts": row["last_ts"],
                 "status": "passed" if int(row["forecast_rows"]) > 0 and int(row["done_units"]) > 0 else "failed",
@@ -436,12 +481,181 @@ def _stage_eval_quality_rows(manifest: Dict[str, Any]) -> Dict[Tuple[int, int, s
     return out
 
 
+def _stats_structural_stage1_contract(model_key: str, row: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]:
+    key = str(model_key)
+    common_evidence = {
+        "evidence_kind": "stage1_manifest_metrics",
+        "forecast_rows": int(row.get("forecast_rows", 0) or 0),
+        "eval_rows": int(row.get("eval_rows", 0) or 0),
+        "convergence_rate": float(row.get("convergence_rate", 0.0) or 0.0),
+        "convergence_warning_count": int(row.get("convergence_warning_count", 0) or 0),
+        "skipped_origin_rate": float(row.get("skipped_origin_rate", 0.0) or 0.0),
+        "median_selected_window_bars": row.get("median_selected_window_bars"),
+        "mean_aic": row.get("mean_aic"),
+        "mean_bic": row.get("mean_bic"),
+    }
+    if key == "sarimax":
+        options = {
+            "order_policy": "bounded SARIMAX order search",
+            "seasonality_policy": "seasonal Fourier exog only when seasonality profile is usable",
+            "exog_policy": "calendar/seasonal deterministic exog only; no scalar-derived exog search",
+            "train_windows_bars": sorted(set(int(v) for v in row.get("selected_window_bars") or [])),
+            "selected_orders_observed": list(row.get("selected_orders") or []),
+            "selected_seasonal_orders_observed": list(row.get("selected_seasonal_orders") or []),
+        }
+        return {
+            "scalar_feature_search_performed": False,
+            "scalar_feature_search_reason": "SARIMAX Stage 1 searches endogenous order/seasonality/window behavior, not broad scalar exogenous features.",
+            "stage1_decision_basis": {
+                "kind": "data_derived_manifest_metrics",
+                "data_derived_in_stage1": True,
+                "deferred_to": [],
+                "note": "Stage 1 records SARIMAX order/seasonality/window evidence from the run manifest; scalar exog policy remains fixed deterministic-seasonal-only.",
+            },
+            "stage1_selected_instead": ["order", "seasonality", "exog_policy", "training_window"],
+            "candidates_options_considered": options,
+            "data_derived_evidence_used": {
+                **common_evidence,
+                "selected_orders": list(row.get("selected_orders") or []),
+                "selected_seasonal_orders": list(row.get("selected_seasonal_orders") or []),
+                "seasonality_used": bool(row.get("seasonality_used", False)),
+                "seasonality_sources": list(row.get("seasonality_sources") or []),
+                "seasonal_period_bars": list(row.get("seasonal_period_bars") or []),
+                "spec_search_window_count": int(row.get("spec_search_window_count", 0) or 0),
+            },
+            "model_specific_stage1_intent": {
+                "order": "select/confirm SARIMAX endogenous order by AIC/BIC among bounded candidates",
+                "seasonality": "confirm whether deterministic seasonal exog is active from seasonality profile",
+                "exog_policy": "use deterministic seasonal exog only; scalar feature exog search is not performed",
+            },
+        }
+    if key == "llt":
+        return {
+            "scalar_feature_search_performed": False,
+            "scalar_feature_search_reason": "LLT/DLM Stage 1 validates local-linear-trend target-history behavior and seasonality/window choices, not scalar exog columns.",
+            "stage1_decision_basis": {
+                "kind": "data_derived_manifest_metrics",
+                "data_derived_in_stage1": True,
+                "deferred_to": [],
+                "note": "Stage 1 records LLT seasonality/window evidence from the run manifest; the local-linear-trend structure is fixed by model family.",
+            },
+            "stage1_selected_instead": ["level_trend_structure", "seasonality", "training_window"],
+            "candidates_options_considered": {
+                "level_trend_structure": ["local linear trend"],
+                "seasonality_policy": "include seasonal component only when seasonality profile is usable",
+                "train_windows_bars": sorted(set(int(v) for v in row.get("selected_window_bars") or [])),
+            },
+            "data_derived_evidence_used": {
+                **common_evidence,
+                "seasonality_used": bool(row.get("seasonality_used", False)),
+                "seasonality_sources": list(row.get("seasonality_sources") or []),
+                "seasonal_period_bars": list(row.get("seasonal_period_bars") or []),
+            },
+            "model_specific_stage1_intent": {
+                "level_trend_structure": "confirm local linear trend state-space path",
+                "seasonality": "confirm usable seasonality profile",
+                "window": "use make-do window selected from available history",
+            },
+        }
+    if key == "egarch":
+        return {
+            "scalar_feature_search_performed": False,
+            "scalar_feature_search_reason": "EGARCH Stage 1 validates target-history volatility formulation/window behavior, not scalar exogenous columns.",
+            "stage1_decision_basis": {
+                "kind": "data_derived_manifest_metrics",
+                "data_derived_in_stage1": True,
+                "deferred_to": [],
+                "note": "Stage 1 records EGARCH convergence/window evidence from the run manifest; the EGARCH(1,1) asymmetric formulation is fixed by model family.",
+            },
+            "stage1_selected_instead": ["volatility_formulation", "training_window"],
+            "candidates_options_considered": {
+                "volatility_formulation": ["EGARCH(1,1) with asymmetry term"],
+                "distribution": ["normal"],
+                "train_windows_bars": sorted(set(int(v) for v in row.get("selected_window_bars") or [])),
+            },
+            "data_derived_evidence_used": common_evidence,
+            "model_specific_stage1_intent": {
+                "volatility_formulation": "confirm EGARCH volatility state path",
+                "window": "use make-do window selected from available target history",
+            },
+        }
+    if key == "quantreg":
+        quantiles = list(row.get("quantile_sets") or manifest.get("quantiles") or [])
+        return {
+            "scalar_feature_search_performed": False,
+            "scalar_feature_search_reason": "QuantReg Stage 1 uses target-history lag features and fixed output quantile structure; it does not search broad scalar features.",
+            "stage1_decision_basis": {
+                "kind": "data_derived_manifest_metrics",
+                "data_derived_in_stage1": True,
+                "deferred_to": [],
+                "note": "Stage 1 records QuantReg convergence/window/quantile evidence from the run manifest; lag structure is fixed by model family.",
+            },
+            "stage1_selected_instead": ["lag_structure", "quantile_structure", "training_window"],
+            "candidates_options_considered": {
+                "lag_structure": ["target lags 1,2,3,5,8"],
+                "quantile_structure": quantiles or "manifest/default quantiles",
+                "train_windows_bars": sorted(set(int(v) for v in row.get("selected_window_bars") or [])),
+            },
+            "data_derived_evidence_used": {
+                **common_evidence,
+                "quantile_sets": quantiles,
+            },
+            "model_specific_stage1_intent": {
+                "lag_structure": "use target-history supervised lags",
+                "quantile_structure": "confirm quantile output contract",
+                "window": "use make-do window selected from available target history",
+            },
+        }
+    return {
+        "scalar_feature_search_performed": False,
+        "scalar_feature_search_reason": "stats Stage 1 is structural/endogenous unless a model explicitly enables scalar exog search",
+        "stage1_selected_instead": ["target_history"],
+        "candidates_options_considered": {},
+        "data_derived_evidence_used": common_evidence,
+        "model_specific_stage1_intent": {},
+        "stage1_decision_basis": {
+            "kind": "unknown",
+            "data_derived_in_stage1": False,
+            "deferred_to": [],
+            "note": "No model-specific stats Stage 1 structural contract is defined.",
+        },
+    }
+
+
 def _write_stage1_profile(output_dir: Path, model_key: str, manifest: Dict[str, Any], args: argparse.Namespace) -> None:
     combo_rows = _stage_combo_rows(manifest)
     assets = sorted({asset for row in combo_rows for asset in list(row.get("assets") or [])}) or _split_csv(str(args.assets))
+    source_roots = dict(manifest.get("source_roots") or _stage1_source_roots(args))
     selections: Dict[str, Dict[str, Any]] = {}
     for row in combo_rows:
         key = _combo_key(int(row["interval_minutes"]), int(row["horizon_minutes"]), str(row["task"]))
+        structural_contract = _stats_structural_stage1_contract(str(model_key), row, manifest)
+        selected_formulation = {
+            "model_family": str(model_key),
+            "selected_window_bars": row.get("median_selected_window_bars"),
+        }
+        if str(model_key) == "sarimax":
+            selected_formulation.update(
+                {
+                    "selected_orders": list(row.get("selected_orders") or []),
+                    "selected_seasonal_orders": list(row.get("selected_seasonal_orders") or []),
+                    "seasonality_used": bool(row.get("seasonality_used", False)),
+                    "seasonal_period_bars": list(row.get("seasonal_period_bars") or []),
+                    "exog_policy": "deterministic_seasonal_only",
+                }
+            )
+        elif str(model_key) == "llt":
+            selected_formulation.update(
+                {
+                    "level": "local linear trend",
+                    "seasonality_used": bool(row.get("seasonality_used", False)),
+                    "seasonal_period_bars": list(row.get("seasonal_period_bars") or []),
+                }
+            )
+        elif str(model_key) == "egarch":
+            selected_formulation.update({"volatility_formulation": "EGARCH(1,1) asymmetric", "distribution": "normal"})
+        elif str(model_key) == "quantreg":
+            selected_formulation.update({"lag_structure": [1, 2, 3, 5, 8], "quantile_sets": list(row.get("quantile_sets") or manifest.get("quantiles") or [])})
         selections[key] = {
             "model_key": str(model_key),
             "interval_minutes": int(row["interval_minutes"]),
@@ -450,10 +664,9 @@ def _write_stage1_profile(output_dir: Path, model_key: str, manifest: Dict[str, 
             "selection_semantics": "stats_relationship_profile",
             "feature_profile": "endogenous_history_and_distribution_form",
             "selected_features": ["target_history"],
-            "selected_formulation": {
-                "model_family": str(model_key),
-                "selected_window_bars": row.get("median_selected_window_bars"),
-            },
+            "selected_formulation": selected_formulation,
+            "final_selected_formulation_settings": selected_formulation,
+            **structural_contract,
             "cohort_assets": list(row.get("assets") or assets),
             "forecast_rows": int(row.get("forecast_rows", 0) or 0),
             "eval_rows": int(row.get("eval_rows", 0) or 0),
@@ -461,6 +674,7 @@ def _write_stage1_profile(output_dir: Path, model_key: str, manifest: Dict[str, 
             "convergence_warning_count": int(row.get("convergence_warning_count", 0) or 0),
             "skipped_origin_rate": float(row.get("skipped_origin_rate", 0.0) or 0.0),
             "selection_status": str(row.get("status", "failed")),
+            "resolved_roots": source_roots,
         }
     payload = {
         "selection_file_version": 2,
@@ -469,6 +683,7 @@ def _write_stage1_profile(output_dir: Path, model_key: str, manifest: Dict[str, 
         "stage1_mode": "relationship_confirmation",
         "generated_at": utc_now_iso(),
         "cohort_assets": list(assets),
+        "resolved_roots": source_roots,
         "combo_count": int(len(selections)),
         "selections": selections,
     }
@@ -483,6 +698,7 @@ def _write_stage1_profile(output_dir: Path, model_key: str, manifest: Dict[str, 
             "expected_combo_count": int(len(selections)),
             "completed_combo_count": int(len([row for row in selections.values() if row.get("selection_status") == "passed"])),
             "cohort_assets": list(assets),
+            "resolved_roots": source_roots,
             "generated_at": utc_now_iso(),
         },
     )
@@ -668,6 +884,14 @@ def run_stage_for_model(model_key: str, stage_name: str, argv: Optional[Sequence
 
     env = dict(os.environ)
     env[STATS_NUMERIC_FAMILY_ROOT_ENVS[str(model_key)]] = str(branch_root)
+    source_roots = _stage1_source_roots(args)
+    for name in (
+        "PIPELINE_SOURCE_PARQUET_ROOT",
+        "PIPELINE_SOURCE_OHLCVT_ROOT",
+        "PIPELINE_SOURCE_FEATURES_ROOT",
+        "PIPELINE_PARQUET_FEATURES_ROOT",
+    ):
+        env[name] = source_roots["parquet_root"]
     if bool(args.force):
         _clear_stage_locks(branch_root, str(model_key))
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
@@ -724,6 +948,7 @@ def run_stage_for_model(model_key: str, stage_name: str, argv: Optional[Sequence
         "status": status,
         "log_path": str(log_path),
         "output_root": str(branch_root),
+        "resolved_roots": source_roots,
         **artifact_summary,
         "feature_profile_json": str(Path(args.feature_profile_json).resolve()) if args.feature_profile_json is not None else None,
         "staged": bool(args.staged),

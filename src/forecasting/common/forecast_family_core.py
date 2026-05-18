@@ -923,9 +923,13 @@ def build_unit_context(
     )
 
 
-def discover_edge_and_min(asset: str, interval_minutes: int) -> Tuple[Optional[int], Optional[int]]:
-    return interval_edge_ts(asset=str(asset), interval_minutes=int(interval_minutes)), interval_min_ts(
-        asset=str(asset), interval_minutes=int(interval_minutes)
+def discover_edge_and_min(
+    asset: str,
+    interval_minutes: int,
+    root: Optional[Path] = None,
+) -> Tuple[Optional[int], Optional[int]]:
+    return interval_edge_ts(asset=str(asset), interval_minutes=int(interval_minutes), root=root), interval_min_ts(
+        asset=str(asset), interval_minutes=int(interval_minutes), root=root
     )
 
 

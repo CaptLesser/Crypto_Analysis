@@ -20,10 +20,12 @@ import pandas as pd
 from sklearn.feature_selection import VarianceThreshold, mutual_info_regression
 from sklearn.model_selection import TimeSeriesSplit
 
+from src.features.scalar_features import SCALAR_FEATURE_COLUMNS
 from src.forecasting.common.path_config import resolve_path, selected_profile
 from src.forecasting.common.ml_module_utils import select_numeric_feature_columns
 from src.forecasting.ml.tabular.shared.numeric_forecast_engine import ConstantRegressor
 from src.forecasting.ml.shared.feature_profile_common import combo_selection_key
+from src.forecasting.ml.shared.stage1_candidate_universe import RAW_SOURCE_COLUMNS
 from src.forecasting.ml.shared.numeric_cohort_common import (
     CLAMP_START_MONTH,
     CLAMP_START_YEAR,
@@ -46,6 +48,8 @@ STAGE1_DEFAULT_WINDOW_MONTHS = 3
 STAGE1_SLOW_WINDOW_MONTHS = 6
 STAGE1_DEFAULT_WORKERS = 8
 STAGE1_DEFAULT_MODEL_THREADS = 6
+RAW_SOURCE_COLUMN_SET = set(RAW_SOURCE_COLUMNS)
+SCALAR_FEATURE_COLUMN_SET = set(SCALAR_FEATURE_COLUMNS)
 
 TASK_FAMILY = {
     "log_return": "returns",
@@ -120,6 +124,149 @@ def family_for_column(column: str) -> str:
     return FAMILY_LOOKUP.get(str(column), "other")
 
 
+def source_type_for_column(column: str) -> str:
+    name = str(column)
+    if name in RAW_SOURCE_COLUMN_SET:
+        return "raw_source"
+    if name in SCALAR_FEATURE_COLUMN_SET:
+        return "scalar_derived"
+    return "other_allowed"
+
+
+def candidate_records(columns: Sequence[str]) -> List[Dict[str, Any]]:
+    return [{"name": str(column), "source_type": source_type_for_column(str(column))} for column in columns]
+
+
+def _dedupe_preserve_order(values: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        name = str(value)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def aggregate_drop_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for record in records:
+        feature = str(record.get("feature") or record.get("name") or "")
+        reason = str(record.get("reason") or "unspecified")
+        if not feature:
+            continue
+        key = (feature, reason)
+        row = grouped.setdefault(
+            key,
+            {
+                "feature": feature,
+                "source_type": str(record.get("source_type") or source_type_for_column(feature)),
+                "reason": reason,
+                "count": 0,
+                "assets": set(),
+                "fold_indices": set(),
+                "max_missing_fraction": None,
+                "total_missing_rows": 0,
+                "required_rows": record.get("required_rows"),
+            },
+        )
+        row["count"] = int(row["count"]) + int(record.get("count") or 1)
+        if record.get("asset"):
+            row["assets"].add(str(record["asset"]))
+        if record.get("fold_index") is not None:
+            row["fold_indices"].add(int(record["fold_index"]))
+        if record.get("missing_fraction") is not None:
+            missing_fraction = float(record["missing_fraction"])
+            current = row["max_missing_fraction"]
+            row["max_missing_fraction"] = missing_fraction if current is None else max(float(current), missing_fraction)
+        row["total_missing_rows"] = int(row["total_missing_rows"]) + int(record.get("missing_rows") or 0)
+    out: List[Dict[str, Any]] = []
+    for row in grouped.values():
+        clean = dict(row)
+        clean["assets"] = sorted(clean["assets"])
+        clean["fold_indices"] = sorted(clean["fold_indices"])
+        out.append(clean)
+    out.sort(key=lambda item: (str(item["reason"]), str(item["feature"])))
+    return out
+
+
+def aggregate_feature_evidence(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        feature = str(record.get("feature") or "")
+        if not feature:
+            continue
+        row = grouped.setdefault(
+            feature,
+            {
+                "feature": feature,
+                "source_type": str(record.get("source_type") or source_type_for_column(feature)),
+                "folds_evaluated": 0,
+                "selected_fold_count": 0,
+                "variance_filtered_fold_count": 0,
+                "mi_scores": [],
+                "model_importance_scores": [],
+                "permutation_scores": [],
+            },
+        )
+        status = str(record.get("status") or "")
+        if status == "variance_filtered":
+            row["variance_filtered_fold_count"] = int(row["variance_filtered_fold_count"]) + 1
+            continue
+        row["folds_evaluated"] = int(row["folds_evaluated"]) + 1
+        if bool(record.get("selected")):
+            row["selected_fold_count"] = int(row["selected_fold_count"]) + 1
+        for src_key, dst_key in (
+            ("mi_score", "mi_scores"),
+            ("model_importance", "model_importance_scores"),
+            ("permutation_score", "permutation_scores"),
+        ):
+            value = safe_float(record.get(src_key))
+            if value is not None:
+                row[dst_key].append(float(value))
+    out: List[Dict[str, Any]] = []
+    for row in grouped.values():
+        folds = int(row["folds_evaluated"])
+        out.append(
+            {
+                "feature": str(row["feature"]),
+                "source_type": str(row["source_type"]),
+                "folds_evaluated": folds,
+                "selected_fold_count": int(row["selected_fold_count"]),
+                "selected_fold_share": (float(row["selected_fold_count"]) / float(folds) if folds else 0.0),
+                "variance_filtered_fold_count": int(row["variance_filtered_fold_count"]),
+                "mean_mi_score": mean(row["mi_scores"]),
+                "mean_model_importance": mean(row["model_importance_scores"]),
+                "mean_permutation_score": mean(row["permutation_scores"]),
+            }
+        )
+    out.sort(
+        key=lambda item: (
+            -int(item["selected_fold_count"]),
+            -(safe_float(item.get("mean_permutation_score")) or 0.0),
+            -(safe_float(item.get("mean_mi_score")) or 0.0),
+            str(item["feature"]),
+        )
+    )
+    return out
+
+
+def candidate_universe_artifact(columns: Sequence[str]) -> Dict[str, Any]:
+    ordered = _dedupe_preserve_order(columns)
+    raw_source = [column for column in ordered if source_type_for_column(column) == "raw_source"]
+    scalar_derived = [column for column in ordered if source_type_for_column(column) == "scalar_derived"]
+    other_allowed = [column for column in ordered if source_type_for_column(column) == "other_allowed"]
+    return {
+        "candidate_count": int(len(ordered)),
+        "candidate_columns": list(ordered),
+        "records": candidate_records(ordered),
+        "raw_source_candidates": raw_source,
+        "scalar_derived_candidates": scalar_derived,
+        "other_allowed_candidates": other_allowed,
+    }
+
+
 def mean(values: Iterable[Optional[float]]) -> Optional[float]:
     vals = [float(v) for v in values if v is not None and math.isfinite(float(v))]
     return float(sum(vals) / len(vals)) if vals else None
@@ -147,6 +294,29 @@ def parse_csv_int(raw: str) -> List[int]:
 
 def parse_csv_str(raw: str) -> List[str]:
     return sorted(set(token.strip() for token in str(raw).split(',') if token.strip()))
+
+
+def _resolved_stage1_source_roots(parquet_root: Path) -> Dict[str, str]:
+    root = Path(parquet_root).expanduser().resolve()
+    return {
+        "parquet_root": str(root),
+        "ohlcvt_root": str(root),
+        "scalar_feature_root": str(root),
+        "edge_discovery_root": str(root),
+        "target_label_root": str(root),
+    }
+
+
+def _apply_explicit_stage1_source_root(parquet_root: Path) -> Dict[str, str]:
+    roots = _resolved_stage1_source_roots(parquet_root)
+    for name in (
+        "PIPELINE_SOURCE_PARQUET_ROOT",
+        "PIPELINE_SOURCE_OHLCVT_ROOT",
+        "PIPELINE_SOURCE_FEATURES_ROOT",
+        "PIPELINE_PARQUET_FEATURES_ROOT",
+    ):
+        os.environ[name] = roots["parquet_root"]
+    return roots
 
 
 def parse_combo_list(raw: str) -> List[Tuple[int, int, str]]:
@@ -353,7 +523,8 @@ def build_labeled_frame(
     telemetry_path: Optional[Path] = None,
     model_key: str = "",
     combo_key: Optional[str] = None,
-) -> Tuple[pd.DataFrame, List[str]]:
+    return_report: bool = False,
+) -> Tuple[pd.DataFrame, List[str]] | Tuple[pd.DataFrame, List[str], Dict[str, Any]]:
     base_event = {
         "family": "Tabular_Numeric",
         "model": str(model_key),
@@ -379,6 +550,22 @@ def build_labeled_frame(
         feature_df, _stats = module._load_unit_feature_frame(asset, interval_minutes, start_ts, stop_ts)
         scope.set_output(feature_df, reason_code=("feature_load_empty" if feature_df.empty else ""))
     if feature_df.empty:
+        report = {
+            "asset": str(asset),
+            "candidate_universe": candidate_universe_artifact(()),
+            "dropped_candidates": [],
+            "missingness_notes": [],
+            "row_filtering": {
+                "input_rows": 0,
+                "target_valid_rows": 0,
+                "output_rows": 0,
+                "policy": "target_valid_rows_plus_candidate_specific_missingness_filter",
+                "all_column_dropna_used": False,
+                "loader_fill_note": "production feature loader forward-fills and fills OHLCVT/scalar inputs; residual candidate missingness is filtered per candidate.",
+            },
+        }
+        if return_report:
+            return pd.DataFrame(), [], report
         return pd.DataFrame(), []
     with telemetry_scope_for_path(
         telemetry_path,
@@ -395,7 +582,11 @@ def build_labeled_frame(
     y_col = str(task_label)
     frame = pd.concat([feature_df.reset_index(drop=True), label_df.reset_index(drop=True)], axis=1)
     x_cols = list(select_numeric_feature_columns(frame.columns, extra_exclude={y_col, 'future_direction'}))
-    needed = [col for col in x_cols if col in frame.columns] + [y_col]
+    x_cols = [col for col in x_cols if col in frame.columns]
+    needed = x_cols + [y_col]
+    raw_candidate_universe = candidate_universe_artifact(x_cols)
+    dropped_candidates: List[Dict[str, Any]] = []
+    missingness_notes: List[Dict[str, Any]] = []
     with telemetry_scope_for_path(
         telemetry_path,
         input_obj=frame,
@@ -406,11 +597,83 @@ def build_labeled_frame(
         phase_name="join",
         parent_phase="feature_selection",
     ) as scope:
-        df = frame.loc[:, needed].replace([np.inf, -np.inf], np.nan).dropna(axis=0, how='any').reset_index(drop=True)
+        clean = frame.loc[:, needed].replace([np.inf, -np.inf], np.nan)
+        target_valid = pd.to_numeric(clean[y_col], errors="coerce").notna()
+        target_valid_rows = int(target_valid.sum())
+        filtered_feature_cols: List[str] = []
+        candidate_base = clean.loc[target_valid, x_cols]
+        for col in x_cols:
+            source_type = source_type_for_column(col)
+            finite_mask = pd.to_numeric(candidate_base[col], errors="coerce").notna()
+            finite_rows = int(finite_mask.sum())
+            missing_rows = int(target_valid_rows - finite_rows)
+            missing_fraction = float(missing_rows / target_valid_rows) if target_valid_rows else 1.0
+            if missing_rows > 0:
+                missingness_notes.append(
+                    {
+                        "asset": str(asset),
+                        "feature": str(col),
+                        "source_type": source_type,
+                        "finite_rows": finite_rows,
+                        "missing_rows": missing_rows,
+                        "missing_fraction": missing_fraction,
+                    }
+                )
+            if finite_rows <= 0:
+                dropped_candidates.append(
+                    {
+                        "asset": str(asset),
+                        "feature": str(col),
+                        "source_type": source_type,
+                        "reason": "no_finite_candidate_rows",
+                        "finite_rows": finite_rows,
+                        "missing_rows": missing_rows,
+                        "missing_fraction": missing_fraction,
+                    }
+                )
+                continue
+            if missing_rows > 0:
+                dropped_candidates.append(
+                    {
+                        "asset": str(asset),
+                        "feature": str(col),
+                        "source_type": source_type,
+                        "reason": "candidate_missing_values",
+                        "finite_rows": finite_rows,
+                        "missing_rows": missing_rows,
+                        "missing_fraction": missing_fraction,
+                    }
+                )
+                continue
+            filtered_feature_cols.append(str(col))
+        df = clean.loc[target_valid, filtered_feature_cols + [y_col]].reset_index(drop=True)
+        df[y_col] = pd.to_numeric(df[y_col], errors="coerce")
+        if filtered_feature_cols:
+            df.loc[:, filtered_feature_cols] = df.loc[:, filtered_feature_cols].apply(pd.to_numeric, errors="coerce")
+        df = df.dropna(axis=0, how="any").reset_index(drop=True)
         if max_rows > 0 and len(df) > max_rows:
             df = df.iloc[-int(max_rows):].reset_index(drop=True)
         scope.set_output(df, reason_code=("train_frame_empty" if df.empty else ""))
-    return df, [col for col in x_cols if col in df.columns]
+    kept_cols = [col for col in x_cols if col in df.columns]
+    report = {
+        "asset": str(asset),
+        "candidate_universe": raw_candidate_universe,
+        "dropped_candidates": dropped_candidates,
+        "missingness_notes": missingness_notes,
+        "row_filtering": {
+            "input_rows": int(len(frame)),
+            "target_valid_rows": int(target_valid_rows),
+            "output_rows": int(len(df)),
+            "candidate_count_before_missingness": int(len(x_cols)),
+            "candidate_count_after_missingness": int(len(kept_cols)),
+            "policy": "target_valid_rows_plus_candidate_specific_missingness_filter",
+            "all_column_dropna_used": False,
+            "loader_fill_note": "production feature loader forward-fills and fills OHLCVT/scalar inputs; residual candidate missingness is filtered per candidate.",
+        },
+    }
+    if return_report:
+        return df, kept_cols, report
+    return df, kept_cols
 
 
 def rank_candidate_columns(importances: Dict[str, float], mi_map: Dict[str, float], top_k: int) -> List[str]:
@@ -433,11 +696,12 @@ def run_fold(
     *,
     telemetry_path: Optional[Path] = None,
     model_key: str = "",
-) -> Tuple[List[FoldResult], Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[List[FoldResult], Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     rows: List[FoldResult] = []
     top_feature_stats: Counter[str] = Counter()
     family_rows: List[Dict[str, Any]] = []
     fold_rows: List[Dict[str, Any]] = []
+    evidence_rows: List[Dict[str, Any]] = []
     n_splits, min_train_rows, min_val_rows = stage1_cv_params(args, int(spec.interval_minutes), int(spec.horizon_minutes))
     tscv = TimeSeriesSplit(n_splits=max(2, int(n_splits)))
     y_col = str(module.TASK_LABEL[str(spec.task)])
@@ -511,6 +775,22 @@ def run_fold(
                 columns=x_train_raw.columns[selector.get_support()].tolist(),
             )
             x_val_screen = pd.DataFrame(selector.transform(x_val_raw), columns=x_train_screen.columns.tolist())
+            kept_set = set(str(col) for col in x_train_screen.columns)
+            for col in x_cols:
+                if str(col) in kept_set:
+                    continue
+                evidence_rows.append(
+                    {
+                        "spec_key": spec.key,
+                        "asset": str(asset),
+                        "fold_index": int(fold_index),
+                        "feature": str(col),
+                        "source_type": source_type_for_column(str(col)),
+                        "status": "variance_filtered",
+                        "reason": "variance_threshold",
+                        "variance_threshold": float(args.variance_threshold),
+                    }
+                )
             variance_scope.set_output(
                 x_train_screen,
                 output_columns_count=len(x_train_screen.columns),
@@ -628,6 +908,22 @@ def run_fold(
         if not selected_cols:
             selected_cols = candidate_cols[: max(1, int(args.top_k_features))]
         selected_cols = selected_cols[: max(1, int(args.top_k_features))]
+        selected_set = set(str(col) for col in selected_cols)
+        for col in x_train_screen.columns:
+            evidence_rows.append(
+                {
+                    "spec_key": spec.key,
+                    "asset": str(asset),
+                    "fold_index": int(fold_index),
+                    "feature": str(col),
+                    "source_type": source_type_for_column(str(col)),
+                    "status": "scored",
+                    "selected": str(col) in selected_set,
+                    "mi_score": mi_map.get(str(col)),
+                    "model_importance": gains.get(str(col)),
+                    "permutation_score": perm_map.get(str(col)),
+                }
+            )
         subset_pred, _subset_model = fit_and_predict(
             module,
             spec.task,
@@ -703,7 +999,7 @@ def run_fold(
                 'skill_delta': (None if subset_skill is None or ablated_skill is None else float(ablated_skill - subset_skill)),
             })
         folds_done += 1
-    return rows, dict(top_feature_stats), family_rows, fold_rows
+    return rows, dict(top_feature_stats), family_rows, fold_rows, evidence_rows
 
 
 def parse_args() -> argparse.Namespace:
@@ -740,6 +1036,7 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
     telemetry_path = Path(args.output_dir).resolve() if getattr(args, "output_dir", None) is not None else None
     model_key = str(getattr(args, "model_key", ""))
     combo_key = combo_selection_key(int(interval_minutes), int(horizon_minutes), str(task))
+    source_roots = dict(getattr(args, "resolved_source_roots", {}) or {})
     if not assets:
         emit_event_for_path(
             telemetry_path,
@@ -757,6 +1054,7 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
             reason_code="no_assets",
             output_rows=0,
             asset_count=0,
+            **source_roots,
         )
         return None
     training_window_months = stage1_training_window_months(int(args.train_window_months), int(interval_minutes), int(horizon_minutes))
@@ -771,9 +1069,14 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
     feature_votes: Counter[str] = Counter()
     family_rows_all: List[Dict[str, Any]] = []
     fold_rows_all: List[Dict[str, Any]] = []
+    evidence_rows_all: List[Dict[str, Any]] = []
+    build_reports: List[Dict[str, Any]] = []
+    candidate_columns_seen: List[str] = []
+    dropped_candidates_all: List[Dict[str, Any]] = []
+    missingness_notes_all: List[Dict[str, Any]] = []
     started = time.perf_counter()
     for asset in assets:
-        df, x_cols = build_labeled_frame(
+        df, x_cols, build_report = build_labeled_frame(
             module,
             asset,
             int(interval_minutes),
@@ -784,10 +1087,15 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
             telemetry_path=telemetry_path,
             model_key=model_key,
             combo_key=combo_spec.key,
+            return_report=True,
         )
+        build_reports.append(build_report)
+        candidate_columns_seen.extend(build_report.get("candidate_universe", {}).get("candidate_columns") or [])
+        dropped_candidates_all.extend(build_report.get("dropped_candidates") or [])
+        missingness_notes_all.extend(build_report.get("missingness_notes") or [])
         if df.empty or len(x_cols) < 2:
             continue
-        fold_results, feature_stats, family_rows, fold_rows = run_fold(
+        fold_results, feature_stats, family_rows, fold_rows, evidence_rows = run_fold(
             module,
             combo_spec,
             asset,
@@ -802,6 +1110,7 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
         feature_votes.update(feature_stats)
         family_rows_all.extend(family_rows)
         fold_rows_all.extend(fold_rows)
+        evidence_rows_all.extend(evidence_rows)
     if not all_fold_results:
         emit_event_for_path(
             telemetry_path,
@@ -826,10 +1135,66 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
             candidate_feature_count=0,
             selected_feature_count=0,
             dynamic_feature_count=0,
+            **source_roots,
         )
         return None
     top_features = [name for name, _count in feature_votes.most_common(int(args.top_k_features))]
     top_family_counts = Counter(family_for_column(col) for col in top_features)
+    candidate_universe = candidate_universe_artifact(candidate_columns_seen)
+    feature_evidence = aggregate_feature_evidence(evidence_rows_all)
+    variance_filtered_records = [
+        {
+            "feature": str(row.get("feature")),
+            "source_type": str(row.get("source_type") or source_type_for_column(str(row.get("feature")))),
+            "reason": "variance_threshold",
+            "asset": str(row.get("asset") or ""),
+            "fold_index": row.get("fold_index"),
+            "variance_threshold": row.get("variance_threshold"),
+        }
+        for row in evidence_rows_all
+        if str(row.get("status") or "") == "variance_filtered"
+    ]
+    variance_filtered_candidates = aggregate_drop_records(variance_filtered_records)
+    dropped_candidates = aggregate_drop_records([*dropped_candidates_all, *variance_filtered_records])
+    missingness_notes = aggregate_drop_records(
+        [
+            {
+                **dict(note),
+                "reason": "candidate_missing_values",
+            }
+            for note in missingness_notes_all
+        ]
+    )
+    evidence_by_feature = {str(row["feature"]): row for row in feature_evidence}
+    selected_feature_records = [
+        {
+            "name": str(name),
+            "source_type": source_type_for_column(str(name)),
+            "vote_count": int(feature_votes.get(str(name), 0)),
+            "selected_fold_count": int((evidence_by_feature.get(str(name)) or {}).get("selected_fold_count") or 0),
+            "selected_fold_share": safe_float((evidence_by_feature.get(str(name)) or {}).get("selected_fold_share")) or 0.0,
+            "mean_mi_score": (evidence_by_feature.get(str(name)) or {}).get("mean_mi_score"),
+            "mean_model_importance": (evidence_by_feature.get(str(name)) or {}).get("mean_model_importance"),
+            "mean_permutation_score": (evidence_by_feature.get(str(name)) or {}).get("mean_permutation_score"),
+        }
+        for name in top_features
+    ]
+    fold_stability = [
+        {
+            "feature": record["name"],
+            "source_type": record["source_type"],
+            "selected_fold_count": int(record["selected_fold_count"]),
+            "folds_total": int(len(all_fold_results)),
+            "selected_fold_share": float(record["selected_fold_share"]),
+        }
+        for record in selected_feature_records
+    ]
+    row_filtering = {
+        "policy": "target_valid_rows_plus_candidate_specific_missingness_filter",
+        "all_column_dropna_used": False,
+        "loader_fill_note": "production _load_unit_feature_frame forward-fills/fills OHLCVT and scalar inputs before Stage 1; residual missing candidates are dropped individually.",
+        "asset_reports": [dict(report.get("row_filtering") or {}, asset=str(report.get("asset") or "")) for report in build_reports],
+    }
     summary_row = {
         'spec_key': combo_spec.key,
         'interval_minutes': int(interval_minutes),
@@ -845,6 +1210,12 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
         'selected_subset_median_skill': median(row.subset_skill for row in all_fold_results),
         'mean_full_feature_count': mean(row.full_feature_count for row in all_fold_results),
         'mean_selected_feature_count': mean(row.selected_feature_count for row in all_fold_results),
+        'candidate_feature_count': int(candidate_universe["candidate_count"]),
+        'raw_source_candidate_count': int(len(candidate_universe["raw_source_candidates"])),
+        'scalar_derived_candidate_count': int(len(candidate_universe["scalar_derived_candidates"])),
+        'other_allowed_candidate_count': int(len(candidate_universe["other_allowed_candidates"])),
+        'dropped_candidate_count': int(sum(int(row.get("count") or 1) for row in dropped_candidates)),
+        'variance_filtered_candidate_count': int(len(variance_filtered_candidates)),
         'stable_top_features': ','.join(top_features),
         'top_feature_families': ','.join(fam for fam, _ in top_family_counts.most_common(4)),
         'subset_vs_full': 'improved_or_equal' if (mean(row.subset_skill for row in all_fold_results) or -1e9) >= (mean(row.full_skill for row in all_fold_results) or -1e9) else 'worse',
@@ -852,9 +1223,22 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
     selection = {
         'feature_profile': 'selected_subset',
         'selected_features': top_features,
+        'selected_feature_records': selected_feature_records,
+        'selected_source_types': {str(name): source_type_for_column(str(name)) for name in top_features},
         'top_feature_families': [fam for fam, _ in top_family_counts.most_common(4)],
         'training_window_months': int(training_window_months),
         'asset_count_used': int(len(assets)),
+        'resolved_roots': source_roots,
+        'candidate_universe': candidate_universe,
+        'raw_source_candidates': list(candidate_universe["raw_source_candidates"]),
+        'scalar_derived_candidates': list(candidate_universe["scalar_derived_candidates"]),
+        'other_allowed_candidates': list(candidate_universe["other_allowed_candidates"]),
+        'dropped_candidates': dropped_candidates,
+        'variance_filtered_candidates': variance_filtered_candidates,
+        'missingness_notes': missingness_notes,
+        'row_filtering': row_filtering,
+        'feature_evidence': feature_evidence,
+        'fold_stability': fold_stability,
     }
     emit_event_for_path(
         telemetry_path,
@@ -879,6 +1263,7 @@ def run_combo_spec(module: Any, args: argparse.Namespace, interval_minutes: int,
         candidate_feature_count=int(round(mean(row.full_feature_count for row in all_fold_results) or 0)),
         selected_feature_count=int(len(top_features)),
         dynamic_feature_count=int(round(mean(row.full_feature_count for row in all_fold_results) or 0)),
+        **source_roots,
     )
     return {
         'combo_key': combo_spec.key,
@@ -899,7 +1284,15 @@ def append_rows_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     df.to_csv(path, mode='a', header=write_header, index=False)
 
 
-def write_selection_payload(path: Path, *, model_key: str, selections: Dict[str, Dict[str, Any]], cohort_assets: Sequence[str], cohort_asset_aliases: Dict[str, str]) -> None:
+def write_selection_payload(
+    path: Path,
+    *,
+    model_key: str,
+    selections: Dict[str, Dict[str, Any]],
+    cohort_assets: Sequence[str],
+    cohort_asset_aliases: Dict[str, str],
+    resolved_roots: Optional[Dict[str, str]] = None,
+) -> None:
     path.write_text(
         json.dumps(
             {
@@ -908,6 +1301,7 @@ def write_selection_payload(path: Path, *, model_key: str, selections: Dict[str,
                 'selection_file_version': 2,
                 'cohort_assets': [str(asset) for asset in cohort_assets],
                 'cohort_asset_aliases': {str(key): str(value) for key, value in cohort_asset_aliases.items()},
+                'resolved_roots': dict(resolved_roots or {}),
                 'selections': selections,
             },
             indent=2,
@@ -954,10 +1348,23 @@ def main_for_model(model_key: str = DEFAULT_MODEL_KEY) -> None:
     args = parse_args()
     setattr(args, "model_key", str(model_key))
     if args.parquet_root:
-        os.environ.setdefault('PIPELINE_PARQUET_ROOT', str(args.parquet_root.resolve()))
-        os.environ.setdefault('PIPELINE_PARQUET_FEATURES_ROOT', str(args.parquet_root.resolve()))
+        args.parquet_root = Path(args.parquet_root).expanduser().resolve()
+        source_roots = _apply_explicit_stage1_source_root(args.parquet_root)
+    else:
+        source_roots = {}
     spec = get_tabular_numeric_model_spec(model_key)
     module = importlib.import_module(spec.module_import_path)
+    io_config = getattr(module, "IO_CONFIG", None)
+    if io_config is not None:
+        source_roots = {
+            **source_roots,
+            "parquet_root": str(Path(args.parquet_root).resolve()),
+            "ohlcvt_root": str(Path(getattr(io_config, "ohlc_root", Path(args.parquet_root))).resolve()),
+            "scalar_feature_root": str(Path(getattr(io_config, "scalar_root", Path(args.parquet_root))).resolve()),
+        }
+        source_roots["edge_discovery_root"] = source_roots["ohlcvt_root"]
+        source_roots["target_label_root"] = source_roots["ohlcvt_root"]
+    setattr(args, "resolved_source_roots", dict(source_roots))
     supported_tasks, _task_short, _task_label = load_model_task_metadata(spec, args.project_root.resolve())
     combos = parse_combo_list(args.combo_list) if str(args.combo_list).strip() else full_combo_universe(
         module,
@@ -993,6 +1400,7 @@ def main_for_model(model_key: str = DEFAULT_MODEL_KEY) -> None:
         output_rows=len(cohort_assets),
         reason_code=("no_assets" if not cohort_assets else ""),
         source_path=str(args.parquet_root),
+        **dict(source_roots),
     )
     summary_rows: List[Dict[str, Any]] = []
     family_rows_all: List[Dict[str, Any]] = []
@@ -1032,7 +1440,14 @@ def main_for_model(model_key: str = DEFAULT_MODEL_KEY) -> None:
             append_rows_csv(family_path, family_rows)
             append_rows_csv(folds_path, fold_rows)
             completed_combos += 1
-            write_selection_payload(selection_path, model_key=str(model_key), selections=selections, cohort_assets=cohort_assets, cohort_asset_aliases=cohort_asset_aliases)
+            write_selection_payload(
+                selection_path,
+                model_key=str(model_key),
+                selections=selections,
+                cohort_assets=cohort_assets,
+                cohort_asset_aliases=cohort_asset_aliases,
+                resolved_roots=dict(source_roots),
+            )
             write_progress_payload(
                 progress_path,
                 model_key=str(model_key),
@@ -1052,7 +1467,14 @@ def main_for_model(model_key: str = DEFAULT_MODEL_KEY) -> None:
     summary_df.to_csv(summary_path, index=False)
     family_df.to_csv(family_path, index=False)
     fold_df.to_csv(folds_path, index=False)
-    write_selection_payload(selection_path, model_key=str(model_key), selections=selections, cohort_assets=cohort_assets, cohort_asset_aliases=cohort_asset_aliases)
+    write_selection_payload(
+        selection_path,
+        model_key=str(model_key),
+        selections=selections,
+        cohort_assets=cohort_assets,
+        cohort_asset_aliases=cohort_asset_aliases,
+        resolved_roots=dict(source_roots),
+    )
     emit_event_for_path(
         output_dir,
         family="Tabular_Numeric",
