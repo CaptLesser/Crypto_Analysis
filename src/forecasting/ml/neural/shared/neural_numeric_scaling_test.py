@@ -340,7 +340,7 @@ def _origin_metrics(
     if selected_feature_columns is None:
         feat_cols = candidate_cols
     else:
-        feat_cols = [str(col) for col in selected_feature_columns if str(col) in candidate_cols]
+        feat_cols = [str(col) for col in selected_feature_columns if str(col) in merged.columns]
     use_dynamic_features = bool(getattr(module.MODULE_SPEC, "needs_dynamic_features", False)) if selected_feature_columns is None else bool(feat_cols)
     feat_matrix = None
     if use_dynamic_features and feat_cols:

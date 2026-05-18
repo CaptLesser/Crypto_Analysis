@@ -250,7 +250,7 @@ def _load_asset_frame(
     if selected_feature_columns is None:
         feature_columns.extend(dynamic_feature_candidates)
     else:
-        selected_dynamic = [str(c) for c in selected_feature_columns if str(c) in dynamic_feature_candidates]
+        selected_dynamic = [str(c) for c in selected_feature_columns if str(c)]
         feature_columns.extend(selected_dynamic)
     with telemetry_scope_for_path(
         telemetry_path,
@@ -390,7 +390,7 @@ def _origin_metrics(
     if selected_feature_columns is None:
         feat_cols = candidate_cols
     else:
-        feat_cols = [str(c) for c in selected_feature_columns if str(c) in candidate_cols]
+        feat_cols = [str(c) for c in selected_feature_columns if str(c) in merged.columns]
     feat_cols = [str(c) for c in feat_cols if str(c) in merged.columns and merged[str(c)].notna().any()]
     feat_matrix = None
     if module.MODULE_SPEC.needs_dynamic_features and feat_cols:

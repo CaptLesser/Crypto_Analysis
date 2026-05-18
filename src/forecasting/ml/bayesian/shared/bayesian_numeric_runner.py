@@ -57,9 +57,11 @@ from src.forecasting.ml.shared.numeric_runner_common import (
     project_root as _project_root,
     raise_writer_fatal as _shared_raise_writer_fatal,
     resolve_combo_fit_days as _shared_resolve_combo_fit_days,
+    require_production_stream_scope_contract as _shared_require_production_stream_scope_contract,
     resolve_model_state_root as _shared_resolve_model_state_root,
     resolve_dispatch_slots as _resolve_dispatch_slots,
     resolve_min_env_int as _shared_resolve_min_env_int,
+    resolve_production_stream_scope_contract as _shared_resolve_production_stream_scope_contract,
     resolve_progress_every_seconds as _shared_resolve_progress_every_seconds,
     resolve_runner_model_threads as _resolve_runner_model_threads,
     save_unit_state as _shared_save_unit_state,
@@ -1210,22 +1212,39 @@ def run_bayesian_numeric_module(spec: BayesianNumericModuleSpec) -> None:
     quantiles = sorted(set(parse_quantiles(args.quantiles, default_vals=(0.1, 0.5, 0.9))) | {0.1, 0.5, 0.9})
     using_default_combo_selection = not str(args.combo_list).strip()
     production_scope = discover_existing_production_scope(spec, manifest_path=files.manifest_file, canonical_io_config=canonical_io_config) if using_default_combo_selection else None
-    tested_scope = discover_tested_production_artifact_scope(spec) if using_default_combo_selection and production_scope is None else None
-    if production_scope is not None:
+    tested_scope = None
+    tested_scope_error = None
+    stream_contract = None
+    if using_default_combo_selection:
+        try:
+            tested_scope = discover_tested_production_artifact_scope(spec)
+        except BaseException as exc:
+            tested_scope_error = exc
+        stream_contract = _shared_require_production_stream_scope_contract(
+            _shared_resolve_production_stream_scope_contract(
+                family="bayesian",
+                model=spec.module_tag,
+                existing_scope=production_scope,
+                tested_scope=tested_scope,
+                tested_scope_error=tested_scope_error,
+                production_paths_inspected=(forecast_root, files.manifest_file),
+            )
+        )
+    if stream_contract is not None and stream_contract.mode == "locked_to_existing_production":
         print(
-            f"[{utc_now_iso()}] [{spec.module_tag}] production-defaults root={production_scope.source_root} "
-            f"combos={len(production_scope.combo_specs)} "
-            f"asset_scope=existing_production_scope",
+            f"[{utc_now_iso()}] [{spec.module_tag}] production-defaults root={production_scope.source_root if production_scope is not None else forecast_root} "
+            f"combos={len(stream_contract.combo_specs)} "
+            f"asset_scope=existing_production_scope scope_mode={stream_contract.mode} warnings={';'.join(stream_contract.warnings)}",
             flush=True,
         )
-    elif tested_scope is not None:
+    elif stream_contract is not None and stream_contract.mode == "bootstrap_from_test" and tested_scope is not None:
         print(
             f"[{utc_now_iso()}] [{spec.module_tag}] tested-defaults handoff={tested_scope.handoff_path} "
             f"feature_profile_json={tested_scope.feature_profile_json} cohort_assets={len(tested_scope.cohort_assets)} "
             f"combo_source={'stage3' if tested_scope.stage3_combo_specs else 'stage2'} "
             f"combos={len(tested_scope.stage3_combo_specs or tested_scope.combo_specs)} "
             f"stage3_combo_results={tested_scope.stage3_combo_results_path} "
-            f"asset_scope=full_production_universe",
+            f"asset_scope=full_production_universe scope_mode={stream_contract.mode}",
             flush=True,
         )
     assets = load_assets(intervals=spec.default_intervals, assets_arg=args.assets, assets_file=args.assets_file)
@@ -1233,7 +1252,7 @@ def run_bayesian_numeric_module(spec: BayesianNumericModuleSpec) -> None:
         write_json_atomic(files.skipped_file, {"run_id": "none", "generated_at": utc_now_iso(), "units": {}})
         return
 
-    combos = _parse_combo_list(args.combo_list) if str(args.combo_list).strip() else list((production_scope.combo_specs if production_scope is not None else tested_scope.stage3_combo_specs or tested_scope.combo_specs if tested_scope is not None else spec.resolve_default_combo_specs_fn()))
+    combos = _parse_combo_list(args.combo_list) if str(args.combo_list).strip() else list(stream_contract.combo_specs if stream_contract is not None else ())
     combos = sorted({(int(i), int(h), str(t)) for i, h, t in combos if int(i) > 0 and int(h) > 0 and int(h) % int(i) == 0}, key=lambda item: (item[0], item[1], item[2]))
     tested_combo_window_months = _combo_window_map(tested_scope)
     run_id = os.getenv("RUN_ID", "") or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")

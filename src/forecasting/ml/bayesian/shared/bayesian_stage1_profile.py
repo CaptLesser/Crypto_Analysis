@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
+from src.forecasting.ml.shared.stage1_candidate_universe import STRUCTURAL_TOKEN_NAMES, is_dynamic_input_column
+
 
 def _combo_key(interval: int, horizon: int, task: str) -> str:
     return f"interval={int(interval)}|horizon={int(horizon)}|task={str(task)}"
@@ -45,6 +47,24 @@ def combo_payload(
     return dict(entry) if isinstance(entry, dict) else {}
 
 
+def _fallback_dynamic_columns(
+    selected_features: Sequence[str],
+    dynamic_feature_candidates: Sequence[str],
+) -> tuple[str, ...]:
+    candidate_set = {str(value) for value in dynamic_feature_candidates if str(value)}
+    selected: list[str] = []
+    for value in selected_features:
+        feature_name = str(value)
+        if feature_name in candidate_set:
+            selected.append(feature_name)
+            continue
+        if feature_name in STRUCTURAL_TOKEN_NAMES:
+            continue
+        if is_dynamic_input_column(feature_name):
+            selected.append(feature_name)
+    return tuple(selected)
+
+
 def resolve_execution_profile(
     feature_profile_json: Path | Dict[str, Any],
     *,
@@ -63,10 +83,7 @@ def resolve_execution_profile(
     if explicit_dynamic_columns:
         selected_dynamic_feature_columns = explicit_dynamic_columns
     else:
-        dynamic_candidates = {str(value) for value in dynamic_feature_candidates}
-        selected_dynamic_feature_columns = tuple(
-            str(value) for value in selected_features if str(value) in dynamic_candidates
-        )
+        selected_dynamic_feature_columns = _fallback_dynamic_columns(selected_features, dynamic_feature_candidates)
     seasonality_mode = str(selected_formulation.get("seasonality_mode", "")).strip().lower()
     seasonality_enabled = bool(use_seasonality)
     if seasonality_mode:

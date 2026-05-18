@@ -40,7 +40,9 @@ from src.forecasting.ml.shared.numeric_runtime_common import (
     discover_tabular_existing_production_scope as _discover_tabular_existing_production_scope,
     discover_tabular_tested_production_artifact_scope as _discover_tabular_tested_production_artifact_scope,
     env_int as _env_int,
+    require_production_stream_scope_contract as _require_production_stream_scope_contract,
     resolve_planning_workers as _resolve_planning_workers,
+    resolve_production_stream_scope_contract as _resolve_production_stream_scope_contract,
 )
 from src.forecasting.ml.tabular.shared.numeric_forecast_cli import (
     horizons_for_interval,
@@ -170,6 +172,7 @@ def discover_existing_production_scope(spec: NumericFamilyModuleSpec, io_config:
             task=str(task),
         )
         or {},
+        io_config=io_config,
     )
 
 
@@ -393,19 +396,37 @@ def build_numeric_family_module(spec: NumericFamilyModuleSpec) -> Dict[str, Any]
         tasks = parse_requested_tasks_fn(args.tasks)
         using_default_combo_selection = not explicit_combo_profile_list and not explicit_combo_window_list and not explicit_combo_list and not explicit_intervals and not explicit_horizons and not str(args.tasks).strip()
         production_scope = discover_existing_production_scope(spec, io_config) if using_default_combo_selection else None
-        tested_scope = discover_tested_production_artifact_scope_fn() if using_default_combo_selection and production_scope is None else None
-        if production_scope is not None:
+        tested_scope = None
+        tested_scope_error = None
+        stream_contract = None
+        if using_default_combo_selection:
+            try:
+                tested_scope = discover_tested_production_artifact_scope_fn()
+            except BaseException as exc:
+                tested_scope_error = exc
+            stream_contract = _require_production_stream_scope_contract(
+                _resolve_production_stream_scope_contract(
+                    family="tabular",
+                    model=spec.module_slug,
+                    existing_scope=production_scope,
+                    tested_scope=tested_scope,
+                    tested_scope_error=tested_scope_error,
+                    production_paths_inspected=(io_config.parquet_root, io_config.state_root),
+                )
+            )
+        if stream_contract is not None and stream_contract.mode == "locked_to_existing_production":
             log(
                 f"{spec.log_prefix}[production-defaults] state_root={io_config.state_root.resolve()} "
-                f"combos={len(production_scope)} asset_scope=existing_production_scope"
+                f"combos={len(stream_contract.combo_windows or stream_contract.combo_specs)} asset_scope=existing_production_scope "
+                f"scope_mode={stream_contract.mode} warnings={';'.join(stream_contract.warnings)}"
             )
-        elif tested_scope is not None:
+        elif stream_contract is not None and stream_contract.mode == "bootstrap_from_test" and tested_scope is not None:
             os.environ.setdefault("TABULAR_NUMERIC_FEATURE_SELECTION_FILE", str(tested_scope.feature_profile_json))
             log(
                 f"{spec.log_prefix}[tested-defaults] handoff={tested_scope.handoff_path} "
                 f"feature_profile_json={tested_scope.feature_profile_json} "
                 f"cohort_assets={len(tested_scope.cohort_assets)} combos={len(tested_scope.combo_windows)} "
-                f"asset_scope=full_production_universe"
+                f"asset_scope=full_production_universe scope_mode={stream_contract.mode}"
             )
 
         if explicit_combo_profile_list:
@@ -429,7 +450,7 @@ def build_numeric_family_module(spec: NumericFamilyModuleSpec) -> Dict[str, Any]
             ]
             resolved_combo_profiles = [(int(interval), int(hm), str(task), int(months), str(explicit_refit_cadence) if explicit_refit_cadence else None) for interval, hm, task, months in resolved_combo_windows]
         elif using_default_combo_selection:
-            resolved_combo_windows = list(production_scope if production_scope is not None else tested_scope.combo_windows if tested_scope is not None else spec.resolve_default_combo_profile_fn())
+            resolved_combo_windows = list(stream_contract.combo_windows if stream_contract is not None else ())
             resolved_combos = [(int(interval), int(hm), str(task)) for interval, hm, task, _ in resolved_combo_windows]
             if explicit_train_window_months is not None:
                 resolved_combo_windows = [(int(interval), int(hm), str(task), int(explicit_train_window_months)) for interval, hm, task in resolved_combos]

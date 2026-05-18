@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 from src.forecasting.common.path_config import resolve_path, selected_profile
 from src.forecasting.ml.bayesian.shared.bayesian_numeric_cohort import resolve_bayesian_cohort_assets
 from src.forecasting.ml.bayesian.shared.bayesian_numeric_model_registry import BAYESIAN_NUMERIC_BRANCHES
+from src.forecasting.ml.shared.stage1_candidate_universe import build_stage1_candidate_universe
 from src.forecasting.ml.shared.stage1_dynamic_feature_selection import select_stage1_dynamic_feature_columns
 from src.forecasting.ml.shared.feature_profile_common import combo_selection_key
 from src.forecasting.ml.shared.test_branch_function_telemetry import emit_event_for_path
@@ -55,6 +56,17 @@ def parse_args() -> argparse.Namespace:
 
 def _split_csv(raw: str) -> List[str]:
     return [part.strip() for part in str(raw).split(",") if part.strip()]
+
+
+def _resolved_source_roots(parquet_root: Path) -> Dict[str, str]:
+    root = Path(parquet_root).expanduser().resolve()
+    return {
+        "parquet_root": str(root),
+        "ohlcvt_root": str(root),
+        "scalar_feature_root": str(root),
+        "edge_discovery_root": str(root),
+        "target_label_root": str(root),
+    }
 
 
 def _parse_int_csv(raw: str, default: Sequence[int]) -> List[int]:
@@ -147,6 +159,90 @@ def _default_formulation_options(stage1_spec: BayesianStage1Spec) -> Dict[str, L
     return {"history_schema": ["target_history"]}
 
 
+def _structural_stage1_contract(stage1_spec: BayesianStage1Spec) -> Dict[str, Any]:
+    model_key = str(stage1_spec.model_key)
+    if model_key == "stochastic_vol":
+        return {
+            "scalar_feature_search_performed": False,
+            "scalar_feature_search_reason": "stochastic_vol is a target-history volatility-state model; this Stage 1 branch does not search scalar exogenous columns.",
+            "stage1_decision_basis": {
+                "kind": "fixed_default_recorded",
+                "data_derived_in_stage1": False,
+                "deferred_to": ["stage2_validation", "stage3_validation"],
+                "note": "Stage 1 records the active volatility-state formulation and cohort/combo scope; model-quality selection is deferred to later validation stages.",
+            },
+            "stage1_selected_instead": ["target_schema", "observation_transform", "volatility_asymmetry_formulation"],
+            "model_specific_stage1_intent": {
+                "target_schema": "choose the target-history schema used to represent realized volatility or return scale",
+                "observation_transform": "choose the observation transform used by the volatility state update",
+                "volatility_asymmetry_formulation": "choose symmetric or asymmetric volatility behavior supported by the model contract",
+            },
+            "data_derived_evidence_used": {
+                "evidence_kind": "cohort_and_combo_scope_only",
+                "note": "Slim Stage 1 resolves task/interval/horizon/cohort coverage; model quality remains data-derived in Stage 2/3 validation, not scalar column search.",
+            },
+        }
+    if model_key == "copula_dependency":
+        return {
+            "scalar_feature_search_performed": False,
+            "scalar_feature_search_reason": "copula_dependency uses target history plus a factor/dependency cache; broad scalar feature search is outside this formulation.",
+            "stage1_decision_basis": {
+                "kind": "fixed_default_recorded",
+                "data_derived_in_stage1": False,
+                "deferred_to": ["stage2_validation", "stage3_validation"],
+                "note": "Stage 1 records the active dependency/marginal/factor setup and cohort/combo scope; dependency quality is validated downstream.",
+            },
+            "stage1_selected_instead": ["dependency_schema", "marginal_transform", "factor_dependency_setup"],
+            "model_specific_stage1_intent": {
+                "dependency_schema": "choose the dependency link between target history and factor history",
+                "marginal_transform": "choose the marginal transform used before dependency modeling",
+                "factor_dependency_setup": "choose the factor/dependency setup consumed by factor_hist/factor_last",
+            },
+            "data_derived_evidence_used": {
+                "evidence_kind": "cohort_and_combo_scope_only",
+                "note": "Slim Stage 1 records the factor-dependent structural path; factor availability and performance are validated downstream.",
+            },
+        }
+    if model_key == "tail_risk":
+        return {
+            "scalar_feature_search_performed": False,
+            "scalar_feature_search_reason": "tail_risk models target-history tail exceedances; it does not consume broad scalar exogenous feature columns.",
+            "stage1_decision_basis": {
+                "kind": "fixed_default_recorded",
+                "data_derived_in_stage1": False,
+                "deferred_to": ["stage2_validation", "stage3_validation"],
+                "note": "Stage 1 records the active tail schema/threshold/exceedance rule and cohort/combo scope; tail behavior is validated downstream.",
+            },
+            "stage1_selected_instead": ["tail_schema", "threshold_family", "exceedance_rule"],
+            "model_specific_stage1_intent": {
+                "tail_schema": "choose one-tail or two-tail target-history tail structure",
+                "threshold_family": "choose fixed/adaptive quantile threshold family",
+                "exceedance_rule": "choose the rolling exceedance rule used to define tail observations",
+            },
+            "data_derived_evidence_used": {
+                "evidence_kind": "cohort_and_combo_scope_only",
+                "note": "Slim Stage 1 records tail formulation candidates; exceedance behavior is exercised by downstream Stage 2/3 runs.",
+            },
+        }
+    return {
+        "scalar_feature_search_performed": bool(stage1_spec.needs_dynamic_features),
+        "scalar_feature_search_reason": (
+            "dynamic exogenous model performs scalar feature selection"
+            if stage1_spec.needs_dynamic_features
+            else "model Stage 1 does not require broad scalar feature search"
+        ),
+        "stage1_selected_instead": [],
+        "model_specific_stage1_intent": {},
+        "data_derived_evidence_used": {},
+        "stage1_decision_basis": {
+            "kind": "unknown",
+            "data_derived_in_stage1": False,
+            "deferred_to": [],
+            "note": "No model-specific structural Stage 1 contract is defined.",
+        },
+    }
+
+
 def _resolve_stage1_payload(stage1_spec: BayesianStage1Spec) -> Dict[str, Any]:
     feature_blocks = _default_feature_blocks(stage1_spec)
     formulation_options = _default_formulation_options(stage1_spec)
@@ -165,6 +261,11 @@ def _resolve_stage1_payload(stage1_spec: BayesianStage1Spec) -> Dict[str, Any]:
             "selected_features": selected_features or ["target_history"],
             "formulation_options": formulation_options,
             "selected_formulation": formulation_choice,
+            "scalar_feature_search_performed": bool(stage1_spec.needs_dynamic_features),
+            "scalar_feature_search_reason": "dynamic Bayesian model searches scalar/raw exogenous candidates for x_hist/x_last",
+            "stage1_selected_instead": ["dynamic_exogenous_feature_subset"],
+            "model_specific_stage1_intent": {"dynamic_features": "select useful scalar/raw exogenous predictors for this task/interval/horizon"},
+            "data_derived_evidence_used": {"evidence_kind": "dynamic_feature_relationship_scores"},
         }
     formulation_choice = {name: values[0] for name, values in formulation_options.items() if values}
     selected_features = ["target_history"]
@@ -179,6 +280,8 @@ def _resolve_stage1_payload(stage1_spec: BayesianStage1Spec) -> Dict[str, Any]:
         "selected_features": selected_features,
         "formulation_options": formulation_options,
         "selected_formulation": formulation_choice,
+        "candidates_options_considered": formulation_options,
+        **_structural_stage1_contract(stage1_spec),
     }
 
 
@@ -196,6 +299,8 @@ def main_for_model(model_key: str) -> Path:
     if str(model_key) not in BAYESIAN_NUMERIC_BRANCHES:
         raise ValueError(f"Unsupported Bayesian model key: {model_key}")
     args = parse_args()
+    args.parquet_root = Path(args.parquet_root).expanduser().resolve()
+    source_roots = _resolved_source_roots(args.parquet_root)
     stage1_spec = _load_stage1_spec(str(model_key))
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -226,6 +331,7 @@ def main_for_model(model_key: str) -> Path:
         output_rows=len(cohort_assets),
         reason_code=("no_assets" if not cohort_assets else ""),
         source_path=str(args.parquet_root),
+        **source_roots,
     )
     generated_at = datetime.now(timezone.utc).isoformat()
 
@@ -235,21 +341,36 @@ def main_for_model(model_key: str) -> Path:
         payload_bits = _resolve_stage1_payload(stage1_spec)
         selected_dynamic_feature_columns: List[str] = []
         selected_features = list(payload_bits["selected_features"])
-        if bool(stage1_spec.needs_dynamic_features) and stage1_spec.dynamic_feature_candidates:
-            selected_dynamic_feature_columns = select_stage1_dynamic_feature_columns(
+        candidate_universe = None
+        dynamic_selection_report = None
+        if bool(stage1_spec.needs_dynamic_features):
+            candidate_universe = build_stage1_candidate_universe(
+                model_family="bayesian_numeric",
+                model_key=str(model_key),
+                preferred_feature_names=stage1_spec.dynamic_feature_candidates,
+                feature_blocks=stage1_spec.stage1_feature_blocks,
+                include_raw_source=True,
+            )
+            selection_result = select_stage1_dynamic_feature_columns(
                 parquet_root=Path(args.parquet_root).resolve(),
                 asset_list=cohort_assets,
                 interval_minutes=int(interval_minutes),
                 horizon_minutes=int(horizon_minutes),
                 task=str(task),
                 training_window_months=int(args.train_window_months),
-                requested_feature_names=stage1_spec.dynamic_feature_candidates,
+                requested_feature_names=candidate_universe.candidate_columns,
                 telemetry_path=output_dir,
                 family="Bayesian_Numeric",
                 model=str(model_key),
                 stage="stage1",
                 combo_key=combo_selection_key(int(interval_minutes), int(horizon_minutes), str(task)),
+                return_report=True,
             )
+            if hasattr(selection_result, "selected_features"):
+                dynamic_selection_report = selection_result
+                selected_dynamic_feature_columns = [str(value) for value in getattr(selection_result, "selected_features")]
+            else:
+                selected_dynamic_feature_columns = [str(value) for value in selection_result]
             if selected_dynamic_feature_columns:
                 selected_features = list(selected_dynamic_feature_columns)
         combo_key = combo_selection_key(int(interval_minutes), int(horizon_minutes), str(task))
@@ -268,6 +389,19 @@ def main_for_model(model_key: str) -> Path:
             "selected_dynamic_feature_columns": list(selected_dynamic_feature_columns),
             "formulation_options": dict(payload_bits["formulation_options"]),
             "selected_formulation": dict(payload_bits["selected_formulation"]),
+            "scalar_feature_search_performed": bool(payload_bits.get("scalar_feature_search_performed", False)),
+            "scalar_feature_search_reason": str(payload_bits.get("scalar_feature_search_reason", "")),
+            "stage1_selected_instead": list(payload_bits.get("stage1_selected_instead") or []),
+            "candidates_options_considered": dict(payload_bits.get("candidates_options_considered") or payload_bits.get("formulation_options") or {}),
+            "stage1_decision_basis": dict(payload_bits.get("stage1_decision_basis") or {}),
+            "data_derived_evidence_used": {
+                **dict(payload_bits.get("data_derived_evidence_used") or {}),
+                "asset_count": int(len(cohort_assets)),
+                "training_window_months": int(args.train_window_months),
+                "combo_key": combo_selection_key(int(interval_minutes), int(horizon_minutes), str(task)),
+            },
+            "final_selected_formulation_settings": dict(payload_bits["selected_formulation"]),
+            "model_specific_stage1_intent": dict(payload_bits.get("model_specific_stage1_intent") or {}),
             "asset_count_used": int(len(cohort_assets)),
             "cohort_assets": list(cohort_assets),
             "training_window_months": int(args.train_window_months),
@@ -275,7 +409,18 @@ def main_for_model(model_key: str) -> Path:
             "needs_factor_cache": bool(stage1_spec.needs_factor_cache),
             "uses_seasonality": bool(stage1_spec.use_seasonality),
             "selection_status": "complete",
+            "resolved_roots": source_roots,
         }
+        if candidate_universe is not None:
+            entry["candidate_universe"] = candidate_universe.to_artifact()
+            entry["stale_or_missing_candidates"] = list(candidate_universe.stale_or_missing_candidates)
+            entry["alias_resolutions"] = list(candidate_universe.alias_resolutions)
+        if dynamic_selection_report is not None:
+            report_payload = dynamic_selection_report.to_artifact()
+            entry["dynamic_selection_report"] = report_payload
+            entry["dynamic_feature_scores"] = list(report_payload.get("feature_scores") or [])
+            entry["dynamic_dropped_candidates"] = list(report_payload.get("dropped_candidates") or [])
+            entry["dynamic_redundancy_groups"] = list(report_payload.get("redundancy_groups") or [])
         selections[combo_key] = entry
         summary_rows.append(entry)
 
@@ -290,6 +435,7 @@ def main_for_model(model_key: str) -> Path:
         "tasks": [str(v) for v in tasks],
         "horizon_minutes": [int(v) for v in horizons],
         "cohort_assets": list(cohort_assets),
+        "resolved_roots": source_roots,
         "selections": selections,
     }
     (output_dir / "feature_profile_selection.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -338,6 +484,7 @@ def main_for_model(model_key: str) -> Path:
         "expected_combo_count": int(len(combos)),
         "completed_combo_count": int(len(combos)),
         "missing_combo_keys": [],
+        "resolved_roots": source_roots,
         "generated_at": generated_at,
     }
     (output_dir / "feature_experiment_progress.json").write_text(json.dumps(progress_payload, indent=2), encoding="utf-8")
@@ -352,6 +499,7 @@ def main_for_model(model_key: str) -> Path:
         "missing_combo_keys": [],
         "cohort_assets": list(cohort_assets),
         "training_window_months": int(args.train_window_months),
+        "resolved_roots": source_roots,
         "generated_at": generated_at,
     }
     (output_dir / "feature_experiment_run_meta.json").write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")

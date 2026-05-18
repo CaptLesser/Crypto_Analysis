@@ -19,9 +19,9 @@ USE_SEASONALITY = False
 NEEDS_DYNAMIC_FEATURES = True
 NEEDS_FACTOR_CACHE = False
 DYNAMIC_FEATURE_CANDIDATES = (
-    "log_return", "ret_std_14", "ret_std_30", "ret_std_60", "ret_std_120", "atr_14", "atr_30",
-    "rsi_14", "macd", "macd_signal", "macd_hist", "zscore_30", "zscore_60", "ema_gap_12_26",
-    "range_efficiency_30", "volume_zscore_30",
+    "log_return", "ret_std_20", "atr_14", "atr_pct_14", "true_range_pct", "parkinson_vol_20",
+    "rsi_14", "macd_12_26_9", "macd_signal_12_26_9", "macd_hist_12_26_9", "zscore_20",
+    "range_efficiency_20", "range_efficiency_50", "range_efficiency_100", "volume_zscore_20",
 )
 MODEL_PARAMS: Dict[str, Any] = {
     "global_shrinkage": 1.0,
@@ -44,10 +44,10 @@ def predict_batch_fn(*, origin_batch: Sequence[Dict[str, Any]]) -> Sequence[Tupl
 
 STAGE1_MODE = "full"
 STAGE1_FEATURE_BLOCKS = {
-    "return_context": ["log_return", "zscore_30", "zscore_60", "ema_gap_12_26"],
-    "volatility_context": ["ret_std_14", "ret_std_30", "ret_std_60", "ret_std_120", "atr_14", "atr_30"],
-    "momentum_context": ["rsi_14", "macd", "macd_signal", "macd_hist"],
-    "efficiency_volume_context": ["range_efficiency_30", "volume_zscore_30"],
+    "return_context": ["log_return", "zscore_20"],
+    "volatility_context": ["ret_std_20", "atr_14", "atr_pct_14", "true_range_pct", "parkinson_vol_20"],
+    "momentum_context": ["rsi_14", "macd_12_26_9", "macd_signal_12_26_9", "macd_hist_12_26_9"],
+    "efficiency_volume_context": ["range_efficiency_20", "range_efficiency_50", "range_efficiency_100", "volume_zscore_20"],
 }
 STAGE1_FORMULATION_OPTIONS = {
     "predictor_dynamics": ["dynamic_feature_block", "static_feature_block"],

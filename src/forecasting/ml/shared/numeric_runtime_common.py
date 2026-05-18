@@ -9,9 +9,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from src.forecasting.common.ml_module_utils import get_module_logger
 from src.forecasting.ml.shared.numeric_runner_common import (
+    ProductionStreamScopeContract,
+    discover_existing_combo_specs_from_canonical_physical_output as _discover_existing_combo_specs_from_canonical_physical_output,
     discover_existing_combo_windows_from_state_tree as _discover_existing_combo_windows_from_state_tree,
     json_load_dict as _load_json_dict,
     project_root as _project_root,
+    require_production_stream_scope_contract,
+    resolve_production_stream_scope_contract,
 )
 
 
@@ -153,8 +157,9 @@ def discover_tabular_existing_production_scope(
     state_root: Path,
     infer_training_window_months_fn: Callable[[int, int, str, Optional[int]], int],
     load_state_fn: Callable[[str, int, int, str], Dict[str, Any]],
+    io_config: Any = None,
 ) -> Optional[Tuple[Tuple[int, int, str, int], ...]]:
-    combos = _discover_existing_combo_windows_from_state_tree(
+    state_combos = _discover_existing_combo_windows_from_state_tree(
         state_root=Path(state_root),
         infer_training_window_months_fn=lambda interval, horizon_minutes, task, selected_window_bars: infer_training_window_months_fn(
             int(interval),
@@ -170,4 +175,27 @@ def discover_tabular_existing_production_scope(
         )
         or {},
     )
-    return combos or None
+    if io_config is not None:
+        parquet_combos = _discover_existing_combo_specs_from_canonical_physical_output(io_config=io_config)
+        if parquet_combos:
+            state_months = {
+                (int(interval), int(horizon), str(task)): int(months)
+                for interval, horizon, task, months in state_combos
+            }
+            return tuple(
+                sorted(
+                    (
+                        int(interval),
+                        int(horizon),
+                        str(task),
+                        int(
+                            state_months.get(
+                                (int(interval), int(horizon), str(task)),
+                                infer_training_window_months_fn(int(interval), int(horizon), str(task), None),
+                            )
+                        ),
+                    )
+                    for interval, horizon, task in parquet_combos
+                )
+            )
+    return state_combos or None

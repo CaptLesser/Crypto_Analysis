@@ -18,7 +18,18 @@ DEFAULT_TASKS = ("log_return", "realized_vol", "true_range", "max_drawdown", "ma
 USE_SEASONALITY = True
 NEEDS_DYNAMIC_FEATURES = True
 NEEDS_FACTOR_CACHE = False
-DYNAMIC_FEATURE_CANDIDATES = ("log_return", "ret_std_14", "ret_std_30", "atr_14", "rsi_14", "macd", "zscore_30", "ema_gap_12_26", "range_efficiency_30", "volume_zscore_30")
+DYNAMIC_FEATURE_CANDIDATES = (
+    "log_return",
+    "ret_std_20",
+    "atr_14",
+    "atr_pct_14",
+    "rsi_14",
+    "macd_12_26_9",
+    "zscore_20",
+    "range_efficiency_20",
+    "range_efficiency_50",
+    "volume_zscore_20",
+)
 MODEL_PARAMS: Dict[str, Any] = {
     "level_smoothing": 0.08,
     "trend_smoothing": 0.08,
