@@ -1394,7 +1394,7 @@ def _build_cycle15_safety_expansion_summary(
         },
         "temporary_probe_evidence_status": "design_note_only_not_official_production_evidence",
         "temporary_single_add_design_note": (
-            "Pass 1 temporary probes under D:/pipeline_codex_temp are not official cycle artifacts and do not authorize "
+            "Pass 1 temporary probes under the configured Codex scratch root are not official cycle artifacts and do not authorize "
             "production changes; they only motivate the Cycle 15 bounded run."
         ),
         "production_label_change": False,
@@ -2017,7 +2017,7 @@ def _augment_cycle5_real_artifacts(
 ) -> None:
     output_root = Path(output_root)
     files_read = int(len(source_files))
-    source_policy = "bounded Jan-Mar 2026 asset/interval parquet files touched under D:/pipeline/parquet"
+    source_policy = "bounded Jan-Mar 2026 asset/interval parquet files touched under the configured source parquet root"
     scope = {
         "layer": config.layer,
         "axis": config.axis,
