@@ -7,6 +7,7 @@ from src.regimes.core.contracts import require_schema_version
 from src.regimes.core.serialization import dumps_json, to_jsonable
 from src.regimes.regime_features.cross_asset_feature_catalog import (
     CROSS_ASSET_RELATIONSHIP_FEATURE_SCHEMA_VERSION,
+    DIAGNOSTIC_PROCESS2_FEATURES,
     RELATIONSHIP_FEATURE_CATALOG_ID,
     V1_FEATURE_FIELDS,
     default_cross_asset_relationship_feature_catalog,
@@ -40,6 +41,7 @@ CROSS_ASSET_FEATURE_ROW_REQUIRED_FIELDS: tuple[str, ...] = (
     "feature_catalog_id",
     "feature_family",
     *V1_FEATURE_FIELDS,
+    *DIAGNOSTIC_PROCESS2_FEATURES,
     *SIDE_CAR_AVAILABILITY_FIELDS,
     "schema_version",
     "artifact_boundary",
@@ -231,6 +233,7 @@ def cross_asset_feature_rows_schema() -> dict[str, Any]:
         "row_grain": CROSS_ASSET_FEATURE_ROW_GRAIN,
         "required_fields": list(CROSS_ASSET_FEATURE_ROW_REQUIRED_FIELDS),
         "v1_feature_fields": list(V1_FEATURE_FIELDS),
+        "diagnostic_process2_feature_fields": list(DIAGNOSTIC_PROCESS2_FEATURES),
         "sidecar_availability_fields": list(SIDE_CAR_AVAILABILITY_FIELDS),
         "deferred_timestamp_grain_expansion": True,
         "one_column_per_related_asset_allowed": False,
@@ -262,9 +265,14 @@ def validate_cross_asset_feature_row(row: CrossAssetRelationshipFeatureRow | Map
     if bool(boundary.get("one_column_per_related_asset_allowed", False)):
         raise ValueError("Cross-Asset feature row must not allow one-column-per-related-asset schema")
     for field in V1_FEATURE_FIELDS:
+        if field == "top_peer_count":
+            _nonnegative_int(payload[field], field_name=field)
+        else:
+            _finite_float(payload[field], field_name=field)
+    for field in DIAGNOSTIC_PROCESS2_FEATURES:
         if field == "peer_signal_availability_status":
             _text(payload[field], field_name=field)
-        elif field in {"stable_edge_count", "candidate_edge_count", "top_peer_count"}:
+        elif field in {"stable_edge_count", "candidate_edge_count"}:
             _nonnegative_int(payload[field], field_name=field)
         else:
             _finite_float(payload[field], field_name=field)

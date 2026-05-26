@@ -23,13 +23,14 @@ from src.regimes.core.clusterer_base import (
 )
 
 try:
-    from sklearn.cluster import AgglomerativeClustering, KMeans, MiniBatchKMeans, OPTICS
+    from sklearn.cluster import AgglomerativeClustering, Birch, KMeans, MiniBatchKMeans, OPTICS
     from sklearn.mixture import BayesianGaussianMixture, GaussianMixture
 
     _HAS_SKLEARN = True
     _SKLEARN_IMPORT_ERROR: str | None = None
 except Exception as exc:  # pragma: no cover - exercised only in minimal dependency environments
     AgglomerativeClustering = None  # type: ignore[assignment]
+    Birch = None  # type: ignore[assignment]
     KMeans = None  # type: ignore[assignment]
     MiniBatchKMeans = None  # type: ignore[assignment]
     OPTICS = None  # type: ignore[assignment]
@@ -87,8 +88,9 @@ TIER_A_CLUSTERERS: tuple[str, ...] = (
     "hdbscan",
     "optics",
     "agglomerative",
+    "birch",
 )
-TIER_B_PLACEHOLDER_CLUSTERERS: tuple[str, ...] = ("birch", "spectral_clustering")
+TIER_B_PLACEHOLDER_CLUSTERERS: tuple[str, ...] = ("spectral_clustering",)
 
 _ALL_AXES = tuple(dict.fromkeys(axis for axes in REGIME_LAYER_AXES.values() for axis in axes))
 
@@ -1042,6 +1044,45 @@ class AgglomerativeAdapter(RegimeClustererAdapter):
         raise NotImplementedError("AgglomerativeClustering has no stable native predict; use refit_recluster")
 
 
+class BirchAdapter(RegimeClustererAdapter):
+    spec = RegimeClustererSpec(
+        family_name="birch",
+        library_source="sklearn.cluster.Birch",
+        tier="tier_a",
+        inductive_classification=INDUCTIVE,
+        assignment_policy=ASSIGNMENT_NATIVE_PREDICT,
+        supports_assign=True,
+        default_hyperparameters={"n_clusters": 3, "threshold": 0.5, "branching_factor": 50},
+        hyperparameter_schema={
+            **_common_schema("n_clusters"),
+            "threshold": {"type": "float", "min": 0.05, "max": 2.0, "search": [0.25, 0.5, 0.75]},
+            "branching_factor": {"type": "integer", "min": 10, "max": 200, "search": [25, 50, 100]},
+        },
+        production_caveats=("threshold-sensitive CF tree", "requires explicit cluster-count and threshold validation"),
+    )
+
+    def _fit(self, x: np.ndarray, *, started: float) -> RegimeClusterFitResult:
+        estimator = Birch(**self.hyperparameters)  # type: ignore[misc]
+        labels = estimator.fit_predict(x)
+        self.estimator = estimator
+        subclusters = getattr(estimator, "subcluster_centers_", None)
+        return _fit_result(
+            spec=self.spec,
+            estimator=estimator,
+            labels=labels,
+            probabilities=None,
+            hyperparameters=self.hyperparameters,
+            started=started,
+            fit_metadata={
+                "subcluster_count": 0 if subclusters is None else int(len(subclusters)),
+                "threshold": _safe_float(self.hyperparameters.get("threshold")),
+            },
+        )
+
+    def _assign(self, x: np.ndarray, *, started: float, assignment_policy: str) -> RegimeClusterAssignmentResult:
+        return _native_predict(self, x, started=started, policy=assignment_policy)
+
+
 class PlaceholderClustererAdapter(RegimeClustererAdapter):
     def _fit(self, x: np.ndarray, *, started: float) -> RegimeClusterFitResult:
         return _failed_fit_result(
@@ -1064,22 +1105,6 @@ class PlaceholderClustererAdapter(RegimeClustererAdapter):
             assignment_policy=assignment_policy,
             failure_metadata={"reason_code": "tier_b_placeholder", "error": "placeholder adapter has no assignment"},
         )
-
-
-class BirchPlaceholderAdapter(PlaceholderClustererAdapter):
-    spec = RegimeClustererSpec(
-        family_name="birch",
-        library_source="sklearn.cluster.Birch",
-        tier="tier_b_placeholder",
-        inductive_classification=INDUCTIVE,
-        assignment_policy=ASSIGNMENT_NATIVE_PREDICT,
-        dependency_name=None,
-        supports_fit=False,
-        supports_assign=False,
-        default_hyperparameters={"n_clusters": 3},
-        hyperparameter_schema=_common_schema("n_clusters"),
-        production_caveats=("placeholder only; not part of Tier A foundation"),
-    )
 
 
 class SpectralClusteringPlaceholderAdapter(PlaceholderClustererAdapter):
@@ -1107,7 +1132,7 @@ _ADAPTERS: dict[str, type[RegimeClustererAdapter]] = {
     "hdbscan": HDBSCANAdapter,
     "optics": OPTICSAdapter,
     "agglomerative": AgglomerativeAdapter,
-    "birch": BirchPlaceholderAdapter,
+    "birch": BirchAdapter,
     "spectral_clustering": SpectralClusteringPlaceholderAdapter,
 }
 
@@ -1355,6 +1380,11 @@ class SharedAgglomerativeAdapter(_SharedTierAClustererAdapter):
     capabilities = _shared_capabilities_for_spec(AgglomerativeAdapter.spec)
 
 
+class SharedBirchAdapter(_SharedTierAClustererAdapter):
+    legacy_family_name = "birch"
+    capabilities = _shared_capabilities_for_spec(BirchAdapter.spec)
+
+
 SHARED_TIER_A_CLUSTERER_ADAPTERS: tuple[type[BaseClustererAdapter], ...] = (
     SharedKMeansAdapter,
     SharedMiniBatchKMeansAdapter,
@@ -1363,6 +1393,7 @@ SHARED_TIER_A_CLUSTERER_ADAPTERS: tuple[type[BaseClustererAdapter], ...] = (
     SharedHDBSCANAdapter,
     SharedOPTICSAdapter,
     SharedAgglomerativeAdapter,
+    SharedBirchAdapter,
 )
 
 
@@ -1394,7 +1425,7 @@ __all__ = [
     "TRANSDUCTIVE",
     "AgglomerativeAdapter",
     "BayesianGaussianMixtureAdapter",
-    "BirchPlaceholderAdapter",
+    "BirchAdapter",
     "GaussianMixtureAdapter",
     "HDBSCANAdapter",
     "KMeansAdapter",
@@ -1408,6 +1439,7 @@ __all__ = [
     "SpectralClusteringPlaceholderAdapter",
     "SHARED_TIER_A_CLUSTERER_ADAPTERS",
     "SharedAgglomerativeAdapter",
+    "SharedBirchAdapter",
     "SharedBayesianGaussianMixtureAdapter",
     "SharedGaussianMixtureAdapter",
     "SharedHDBSCANAdapter",

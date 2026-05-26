@@ -16,6 +16,7 @@ ROOT_CLEANUP_CANDIDATES: tuple[str, ...] = (
 )
 
 CROSS_ASSET_FEATURE_ROW_DIR_NAME = "cross_asset_feature_rows"
+CROSS_ASSET_SANDBOX_HANDOFF_MANIFEST_NAME = "cross_asset_regime_features_v1_handoff_manifest.json"
 
 MACHINE_LOCAL_PATH_TOKENS: tuple[str, ...] = (
     "D:" + "\\",
@@ -161,6 +162,76 @@ def detect_cross_asset_row_metadata_gaps(
     }
 
 
+def account_cross_asset_sandbox_handoff(
+    manifest_path: str | Path,
+    *,
+    artifact_root: str | Path | None = None,
+) -> dict[str, Any]:
+    path = Path(manifest_path)
+    root = Path(artifact_root).resolve() if artifact_root is not None else path.parent.resolve()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    parquet_refs = _string_sequence(payload.get("parquet_paths"))
+    contract_ref = str(payload.get("contract_path") or "").strip()
+    ref_items = [("contract_path", contract_ref)] if contract_ref else []
+    ref_items.extend(("parquet_paths", ref) for ref in parquet_refs)
+
+    missing_refs: list[dict[str, str]] = []
+    unsafe_refs: list[dict[str, str]] = []
+    existing_parquet_refs = 0
+    contract_path_exists = False
+
+    for field, ref in ref_items:
+        target = _resolve_manifest_ref(ref, root=root)
+        normalized = _normalize_manifest_ref(ref)
+        if target is None:
+            unsafe_refs.append({"field": field, "path": ref})
+            continue
+        if not target.is_file():
+            missing_refs.append({"field": field, "path": normalized})
+            continue
+        if field == "contract_path":
+            contract_path_exists = True
+        elif field == "parquet_paths":
+            existing_parquet_refs += 1
+
+    production_enabled = bool(payload.get("production_enabled", False))
+    production_outputs_written = bool(payload.get("production_outputs_written", False))
+    cross_asset_labels_written = bool(payload.get("cross_asset_labels_written", False))
+    return {
+        "artifact_kind": "cross_asset_sandbox_handoff_accounting",
+        "schema_version": 1,
+        "manifest_path": _relative_or_posix(path.resolve(), root),
+        "manifest_exists": path.is_file(),
+        "manifest_artifact_kind": payload.get("artifact_kind"),
+        "validation_status": payload.get("validation_status"),
+        "feature_bundle_id": payload.get("feature_bundle_id"),
+        "declared_row_count": payload.get("row_count"),
+        "declared_parquet_path_count": len(parquet_refs),
+        "existing_parquet_path_count": existing_parquet_refs,
+        "missing_ref_count": len(missing_refs),
+        "unsafe_ref_count": len(unsafe_refs),
+        "contract_path_exists": contract_path_exists,
+        "production_enabled": production_enabled,
+        "production_outputs_written": production_outputs_written,
+        "cross_asset_labels_written": cross_asset_labels_written,
+        "ready_for_bounded_handoff": (
+            path.is_file()
+            and payload.get("artifact_kind") == "cross_asset_regime_features_v1_handoff_manifest"
+            and payload.get("validation_status") == "passed"
+            and len(parquet_refs) > 0
+            and existing_parquet_refs == len(parquet_refs)
+            and not missing_refs
+            and not unsafe_refs
+            and contract_path_exists
+            and not production_enabled
+            and not production_outputs_written
+            and not cross_asset_labels_written
+        ),
+        "missing_refs": missing_refs[:20],
+        "unsafe_refs": unsafe_refs[:20],
+    }
+
+
 def scan_machine_local_path_markers(
     paths: Sequence[str | Path],
     *,
@@ -250,6 +321,27 @@ def _unsafe_payload_fields(payload: Any, *, path: str = "$") -> list[str]:
     return findings
 
 
+def _string_sequence(value: object) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return ()
+    return tuple(str(item).strip() for item in value if str(item).strip())
+
+
+def _normalize_manifest_ref(value: str) -> str:
+    return value.replace("\\", "/")
+
+
+def _resolve_manifest_ref(value: str, *, root: Path) -> Path | None:
+    if not value or contains_machine_local_marker(value) or is_unsafe_serialized_path(value):
+        return None
+    normalized = _normalize_manifest_ref(value)
+    candidate = Path(normalized)
+    if candidate.is_absolute():
+        return None
+    target = (root / candidate).resolve()
+    return target if _is_within(target, root) else None
+
+
 def _is_within(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -290,9 +382,11 @@ def _orderable(value: object) -> float:
 
 __all__ = [
     "CROSS_ASSET_FEATURE_ROW_DIR_NAME",
+    "CROSS_ASSET_SANDBOX_HANDOFF_MANIFEST_NAME",
     "DEFAULT_MACHINE_LOCAL_MARKER_ALLOWED_FIXTURES",
     "MACHINE_LOCAL_PATH_TOKENS",
     "ROOT_CLEANUP_CANDIDATES",
+    "account_cross_asset_sandbox_handoff",
     "build_root_cleanup_manifest",
     "classify_artifact_portability",
     "detect_cross_asset_row_metadata_gaps",

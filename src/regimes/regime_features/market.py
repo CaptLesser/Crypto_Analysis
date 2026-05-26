@@ -317,10 +317,14 @@ def build_primitive_market_regime_features(
     universe_snapshot_id = universe["universe_snapshot_id"]
     universe_snapshot_hash = universe["universe_snapshot_hash"]
 
-    returns = _return_panel(normalized, assets=broad_assets, interval=int(config.interval))
-    if returns.empty:
+    return_assets = tuple(dict.fromkeys((*broad_assets, *core_assets)))
+    all_returns = _return_panel(normalized, assets=return_assets, interval=int(config.interval))
+    if all_returns.empty:
         raise ValueError("Regime Feature primitive market builder requires at least one return series")
-    core_returns = returns.loc[:, [asset for asset in core_assets if asset in returns.columns]]
+    returns = all_returns.loc[:, [asset for asset in broad_assets if asset in all_returns.columns]]
+    if returns.empty:
+        raise ValueError("Regime Feature primitive market builder requires at least one broad return series")
+    core_returns = all_returns.loc[:, [asset for asset in core_assets if asset in all_returns.columns]].reindex(returns.index)
     volume = _value_panel(normalized, assets=broad_assets, column="volume", index=returns.index)
     trades = _value_panel(normalized, assets=broad_assets, column="trades", index=returns.index)
     ts_values = returns.index.astype("int64")
