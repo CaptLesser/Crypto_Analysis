@@ -14,6 +14,7 @@ RELATIONSHIP_FEATURE_CATALOG_ID = "relationship_feature_catalog_v1"
 FEATURE_CLASS_V1 = "v1"
 FEATURE_CLASS_SIDECAR = "sidecar"
 FEATURE_CLASS_CONDITIONAL = "conditional"
+FEATURE_CLASS_DIAGNOSTIC = "diagnostic"
 FEATURE_CLASS_DEFERRED = "deferred"
 
 FEATURE_FAMILY_MARKET_EXPOSURE = "market_exposure"
@@ -27,10 +28,10 @@ V1_MARKET_EXPOSURE_FEATURES: tuple[str, ...] = (
     "corr_to_anchor_secondary",
     "corr_to_core_basket",
     "beta_to_core_basket",
-    "market_mode_exposure_score",
 )
 
-V1_ISOLATION_STATUS_FEATURES: tuple[str, ...] = (
+DIAGNOSTIC_PROCESS2_FEATURES: tuple[str, ...] = (
+    "market_mode_exposure_score",
     "isolated_asset_score",
     "peer_signal_availability_status",
     "stable_edge_count",
@@ -64,7 +65,6 @@ DEFERRED_FEATURES: tuple[str, ...] = (
 
 V1_FEATURE_FIELDS: tuple[str, ...] = (
     *V1_MARKET_EXPOSURE_FEATURES,
-    *V1_ISOLATION_STATUS_FEATURES,
     *V1_RESIDUAL_PEER_SUMMARY_FEATURES,
 )
 
@@ -87,7 +87,7 @@ class CrossAssetRelationshipFeatureCatalogEntry:
         object.__setattr__(self, "feature_name", _text(self.feature_name, field_name="feature_name"))
         object.__setattr__(self, "feature_family", _text(self.feature_family, field_name="feature_family"))
         feature_class = _text(self.feature_class, field_name="feature_class")
-        if feature_class not in {FEATURE_CLASS_V1, FEATURE_CLASS_SIDECAR, FEATURE_CLASS_CONDITIONAL, FEATURE_CLASS_DEFERRED}:
+        if feature_class not in {FEATURE_CLASS_V1, FEATURE_CLASS_SIDECAR, FEATURE_CLASS_CONDITIONAL, FEATURE_CLASS_DIAGNOSTIC, FEATURE_CLASS_DEFERRED}:
             raise ValueError("Cross-Asset feature catalog feature_class is not supported")
         object.__setattr__(self, "feature_class", feature_class)
         object.__setattr__(self, "source_artifact", _text(self.source_artifact, field_name="source_artifact"))
@@ -142,6 +142,10 @@ class CrossAssetRelationshipFeatureCatalog:
         return tuple(entry.feature_name for entry in self.entries if entry.feature_class == FEATURE_CLASS_SIDECAR)
 
     @property
+    def diagnostic_feature_names(self) -> tuple[str, ...]:
+        return tuple(entry.feature_name for entry in self.entries if entry.feature_class == FEATURE_CLASS_DIAGNOSTIC)
+
+    @property
     def deferred_feature_names(self) -> tuple[str, ...]:
         return tuple(entry.feature_name for entry in self.entries if entry.feature_class == FEATURE_CLASS_DEFERRED)
 
@@ -154,6 +158,9 @@ class CrossAssetRelationshipFeatureCatalog:
         missing_sidecars = sorted(set(SIDECAR_FEATURES).difference(self.sidecar_feature_names))
         if missing_sidecars:
             raise ValueError(f"Cross-Asset feature catalog missing sidecar features: {missing_sidecars}")
+        missing_diagnostics = sorted(set(DIAGNOSTIC_PROCESS2_FEATURES).difference(self.diagnostic_feature_names))
+        if missing_diagnostics:
+            raise ValueError(f"Cross-Asset feature catalog missing diagnostic Process 2 features: {missing_diagnostics}")
         missing_deferred = sorted(set(DEFERRED_FEATURES).difference(self.deferred_feature_names))
         if missing_deferred:
             raise ValueError(f"Cross-Asset feature catalog missing deferred features: {missing_deferred}")
@@ -172,9 +179,13 @@ class CrossAssetRelationshipFeatureCatalog:
             "class_counts": dict(sorted(class_counts.items())),
             "family_counts": dict(sorted(family_counts.items())),
             "entries": [entry.as_dict() for entry in self.entries],
+            "model_facing_v1_feature_names": list(self.v1_feature_names),
+            "diagnostic_process2_feature_names": list(self.diagnostic_feature_names),
             "production_enabled": False,
             "cross_asset_regime_label_written": False,
             "one_column_per_related_asset_allowed": False,
+            "raw_peer_name_columns_allowed": False,
+            "raw_peer_group_id_allowed": False,
         }
 
     def to_json(self) -> str:
@@ -198,12 +209,12 @@ def default_cross_asset_relationship_feature_catalog() -> CrossAssetRelationship
         CrossAssetRelationshipFeatureCatalogEntry(
             feature_name=name,
             feature_family=FEATURE_FAMILY_ISOLATION_STATUS,
-            feature_class=FEATURE_CLASS_V1,
+            feature_class=FEATURE_CLASS_DIAGNOSTIC,
             source_artifact="isolated_asset_profiles" if "edge_count" in name or "isolated" in name or "availability" in name else "asset_relationship_profiles",
             source_field=name,
-            expected_downstream_use="peer-signal gating and non-peer status handling",
+            expected_downstream_use="Process 2 diagnostics and gating support; not a v1 model-facing Regime Feature column",
         )
-        for name in V1_ISOLATION_STATUS_FEATURES
+        for name in DIAGNOSTIC_PROCESS2_FEATURES
     )
     entries.extend(
         CrossAssetRelationshipFeatureCatalogEntry(
@@ -293,8 +304,10 @@ def _optional_text(value: object | None) -> str | None:
 __all__ = [
     "CROSS_ASSET_RELATIONSHIP_FEATURE_SCHEMA_VERSION",
     "DEFERRED_FEATURES",
+    "DIAGNOSTIC_PROCESS2_FEATURES",
     "FEATURE_CLASS_CONDITIONAL",
     "FEATURE_CLASS_DEFERRED",
+    "FEATURE_CLASS_DIAGNOSTIC",
     "FEATURE_CLASS_SIDECAR",
     "FEATURE_CLASS_V1",
     "FEATURE_FAMILY_DEFERRED_GROUP",
@@ -306,7 +319,6 @@ __all__ = [
     "RELATIONSHIP_FEATURE_CATALOG_ID",
     "SIDECAR_FEATURES",
     "V1_FEATURE_FIELDS",
-    "V1_ISOLATION_STATUS_FEATURES",
     "V1_MARKET_EXPOSURE_FEATURES",
     "V1_RESIDUAL_PEER_SUMMARY_FEATURES",
     "CrossAssetRelationshipFeatureCatalog",
