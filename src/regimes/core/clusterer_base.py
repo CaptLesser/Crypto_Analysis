@@ -15,6 +15,8 @@ from src.regimes.core.serialization import dumps_json, loads_json, require_known
 class AssignmentPolicy(str, Enum):
     NATIVE_PREDICT = "native_predict"
     APPROXIMATE_PREDICT = "approximate_predict"
+    NEAREST_LABELED_NEIGHBOR = "nearest_labeled_neighbor"
+    PROTOTYPE_OR_MEDOID = "prototype_or_medoid"
     SCHEDULED_REFIT = "scheduled_refit"
     FULL_RECLUSTER = "full_recluster"
 
