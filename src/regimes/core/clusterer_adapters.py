@@ -55,12 +55,16 @@ REGIME_CLUSTERER_ADAPTER_SCHEMA_VERSION = 1
 ASSIGNMENT_NATIVE_PREDICT = "native_predict"
 ASSIGNMENT_APPROXIMATE_PREDICT = "approximate_predict"
 ASSIGNMENT_SCORE_SAMPLES_OR_PROBABILITIES = "score_samples_or_probabilities"
+ASSIGNMENT_NEAREST_LABELED_NEIGHBOR = "nearest_labeled_neighbor"
+ASSIGNMENT_PROTOTYPE_OR_MEDOID = "prototype_or_medoid"
 ASSIGNMENT_SCHEDULED_REFIT = "scheduled_refit"
 ASSIGNMENT_FULL_RECLUSTER = "full_recluster"
 REGIME_ASSIGNMENT_POLICIES: tuple[str, ...] = (
     ASSIGNMENT_NATIVE_PREDICT,
     ASSIGNMENT_APPROXIMATE_PREDICT,
     ASSIGNMENT_SCORE_SAMPLES_OR_PROBABILITIES,
+    ASSIGNMENT_NEAREST_LABELED_NEIGHBOR,
+    ASSIGNMENT_PROTOTYPE_OR_MEDOID,
     ASSIGNMENT_SCHEDULED_REFIT,
     ASSIGNMENT_FULL_RECLUSTER,
 )
@@ -503,6 +507,8 @@ class RegimeClustererAdapter:
         self.hyperparameters = {**dict(self.spec.default_hyperparameters), **dict(hyperparameters)}
         self.estimator: Any = None
         self.last_fit_result: RegimeClusterFitResult | None = None
+        self._train_x: np.ndarray | None = None
+        self._train_labels: np.ndarray | None = None
 
     @property
     def family_name(self) -> str:
@@ -709,6 +715,196 @@ def _probability_predict(
         started=started,
         assignment_policy=policy,
         assignment_metadata={"assignment_method": "estimator.predict_proba_argmax"},
+    )
+
+
+def _assignment_policy_params(params: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "assignment_k": max(1, int(params.get("assignment_k", 1))),
+        "assignment_threshold_quantile": max(0.0, min(float(params.get("assignment_threshold_quantile", 0.95)), 1.0)),
+        "assignment_threshold_multiplier": max(0.0, float(params.get("assignment_threshold_multiplier", 1.25))),
+        "unknown_label": int(params.get("unknown_label", -1)),
+        "exclude_noise_from_assignment": bool(params.get("exclude_noise_from_assignment", True)),
+    }
+
+
+def _strip_assignment_params(params: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): value
+        for key, value in params.items()
+        if str(key)
+        not in {
+            "assignment_k",
+            "assignment_threshold_quantile",
+            "assignment_threshold_multiplier",
+            "unknown_label",
+            "exclude_noise_from_assignment",
+        }
+    }
+
+
+def _valid_train_mask(labels: np.ndarray, *, exclude_noise: bool) -> np.ndarray:
+    labels = np.asarray(labels, dtype=int)
+    return labels != -1 if exclude_noise else np.ones(labels.shape, dtype=bool)
+
+
+def _cluster_radius_threshold(
+    train_x: np.ndarray,
+    labels: np.ndarray,
+    *,
+    policy_params: Mapping[str, Any],
+) -> float | None:
+    valid = _valid_train_mask(labels, exclude_noise=bool(policy_params.get("exclude_noise_from_assignment", True)))
+    if not bool(np.any(valid)):
+        return None
+    distances: list[float] = []
+    for label in sorted(int(value) for value in set(labels[valid].tolist())):
+        members = train_x[labels == label]
+        if members.size == 0:
+            continue
+        prototype = np.mean(members, axis=0)
+        distances.extend(np.linalg.norm(members - prototype, axis=1).astype(float).tolist())
+    if not distances:
+        return None
+    q = float(policy_params.get("assignment_threshold_quantile", 0.95))
+    multiplier = float(policy_params.get("assignment_threshold_multiplier", 1.25))
+    return float(np.quantile(np.asarray(distances, dtype=float), q) * multiplier)
+
+
+def _prototype_or_medoid_assignment(
+    *,
+    spec: RegimeClustererSpec,
+    train_x: np.ndarray,
+    train_labels: np.ndarray,
+    score_x: np.ndarray,
+    started: float,
+    policy: str,
+    policy_params: Mapping[str, Any],
+) -> RegimeClusterAssignmentResult:
+    valid = _valid_train_mask(train_labels, exclude_noise=bool(policy_params.get("exclude_noise_from_assignment", True)))
+    labels = sorted(int(value) for value in set(train_labels[valid].tolist()))
+    unknown_label = int(policy_params.get("unknown_label", -1))
+    if not labels:
+        return _assignment_result(
+            spec=spec,
+            labels=np.full(score_x.shape[0], unknown_label, dtype=int),
+            probabilities=np.zeros(score_x.shape[0], dtype=float),
+            status=ASSIGN_STATUS_ASSIGNED,
+            supported=True,
+            started=started,
+            assignment_policy=policy,
+            assignment_metadata={
+                "assignment_method": "prototype_or_medoid",
+                "confidence_semantics": "1_minus_distance_over_threshold_clipped",
+                "unknown_reason": "no_valid_train_clusters",
+            },
+        )
+    prototypes = np.asarray([np.mean(train_x[train_labels == label], axis=0) for label in labels], dtype=float)
+    distances = np.linalg.norm(score_x[:, None, :] - prototypes[None, :, :], axis=2)
+    nearest = np.argmin(distances, axis=1)
+    nearest_distances = distances[np.arange(score_x.shape[0]), nearest]
+    threshold = _cluster_radius_threshold(train_x, train_labels, policy_params=policy_params)
+    assigned = np.asarray([labels[int(idx)] for idx in nearest], dtype=int)
+    if threshold is not None and threshold > 0:
+        unknown_mask = nearest_distances > threshold
+        assigned[unknown_mask] = unknown_label
+        confidence = np.clip(1.0 - nearest_distances / threshold, 0.0, 1.0)
+    else:
+        unknown_mask = np.zeros(score_x.shape[0], dtype=bool)
+        confidence = 1.0 / (1.0 + nearest_distances)
+    return _assignment_result(
+        spec=spec,
+        labels=assigned,
+        probabilities=confidence,
+        status=ASSIGN_STATUS_ASSIGNED,
+        supported=True,
+        started=started,
+        assignment_policy=policy,
+        assignment_metadata={
+            "assignment_method": "prototype_or_medoid",
+            "confidence_semantics": "1_minus_distance_over_threshold_clipped" if threshold else "inverse_distance",
+            "assignment_distance_metric": "euclidean",
+            "assignment_threshold": threshold,
+            "unknown_label": unknown_label,
+            "unknown_count": int(np.sum(unknown_mask)),
+            "assignment_policy_parameters": dict(policy_params),
+            "prototype_labels": labels,
+            "assignment_distance_sample": [float(value) for value in nearest_distances[:10].tolist()],
+        },
+    )
+
+
+def _nearest_labeled_neighbor_assignment(
+    *,
+    spec: RegimeClustererSpec,
+    train_x: np.ndarray,
+    train_labels: np.ndarray,
+    score_x: np.ndarray,
+    started: float,
+    policy: str,
+    policy_params: Mapping[str, Any],
+) -> RegimeClusterAssignmentResult:
+    valid = _valid_train_mask(train_labels, exclude_noise=bool(policy_params.get("exclude_noise_from_assignment", True)))
+    unknown_label = int(policy_params.get("unknown_label", -1))
+    if not bool(np.any(valid)):
+        return _assignment_result(
+            spec=spec,
+            labels=np.full(score_x.shape[0], unknown_label, dtype=int),
+            probabilities=np.zeros(score_x.shape[0], dtype=float),
+            status=ASSIGN_STATUS_ASSIGNED,
+            supported=True,
+            started=started,
+            assignment_policy=policy,
+            assignment_metadata={
+                "assignment_method": "nearest_labeled_neighbor",
+                "confidence_semantics": "confidence_unavailable_no_valid_labeled_neighbors",
+                "unknown_reason": "no_valid_labeled_train_rows",
+            },
+        )
+    valid_x = np.asarray(train_x[valid], dtype=float)
+    valid_labels = np.asarray(train_labels[valid], dtype=int)
+    distances = np.linalg.norm(score_x[:, None, :] - valid_x[None, :, :], axis=2)
+    k = min(int(policy_params.get("assignment_k", 1)), int(valid_x.shape[0]))
+    neighbor_idx = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
+    nearest_distances = np.take_along_axis(distances, neighbor_idx, axis=1)
+    neighbor_labels = valid_labels[neighbor_idx]
+    assigned: list[int] = []
+    for labels, dists in zip(neighbor_labels, nearest_distances):
+        counts: dict[int, tuple[int, float]] = {}
+        for label, dist in zip(labels.tolist(), dists.tolist()):
+            current_count, current_dist = counts.get(int(label), (0, 0.0))
+            counts[int(label)] = (current_count + 1, current_dist + float(dist))
+        winner = sorted(counts.items(), key=lambda item: (-item[1][0], item[1][1], item[0]))[0][0]
+        assigned.append(int(winner))
+    assigned_arr = np.asarray(assigned, dtype=int)
+    min_distances = np.min(nearest_distances, axis=1)
+    threshold = _cluster_radius_threshold(train_x, train_labels, policy_params=policy_params)
+    if threshold is not None and threshold > 0:
+        unknown_mask = min_distances > threshold
+        assigned_arr[unknown_mask] = unknown_label
+        confidence = np.clip(1.0 - min_distances / threshold, 0.0, 1.0)
+    else:
+        unknown_mask = np.zeros(score_x.shape[0], dtype=bool)
+        confidence = 1.0 / (1.0 + min_distances)
+    return _assignment_result(
+        spec=spec,
+        labels=assigned_arr,
+        probabilities=confidence,
+        status=ASSIGN_STATUS_ASSIGNED,
+        supported=True,
+        started=started,
+        assignment_policy=policy,
+        assignment_metadata={
+            "assignment_method": "nearest_labeled_neighbor",
+            "confidence_semantics": "1_minus_distance_over_threshold_clipped" if threshold else "inverse_distance",
+            "assignment_distance_metric": "euclidean",
+            "assignment_k": k,
+            "assignment_threshold": threshold,
+            "unknown_label": unknown_label,
+            "unknown_count": int(np.sum(unknown_mask)),
+            "assignment_policy_parameters": dict(policy_params),
+            "assignment_distance_sample": [float(value) for value in min_distances[:10].tolist()],
+        },
     )
 
 
@@ -978,19 +1174,39 @@ class OPTICSAdapter(RegimeClustererAdapter):
         library_source="sklearn.cluster.OPTICS",
         tier="tier_a",
         inductive_classification=TRANSDUCTIVE,
-        assignment_policy=ASSIGNMENT_FULL_RECLUSTER,
-        supports_assign=False,
+        assignment_policy=ASSIGNMENT_NEAREST_LABELED_NEIGHBOR,
+        supports_assign=True,
         supports_refit_recluster=True,
         supports_noise=True,
-        default_hyperparameters={"min_samples": 5, "xi": 0.05},
-        hyperparameter_schema=_common_schema("min_samples", "xi"),
-        production_caveats=("transductive method", "new score windows require scheduled refit/full recluster"),
+        default_hyperparameters={
+            "min_samples": 5,
+            "xi": 0.05,
+            "assignment_k": 1,
+            "assignment_threshold_quantile": 0.95,
+            "assignment_threshold_multiplier": 1.25,
+            "unknown_label": -1,
+            "exclude_noise_from_assignment": True,
+        },
+        hyperparameter_schema={
+            **_common_schema("min_samples", "xi"),
+            "assignment_k": {"type": "integer", "min": 1, "max": 15, "search": [1, 3, 5]},
+            "assignment_threshold_quantile": {"type": "float", "min": 0.5, "max": 1.0, "search": [0.8, 0.9, 0.95]},
+            "assignment_threshold_multiplier": {"type": "float", "min": 0.5, "max": 3.0, "search": [1.0, 1.25, 1.5]},
+        },
+        production_caveats=(
+            "transductive density fit; score-window assignment uses explicit nearest_labeled_neighbor policy",
+            "noise labels are valid output and unknown/out-of-domain rows are assigned unknown_label",
+            "assignment distance uses fitted train embedding space without train+validation recluster",
+        ),
     )
 
     def _fit(self, x: np.ndarray, *, started: float) -> RegimeClusterFitResult:
-        estimator = OPTICS(**self.hyperparameters)  # type: ignore[misc]
+        policy_params = _assignment_policy_params(self.hyperparameters)
+        estimator = OPTICS(**_strip_assignment_params(self.hyperparameters))  # type: ignore[misc]
         labels = estimator.fit_predict(x)
         self.estimator = estimator
+        self._train_x = np.asarray(x, dtype=float).copy()
+        self._train_labels = np.asarray(labels, dtype=int).copy()
         reachability = getattr(estimator, "reachability_", None)
         finite = np.asarray([], dtype=float)
         if reachability is not None:
@@ -1006,11 +1222,32 @@ class OPTICSAdapter(RegimeClustererAdapter):
             fit_metadata={
                 "reachability_mean": float(finite.mean()) if finite.size else None,
                 "reachability_p90": float(np.quantile(finite, 0.9)) if finite.size else None,
+                "assignment_method": ASSIGNMENT_NEAREST_LABELED_NEIGHBOR,
+                "assignment_policy_parameters": policy_params,
             },
         )
 
     def _assign(self, x: np.ndarray, *, started: float, assignment_policy: str) -> RegimeClusterAssignmentResult:
-        raise NotImplementedError("OPTICS has no stable native predict; use refit_recluster")
+        if self._train_x is None or self._train_labels is None:
+            return _assignment_result(
+                spec=self.spec,
+                labels=np.empty(0, dtype=int),
+                probabilities=None,
+                status=ASSIGN_STATUS_NOT_FITTED,
+                supported=True,
+                started=started,
+                assignment_policy=assignment_policy,
+                failure_metadata={"reason_code": "not_fitted", "error": "train embeddings and labels are unavailable"},
+            )
+        return _nearest_labeled_neighbor_assignment(
+            spec=self.spec,
+            train_x=self._train_x,
+            train_labels=self._train_labels,
+            score_x=x,
+            started=started,
+            policy=assignment_policy,
+            policy_params=_assignment_policy_params(self.hyperparameters),
+        )
 
 
 class AgglomerativeAdapter(RegimeClustererAdapter):
@@ -1019,18 +1256,40 @@ class AgglomerativeAdapter(RegimeClustererAdapter):
         library_source="sklearn.cluster.AgglomerativeClustering",
         tier="tier_a",
         inductive_classification=TRANSDUCTIVE,
-        assignment_policy=ASSIGNMENT_FULL_RECLUSTER,
-        supports_assign=False,
+        assignment_policy=ASSIGNMENT_PROTOTYPE_OR_MEDOID,
+        supports_assign=True,
         supports_refit_recluster=True,
-        default_hyperparameters={"n_clusters": 3},
-        hyperparameter_schema=_common_schema("n_clusters"),
-        production_caveats=("transductive method", "no stable native predict for new windows"),
+        default_hyperparameters={
+            "n_clusters": 3,
+            "assignment_threshold_quantile": 0.95,
+            "assignment_threshold_multiplier": 1.25,
+            "unknown_label": -1,
+            "exclude_noise_from_assignment": True,
+        },
+        hyperparameter_schema={
+            **_common_schema("n_clusters"),
+            "linkage": {"type": "categorical", "values": ["ward", "complete", "average", "single"]},
+            "metric": {"type": "categorical", "values": ["euclidean", "manhattan", "cosine"]},
+            "assignment_threshold_quantile": {"type": "float", "min": 0.5, "max": 1.0, "search": [0.8, 0.9, 0.95]},
+            "assignment_threshold_multiplier": {"type": "float", "min": 0.5, "max": 3.0, "search": [1.0, 1.25, 1.5]},
+        },
+        production_caveats=(
+            "transductive hierarchical fit; score-window assignment uses explicit prototype_or_medoid policy",
+            "cluster labels can be fit-population-sensitive, so train-only fit lineage and assignment policy metadata are required",
+            "assignment distance uses fitted train embedding space without train+validation recluster",
+        ),
     )
 
     def _fit(self, x: np.ndarray, *, started: float) -> RegimeClusterFitResult:
-        estimator = AgglomerativeClustering(**self.hyperparameters)  # type: ignore[misc]
+        policy_params = _assignment_policy_params(self.hyperparameters)
+        params = _strip_assignment_params(self.hyperparameters)
+        if params.get("linkage") == "ward":
+            params["metric"] = "euclidean"
+        estimator = AgglomerativeClustering(**params)  # type: ignore[misc]
         labels = estimator.fit_predict(x)
         self.estimator = estimator
+        self._train_x = np.asarray(x, dtype=float).copy()
+        self._train_labels = np.asarray(labels, dtype=int).copy()
         return _fit_result(
             spec=self.spec,
             estimator=estimator,
@@ -1038,10 +1297,33 @@ class AgglomerativeAdapter(RegimeClustererAdapter):
             probabilities=None,
             hyperparameters=self.hyperparameters,
             started=started,
+            fit_metadata={
+                "assignment_method": ASSIGNMENT_PROTOTYPE_OR_MEDOID,
+                "assignment_policy_parameters": policy_params,
+            },
         )
 
     def _assign(self, x: np.ndarray, *, started: float, assignment_policy: str) -> RegimeClusterAssignmentResult:
-        raise NotImplementedError("AgglomerativeClustering has no stable native predict; use refit_recluster")
+        if self._train_x is None or self._train_labels is None:
+            return _assignment_result(
+                spec=self.spec,
+                labels=np.empty(0, dtype=int),
+                probabilities=None,
+                status=ASSIGN_STATUS_NOT_FITTED,
+                supported=True,
+                started=started,
+                assignment_policy=assignment_policy,
+                failure_metadata={"reason_code": "not_fitted", "error": "train embeddings and labels are unavailable"},
+            )
+        return _prototype_or_medoid_assignment(
+            spec=self.spec,
+            train_x=self._train_x,
+            train_labels=self._train_labels,
+            score_x=x,
+            started=started,
+            policy=assignment_policy,
+            policy_params=_assignment_policy_params(self.hyperparameters),
+        )
 
 
 class BirchAdapter(RegimeClustererAdapter):
@@ -1165,6 +1447,10 @@ def _shared_policy_for_spec(spec: RegimeClustererSpec) -> str:
         return AssignmentPolicy.APPROXIMATE_PREDICT.value
     if spec.assignment_policy == ASSIGNMENT_FULL_RECLUSTER:
         return AssignmentPolicy.FULL_RECLUSTER.value
+    if spec.assignment_policy == ASSIGNMENT_NEAREST_LABELED_NEIGHBOR:
+        return AssignmentPolicy.NEAREST_LABELED_NEIGHBOR.value
+    if spec.assignment_policy == ASSIGNMENT_PROTOTYPE_OR_MEDOID:
+        return AssignmentPolicy.PROTOTYPE_OR_MEDOID.value
     return AssignmentPolicy.NATIVE_PREDICT.value
 
 

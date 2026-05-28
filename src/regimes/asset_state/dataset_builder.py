@@ -233,6 +233,49 @@ def resolve_scalar_feature_partitions(
     return tuple(sorted(paths))
 
 
+def resolve_scalar_feature_source_tail_ts(
+    source_feature_root: str | Path,
+    *,
+    interval: int,
+    asset: str,
+) -> int | None:
+    """Return the latest observed ts for one asset/interval using newest partitions first."""
+    partitions = resolve_scalar_feature_partitions(source_feature_root, interval=int(interval), asset=str(asset))
+    for path in sorted(partitions, key=lambda item: str(item), reverse=True):
+        try:
+            frame = pd.read_parquet(path, columns=[TIMESTAMP_COLUMN])
+        except Exception:
+            continue
+        if frame.empty or TIMESTAMP_COLUMN not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[TIMESTAMP_COLUMN], errors="coerce").dropna()
+        if values.empty:
+            continue
+        return int(values.max())
+    return None
+
+
+def resolve_asset_state_band_source_tail_ts(
+    source_feature_root: str | Path,
+    *,
+    asset: str,
+    band: str,
+) -> int | None:
+    """Return the safe common source tail for an Asset-State band.
+
+    The band tail is the minimum latest timestamp across member intervals, so a
+    window ending at this tail is supported by every required member interval.
+    """
+    band_spec = default_asset_state_taxonomy().band_spec(str(band))
+    tails: list[int] = []
+    for interval in tuple(int(value) for value in band_spec.member_intervals):
+        tail = resolve_scalar_feature_source_tail_ts(source_feature_root, interval=int(interval), asset=str(asset))
+        if tail is None:
+            return None
+        tails.append(int(tail))
+    return min(tails) if tails else None
+
+
 def build_asset_state_study_dataset(
     request: AssetStateStudyDatasetRequest,
 ) -> DatasetBuildResult:
