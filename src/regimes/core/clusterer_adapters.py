@@ -1202,8 +1202,16 @@ class OPTICSAdapter(RegimeClustererAdapter):
 
     def _fit(self, x: np.ndarray, *, started: float) -> RegimeClusterFitResult:
         policy_params = _assignment_policy_params(self.hyperparameters)
-        estimator = OPTICS(**_strip_assignment_params(self.hyperparameters))  # type: ignore[misc]
-        labels = estimator.fit_predict(x)
+        cache_hit = False
+        try:
+            from src.regimes.asset_state.optics_reuse import extract_optics_labels, fit_optics_base_cached
+
+            base_fit, cache_hit = fit_optics_base_cached(x, _strip_assignment_params(self.hyperparameters))
+            estimator = base_fit.estimator
+            labels = extract_optics_labels(base_fit, _strip_assignment_params(self.hyperparameters))
+        except Exception:
+            estimator = OPTICS(**_strip_assignment_params(self.hyperparameters))  # type: ignore[misc]
+            labels = estimator.fit_predict(x)
         self.estimator = estimator
         self._train_x = np.asarray(x, dtype=float).copy()
         self._train_labels = np.asarray(labels, dtype=int).copy()
@@ -1224,6 +1232,8 @@ class OPTICSAdapter(RegimeClustererAdapter):
                 "reachability_p90": float(np.quantile(finite, 0.9)) if finite.size else None,
                 "assignment_method": ASSIGNMENT_NEAREST_LABELED_NEIGHBOR,
                 "assignment_policy_parameters": policy_params,
+                "optics_base_fit_reuse_cache_hit": bool(cache_hit),
+                "optics_base_fit_reuse_active": True,
             },
         )
 

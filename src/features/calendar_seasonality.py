@@ -11,12 +11,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 from src.forecasting.common.ohlcvt_source import list_assets_ohlcvt, ohlcvt_bounds, read_ohlcvt
 from src.forecasting.common.io_atomic import atomic_replace, sibling_temp_path
 from src.forecasting.common.path_config import require_pipeline_io, resolve_path, selected_profile
 
 
-MODULE_VERSION = "1.0.0"
+MODULE_VERSION = "1.2.0"
+MODEL_FEATURE_SET_VERSION = "seasonality_feature_set_v1"
+MANUAL_CONTEXT_VERSION = "seasonality_manual_context_v1"
 PIPELINE_PROFILE = selected_profile()
 DEFAULT_PARQUET_ROOT = Path(
     resolve_path("source_ohlcvt_root", profile=PIPELINE_PROFILE, required=False)
@@ -39,6 +42,114 @@ CANDIDATE_PERIODS = {
     "1D": [7, 30, 365],
 }
 ASSET_MIN_HISTORY_YEARS = 2.0
+DEFAULT_FEATURE_LOOKBACK_DAYS = 84
+DEFAULT_FEATURE_MIN_BUCKET_SAMPLES = 4
+RATIO_DENOMINATOR_EPS = 1e-12
+RATIO_CLIP_MIN = 0.05
+RATIO_CLIP_MAX = 20.0
+RATIO_EXTREME_MIN = 0.10
+RATIO_EXTREME_MAX = 10.0
+SESSION_DEFINITIONS_UTC = {
+    "Asia": "00:00-07:00 UTC rough crypto activity context",
+    "Asia_Europe_overlap": "07:00-09:00 UTC rough overlap context",
+    "Europe": "09:00-13:00 UTC rough Europe context",
+    "Europe_US_overlap": "13:00-17:00 UTC rough overlap context",
+    "US": "17:00-22:00 UTC rough US context",
+    "Off_peak": "22:00-24:00 UTC rough lower activity context",
+}
+SCALAR_SEASONALITY_COLUMNS = [
+    "true_range",
+    "atr_pct_14",
+    "activity_state_score_20",
+    "illiquidity_proxy_20",
+    "true_range_pct",
+    "realized_volatility",
+    "ret_std_20",
+]
+MODEL_FEATURE_COLUMNS = [
+    "hour_sin",
+    "hour_cos",
+    "dow_sin",
+    "dow_cos",
+    "week_cycle_sin",
+    "week_cycle_cos",
+    "utc_weekend_flag",
+    "is_asia_session",
+    "is_europe_session",
+    "is_us_session",
+    "is_london_ny_overlap",
+    "volume_vs_usual_bucket",
+    "volume_vs_usual_bucket_clipped",
+    "volume_vs_usual_bucket_log_ratio",
+    "volume_vs_usual_bucket_quality_flag",
+    "trades_vs_usual_bucket",
+    "trades_vs_usual_bucket_clipped",
+    "trades_vs_usual_bucket_log_ratio",
+    "trades_vs_usual_bucket_quality_flag",
+    "dollar_volume_vs_usual_bucket",
+    "dollar_volume_vs_usual_bucket_clipped",
+    "dollar_volume_vs_usual_bucket_log_ratio",
+    "dollar_volume_vs_usual_bucket_quality_flag",
+    "volatility_vs_usual_bucket",
+    "volatility_vs_usual_bucket_clipped",
+    "volatility_vs_usual_bucket_log_ratio",
+    "volatility_vs_usual_bucket_quality_flag",
+    "illiquidity_vs_usual_bucket",
+    "illiquidity_vs_usual_bucket_clipped",
+    "illiquidity_vs_usual_bucket_log_ratio",
+    "illiquidity_vs_usual_bucket_quality_flag",
+    "activity_state_vs_usual_bucket",
+    "activity_state_vs_usual_bucket_clipped",
+    "activity_state_vs_usual_bucket_log_ratio",
+    "activity_state_vs_usual_bucket_quality_flag",
+    "thin_liquidity_bucket_flag",
+    "active_but_stressed_window_flag",
+    "bucket_sample_count_asof",
+    "bucket_min_samples_required",
+    "bucket_sparse_flag",
+    "bucket_fallback_used",
+    "bucket_fallback_level",
+    "seasonality_feature_quality_flag",
+]
+MANUAL_CONTEXT_COLUMNS = [
+    "context_time_utc",
+    "matched_artifact_time_utc",
+    "context_freshness_status",
+    "interval",
+    "utc_hour",
+    "utc_day_of_week",
+    "is_weekend",
+    "session_tag",
+    "session_overlap_flag",
+    "bucket_volume_vs_usual",
+    "bucket_volume_vs_usual_clipped",
+    "bucket_volume_quality_flag",
+    "bucket_trades_vs_usual",
+    "bucket_trades_vs_usual_clipped",
+    "bucket_trades_quality_flag",
+    "bucket_dollar_volume_vs_usual",
+    "bucket_volatility_vs_usual",
+    "bucket_volatility_vs_usual_clipped",
+    "bucket_volatility_quality_flag",
+    "bucket_activity_vs_usual",
+    "bucket_liquidity_or_illiquidity_vs_usual",
+    "thin_window_flag",
+    "active_window_flag",
+    "active_but_stressed_window_flag",
+    "seasonal_volatility_regime_note",
+    "seasonality_context_quality",
+    "seasonality_context_quality_score",
+    "seasonality_context_warnings",
+    "bucket_sample_count_asof",
+    "bucket_min_samples_required",
+    "bucket_min_samples_met",
+    "bucket_fallback_used",
+    "bucket_fallback_level",
+    "bucket_baseline_quality",
+    "seasonal_target_confidence_adjustment",
+    "seasonal_time_rule_note",
+    "seasonality_summary_note",
+]
 
 
 def _boolean_arg(v: str | bool) -> bool:
@@ -170,7 +281,7 @@ def read_ohlc_asset_window(
     start_ts: int,
     end_ts: int,
 ) -> pd.DataFrame:
-    cols = ["asset", "ts", "high", "low", "close"]
+    cols = ["asset", "ts", "high", "low", "close", "volume", "trades"]
     df = read_ohlcvt(
         asset=str(asset),
         interval_min=int(interval_min),
@@ -183,7 +294,7 @@ def read_ohlc_asset_window(
     if df.empty:
         return pd.DataFrame(columns=cols)
     df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
-    for c in ("high", "low", "close"):
+    for c in ("high", "low", "close", "volume", "trades"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["ts", "high", "low", "close"])
     df = df.sort_values("ts").drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
@@ -191,29 +302,31 @@ def read_ohlc_asset_window(
     return df
 
 
-def read_scalar_true_range_window(
+def read_scalar_feature_window(
     parquet_root: Path,
     interval_min: int,
     asset: str,
     start_ts: int,
     end_ts: int,
+    requested_columns: Optional[Sequence[str]] = None,
 ) -> pd.DataFrame:
     paths: List[Path] = []
     for y, m in _iter_months_between(start_ts, end_ts):
         p = _scalar_path(parquet_root, interval_min, y, m)
         if p.exists():
             paths.append(p)
+    cols_requested = list(dict.fromkeys(["asset", "ts", *(requested_columns or SCALAR_SEASONALITY_COLUMNS)]))
     if not paths:
-        return pd.DataFrame(columns=["ts", "true_range"])
+        return pd.DataFrame(columns=[c for c in cols_requested if c != "asset"])
 
-    cols = ["asset", "ts", "true_range"]
     try:
         import pyarrow.dataset as ds  # type: ignore
 
         dataset = ds.dataset([str(p) for p in paths], format="parquet")
         schema_cols = set(dataset.schema.names)
-        if "true_range" not in schema_cols:
-            return pd.DataFrame(columns=["ts", "true_range"])
+        cols = [c for c in cols_requested if c in schema_cols]
+        if "asset" not in cols or "ts" not in cols:
+            return pd.DataFrame(columns=[c for c in cols_requested if c != "asset"])
         filt = (
             (ds.field("asset") == asset)
             & (ds.field("ts") >= int(start_ts))
@@ -228,22 +341,43 @@ def read_scalar_true_range_window(
                 d = pd.read_parquet(p)
             except Exception:
                 continue
-            if "true_range" not in d.columns:
+            present = [c for c in cols_requested if c in d.columns]
+            if "asset" not in present or "ts" not in present:
                 continue
-            d = d[["asset", "ts", "true_range"]]
+            d = d[present]
             d = d[(d["asset"] == asset) & (d["ts"] >= int(start_ts)) & (d["ts"] <= int(end_ts))]
             if not d.empty:
                 frames.append(d)
         if not frames:
-            return pd.DataFrame(columns=["ts", "true_range"])
+            return pd.DataFrame(columns=[c for c in cols_requested if c != "asset"])
         df = pd.concat(frames, ignore_index=True)
 
     if df.empty:
-        return pd.DataFrame(columns=["ts", "true_range"])
+        return pd.DataFrame(columns=[c for c in cols_requested if c != "asset"])
     df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
-    df["true_range"] = pd.to_numeric(df["true_range"], errors="coerce")
+    for c in df.columns:
+        if c not in {"asset", "ts"}:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["ts"]).sort_values("ts").drop_duplicates(subset=["ts"], keep="last")
-    return df[["ts", "true_range"]].reset_index(drop=True)
+    return df[[c for c in df.columns if c != "asset"]].reset_index(drop=True)
+
+
+def read_scalar_true_range_window(
+    parquet_root: Path,
+    interval_min: int,
+    asset: str,
+    start_ts: int,
+    end_ts: int,
+) -> pd.DataFrame:
+    df = read_scalar_feature_window(
+        parquet_root=parquet_root,
+        interval_min=interval_min,
+        asset=asset,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        requested_columns=["true_range"],
+    )
+    return df[["ts", "true_range"]] if "true_range" in df.columns else pd.DataFrame(columns=["ts", "true_range"])
 
 
 def _compute_true_range(df: pd.DataFrame) -> pd.Series:
@@ -716,11 +850,12 @@ def _prepare_asset_series(
 
     ohlc = ohlc.sort_values("ts").drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
     tr_calc = _compute_true_range(ohlc)
+    scalar_df = pd.DataFrame(columns=["ts"])
 
     if prefer_scalar_features_true_range:
-        tr_df = read_scalar_true_range_window(parquet_root, interval_min, asset, start_ts, end_ts)
-        if not tr_df.empty:
-            merged = ohlc[["ts"]].merge(tr_df, on="ts", how="left")
+        scalar_df = read_scalar_feature_window(parquet_root, interval_min, asset, start_ts, end_ts)
+        if not scalar_df.empty and "true_range" in scalar_df.columns:
+            merged = ohlc[["ts"]].merge(scalar_df[["ts", "true_range"]], on="ts", how="left")
             tr = pd.to_numeric(merged["true_range"], errors="coerce")
             tr = tr.fillna(tr_calc)
         else:
@@ -728,11 +863,841 @@ def _prepare_asset_series(
     else:
         tr = tr_calc
 
-    out = ohlc[["asset", "ts", "high", "low", "close"]].copy()
+    out = ohlc[["asset", "ts", "high", "low", "close", "volume", "trades"]].copy()
     out["true_range"] = pd.to_numeric(tr, errors="coerce")
     close = pd.to_numeric(out["close"], errors="coerce")
     out["log_return"] = np.log(close / close.shift(1))
+    out["dollar_volume"] = pd.to_numeric(out["volume"], errors="coerce") * close
+    out["true_range_pct"] = out["true_range"] / close.replace(0.0, np.nan)
+    if not scalar_df.empty:
+        extra_cols = [
+            c
+            for c in SCALAR_SEASONALITY_COLUMNS
+            if c in scalar_df.columns and c not in {"true_range", "true_range_pct"}
+        ]
+        merge_cols = ["ts", *extra_cols]
+        if "true_range_pct" in scalar_df.columns:
+            merge_cols.append("true_range_pct")
+        if len(merge_cols) > 1:
+            out = out.merge(scalar_df[list(dict.fromkeys(merge_cols))], on="ts", how="left", suffixes=("", "_scalar"))
+            if "true_range_pct_scalar" in out.columns:
+                scalar_tr_pct = pd.to_numeric(out["true_range_pct_scalar"], errors="coerce")
+                out["true_range_pct"] = scalar_tr_pct.where(scalar_tr_pct.notna(), out["true_range_pct"])
+                out = out.drop(columns=["true_range_pct_scalar"])
     out = _build_calendar_columns(out, interval_label)
+    return out
+
+
+def _calendar_bucket_for_interval(out: pd.DataFrame, interval_label: str) -> pd.Series:
+    if interval_label == "1H":
+        return out["utc_day_of_week"].astype(int) * 24 + out["utc_hour"].astype(int)
+    if interval_label == "4H":
+        return out["utc_day_of_week"].astype(int) * 6 + (out["utc_hour"].astype(int) // 4)
+    return out["utc_day_of_week"].astype(int)
+
+
+def _session_tag(hour: int) -> str:
+    h = int(hour)
+    if 13 <= h < 17:
+        return "Europe_US_overlap"
+    if 7 <= h < 9:
+        return "Asia_Europe_overlap"
+    if 0 <= h < 7:
+        return "Asia"
+    if 9 <= h < 13:
+        return "Europe"
+    if 17 <= h < 22:
+        return "US"
+    return "Off_peak"
+
+
+def add_utc_calendar_session_features(df: pd.DataFrame, interval_label: str) -> pd.DataFrame:
+    out = _build_calendar_columns(df, interval_label).copy()
+    dt = pd.to_datetime(out["ts"], unit="s", utc=True)
+    out["utc_hour"] = dt.dt.hour.astype(int)
+    out["utc_day_of_week"] = dt.dt.dayofweek.astype(int)
+    out["utc_weekend_flag"] = (out["utc_day_of_week"] >= 5).astype(int)
+    out["is_weekend"] = out["utc_weekend_flag"].astype(bool)
+    out["utc_month"] = dt.dt.month.astype(int)
+    out["hour_sin"] = np.sin(2.0 * np.pi * out["utc_hour"].astype(float) / 24.0)
+    out["hour_cos"] = np.cos(2.0 * np.pi * out["utc_hour"].astype(float) / 24.0)
+    out["dow_sin"] = np.sin(2.0 * np.pi * out["utc_day_of_week"].astype(float) / 7.0)
+    out["dow_cos"] = np.cos(2.0 * np.pi * out["utc_day_of_week"].astype(float) / 7.0)
+    week_pos = out["utc_day_of_week"].astype(float) * 24.0 + out["utc_hour"].astype(float)
+    out["week_cycle_sin"] = np.sin(2.0 * np.pi * week_pos / 168.0)
+    out["week_cycle_cos"] = np.cos(2.0 * np.pi * week_pos / 168.0)
+    out["session_tag"] = out["utc_hour"].map(_session_tag)
+    out["is_asia_session"] = out["utc_hour"].between(0, 8, inclusive="left").astype(int)
+    out["is_europe_session"] = out["utc_hour"].between(7, 16, inclusive="left").astype(int)
+    out["is_us_session"] = out["utc_hour"].between(13, 22, inclusive="left").astype(int)
+    out["is_london_ny_overlap"] = out["utc_hour"].between(13, 16, inclusive="both").astype(int)
+    out["session_overlap_flag"] = out["session_tag"].isin({"Europe_US_overlap", "Asia_Europe_overlap"}).astype(int)
+    out["seasonality_bucket"] = _calendar_bucket_for_interval(out, interval_label).astype(int)
+    return out
+
+
+def _rolling_mad(values: np.ndarray) -> float:
+    vals = pd.Series(values).replace([np.inf, -np.inf], np.nan).dropna()
+    if vals.empty:
+        return np.nan
+    med = float(vals.median())
+    return float(np.median(np.abs(vals.to_numpy(dtype=float) - med)))
+
+
+def _add_asof_bucket_baseline(
+    df: pd.DataFrame,
+    *,
+    value_col: str,
+    prefix: str,
+    bucket_col: str,
+    window_days: int,
+    min_samples: int,
+) -> pd.DataFrame:
+    out = df.copy()
+    median_col = f"{prefix}_bucket_median_asof"
+    mean_col = f"{prefix}_bucket_mean_asof"
+    mad_col = f"{prefix}_bucket_mad_asof"
+    count_col = f"{prefix}_bucket_sample_count_asof"
+    vs_col = f"{prefix}_vs_usual_bucket"
+    z_col = f"{prefix}_bucket_z_robust"
+    out[median_col] = np.nan
+    out[mean_col] = np.nan
+    out[mad_col] = np.nan
+    out[count_col] = 0
+    out[vs_col] = np.nan
+    out[z_col] = np.nan
+    if value_col not in out.columns:
+        return out
+
+    window_obs = max(int(min_samples), int(np.ceil(max(1, int(window_days)) / 7.0)))
+    for _, idx in out.groupby(bucket_col, sort=False).groups.items():
+        idx_list = list(idx)
+        s = pd.to_numeric(out.loc[idx_list, value_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        prior = s.shift(1)
+        med = prior.rolling(window=window_obs, min_periods=int(min_samples)).median()
+        mean = prior.rolling(window=window_obs, min_periods=int(min_samples)).mean()
+        mad = prior.rolling(window=window_obs, min_periods=int(min_samples)).apply(_rolling_mad, raw=True)
+        cnt = prior.rolling(window=window_obs, min_periods=1).count()
+        out.loc[idx_list, median_col] = med.to_numpy(dtype=float)
+        out.loc[idx_list, mean_col] = mean.to_numpy(dtype=float)
+        out.loc[idx_list, mad_col] = mad.to_numpy(dtype=float)
+        out.loc[idx_list, count_col] = cnt.fillna(0).astype(int).to_numpy()
+
+    current = pd.to_numeric(out[value_col], errors="coerce")
+    med = pd.to_numeric(out[median_col], errors="coerce")
+    mad = pd.to_numeric(out[mad_col], errors="coerce")
+    denom = med.where(med.abs() > RATIO_DENOMINATOR_EPS)
+    out[vs_col] = current / denom
+    robust_scale = 1.4826 * mad.where(mad > RATIO_DENOMINATOR_EPS)
+    out[z_col] = (current - med) / robust_scale
+    out[vs_col] = pd.to_numeric(out[vs_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    out[z_col] = pd.to_numeric(out[z_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return out
+
+
+def _add_asof_recent_baseline(
+    df: pd.DataFrame,
+    *,
+    value_col: str,
+    prefix: str,
+    window_bars: int,
+    min_samples: int,
+) -> pd.DataFrame:
+    out = df.copy()
+    median_col = f"{prefix}_recent_median_asof"
+    mad_col = f"{prefix}_recent_mad_asof"
+    count_col = f"{prefix}_recent_sample_count_asof"
+    fallback_ratio_col = f"{prefix}_vs_usual_recent_fallback"
+    out[median_col] = np.nan
+    out[mad_col] = np.nan
+    out[count_col] = 0
+    out[fallback_ratio_col] = np.nan
+    if value_col not in out.columns:
+        return out
+
+    current = pd.to_numeric(out[value_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    prior = current.shift(1)
+    window = max(int(min_samples), int(window_bars))
+    med = prior.rolling(window=window, min_periods=int(min_samples)).median()
+    mad = prior.rolling(window=window, min_periods=int(min_samples)).apply(_rolling_mad, raw=True)
+    cnt = prior.rolling(window=window, min_periods=1).count()
+    denom = med.where(med.abs() > RATIO_DENOMINATOR_EPS)
+    out[median_col] = med.to_numpy(dtype=float)
+    out[mad_col] = mad.to_numpy(dtype=float)
+    out[count_col] = cnt.fillna(0).astype(int).to_numpy()
+    out[fallback_ratio_col] = (current / denom).replace([np.inf, -np.inf], np.nan)
+    return out
+
+
+def _add_asof_group_baseline(
+    df: pd.DataFrame,
+    *,
+    value_col: str,
+    prefix: str,
+    group_col: str,
+    suffix: str,
+    window_obs: int,
+    min_samples: int,
+) -> pd.DataFrame:
+    out = df.copy()
+    median_col = f"{prefix}_{suffix}_median_asof"
+    mad_col = f"{prefix}_{suffix}_mad_asof"
+    count_col = f"{prefix}_{suffix}_sample_count_asof"
+    ratio_col = f"{prefix}_vs_usual_{suffix}"
+    out[median_col] = np.nan
+    out[mad_col] = np.nan
+    out[count_col] = 0
+    out[ratio_col] = np.nan
+    if value_col not in out.columns or group_col not in out.columns:
+        return out
+
+    window = max(int(min_samples), int(window_obs))
+    for _, idx in out.groupby(group_col, sort=False).groups.items():
+        idx_list = list(idx)
+        s = pd.to_numeric(out.loc[idx_list, value_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        prior = s.shift(1)
+        med = prior.rolling(window=window, min_periods=int(min_samples)).median()
+        mad = prior.rolling(window=window, min_periods=int(min_samples)).apply(_rolling_mad, raw=True)
+        cnt = prior.rolling(window=window, min_periods=1).count()
+        out.loc[idx_list, median_col] = med.to_numpy(dtype=float)
+        out.loc[idx_list, mad_col] = mad.to_numpy(dtype=float)
+        out.loc[idx_list, count_col] = cnt.fillna(0).astype(int).to_numpy()
+
+    current = pd.to_numeric(out[value_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    med = pd.to_numeric(out[median_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    denom = med.where(med.abs() > RATIO_DENOMINATOR_EPS)
+    out[ratio_col] = (current / denom).replace([np.inf, -np.inf], np.nan)
+    return out
+
+
+def _select_hierarchical_ratio(
+    out: pd.DataFrame,
+    *,
+    prefix: str,
+    levels: Sequence[Tuple[str, str, str, str]],
+    min_samples: int,
+    source_present: bool,
+) -> pd.DataFrame:
+    selected_ratio = pd.Series(np.nan, index=out.index, dtype=float)
+    selected_denom = pd.Series(np.nan, index=out.index, dtype=float)
+    selected_count = pd.Series(0, index=out.index, dtype=float)
+    selected_level = pd.Series("null_no_baseline", index=out.index, dtype=object)
+    selected_quality = pd.Series("ratio_source_missing" if not source_present else "ratio_source_missing", index=out.index, dtype=object)
+
+    for level_name, ratio_col, denom_col, count_col in levels:
+        ratio = pd.to_numeric(out.get(ratio_col, np.nan), errors="coerce").replace([np.inf, -np.inf], np.nan)
+        denom = pd.to_numeric(out.get(denom_col, np.nan), errors="coerce").replace([np.inf, -np.inf], np.nan)
+        count = pd.to_numeric(out.get(count_col, 0), errors="coerce").fillna(0)
+        eligible = (
+            source_present
+            & selected_ratio.isna()
+            & ratio.notna()
+            & denom.abs().gt(RATIO_DENOMINATOR_EPS).fillna(False)
+            & count.ge(int(min_samples))
+        )
+        selected_ratio = selected_ratio.where(~eligible, ratio)
+        selected_denom = selected_denom.where(~eligible, denom)
+        selected_count = selected_count.where(~eligible, count)
+        selected_level = selected_level.where(~eligible, level_name)
+
+    selected_quality = _ratio_quality_labels(
+        selected_ratio,
+        selected_denom,
+        selected_count,
+        min_samples,
+        source_present=source_present,
+    )
+    out[f"{prefix}_vs_usual_selected"] = selected_ratio
+    out[f"{prefix}_selected_baseline_asof"] = selected_denom
+    out[f"{prefix}_selected_sample_count_asof"] = selected_count.fillna(0).astype(int)
+    out[f"{prefix}_fallback_level"] = selected_level
+    out[f"{prefix}_fallback_used"] = selected_level.ne(levels[0][0])
+    out[f"{prefix}_selected_quality_flag"] = selected_quality
+    return out
+
+
+def _ratio_quality_labels(
+    ratio: pd.Series,
+    denom: pd.Series,
+    count: pd.Series,
+    min_samples: int,
+    *,
+    source_present: bool = True,
+) -> pd.Series:
+    ratio_num = pd.to_numeric(ratio, errors="coerce")
+    denom_num = pd.to_numeric(denom, errors="coerce").abs()
+    count_num = pd.to_numeric(count, errors="coerce").fillna(0).astype(float)
+    labels = np.full(len(ratio_num), "ratio_valid", dtype=object)
+    if not source_present:
+        labels[:] = "ratio_source_missing"
+    else:
+        labels[ratio_num.isna().to_numpy()] = "ratio_source_missing"
+    denom_small = (denom_num <= RATIO_DENOMINATOR_EPS).fillna(False).to_numpy()
+    sparse = (count_num < int(min_samples)).to_numpy()
+    labels[(labels != "ratio_source_missing") & denom_small] = "ratio_denominator_too_small"
+    labels[(labels == "ratio_valid") & sparse] = "ratio_unreliable_sparse_bucket"
+    extreme = ((ratio_num < RATIO_CLIP_MIN) | (ratio_num > RATIO_CLIP_MAX)).fillna(False).to_numpy()
+    labels[(labels == "ratio_valid") & extreme] = "ratio_extreme_clipped"
+    return pd.Series(labels, index=ratio.index)
+
+
+def _add_ratio_safety_columns(
+    out: pd.DataFrame,
+    *,
+    prefix: str,
+    ratio_col: str,
+    denominator_col: str,
+    count_col: str,
+    min_samples: int,
+    source_present: bool = True,
+) -> pd.DataFrame:
+    if ratio_col not in out.columns:
+        out[ratio_col] = np.nan
+    ratio = pd.to_numeric(out[ratio_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    denom = pd.to_numeric(out.get(denominator_col, np.nan), errors="coerce").replace([np.inf, -np.inf], np.nan)
+    count = pd.to_numeric(out.get(count_col, 0), errors="coerce").fillna(0)
+    quality = _ratio_quality_labels(ratio, denom, count, min_samples, source_present=source_present)
+    clipped = ratio.clip(lower=RATIO_CLIP_MIN, upper=RATIO_CLIP_MAX)
+    clipped = clipped.where(quality.ne("ratio_denominator_too_small") & quality.ne("ratio_source_missing"))
+    out[f"{prefix}_vs_usual_bucket_clipped"] = clipped
+    out[f"{prefix}_vs_usual_bucket_log_ratio"] = np.log(ratio.where(ratio > 0)).replace([np.inf, -np.inf], np.nan)
+    out[f"{prefix}_vs_usual_bucket_clip_flag"] = (
+        (ratio < RATIO_CLIP_MIN) | (ratio > RATIO_CLIP_MAX)
+    ).fillna(False)
+    out[f"{prefix}_vs_usual_bucket_extreme_flag"] = (
+        (ratio < RATIO_EXTREME_MIN) | (ratio > RATIO_EXTREME_MAX)
+    ).fillna(False)
+    out[f"{prefix}_vs_usual_bucket_denominator_too_small_flag"] = quality.eq("ratio_denominator_too_small")
+    out[f"{prefix}_vs_usual_bucket_sparse_flag"] = quality.eq("ratio_unreliable_sparse_bucket")
+    out[f"{prefix}_vs_usual_bucket_quality_flag"] = quality
+    return out
+
+
+def _add_selected_ratio_safety_columns(out: pd.DataFrame, *, prefix: str) -> pd.DataFrame:
+    ratio = pd.to_numeric(out.get(f"{prefix}_vs_usual_selected", np.nan), errors="coerce").replace([np.inf, -np.inf], np.nan)
+    quality = pd.Series(out.get(f"{prefix}_selected_quality_flag", "ratio_source_missing"), index=out.index).astype(str)
+    clipped = ratio.clip(lower=RATIO_CLIP_MIN, upper=RATIO_CLIP_MAX)
+    clipped = clipped.where(quality.ne("ratio_denominator_too_small") & quality.ne("ratio_source_missing"))
+    out[f"{prefix}_vs_usual_selected_clipped"] = clipped
+    out[f"{prefix}_vs_usual_selected_log_ratio"] = np.log(ratio.where(ratio > 0)).replace([np.inf, -np.inf], np.nan)
+    out[f"{prefix}_vs_usual_selected_clip_flag"] = (
+        (ratio < RATIO_CLIP_MIN) | (ratio > RATIO_CLIP_MAX)
+    ).fillna(False)
+    out[f"{prefix}_vs_usual_selected_extreme_flag"] = (
+        (ratio < RATIO_EXTREME_MIN) | (ratio > RATIO_EXTREME_MAX)
+    ).fillna(False)
+    out[f"{prefix}_vs_usual_selected_denominator_too_small_flag"] = quality.eq("ratio_denominator_too_small")
+    out[f"{prefix}_vs_usual_selected_sparse_flag"] = quality.eq("ratio_unreliable_sparse_bucket")
+    return out
+
+
+def _label_quality(count: Any, min_samples: int, source_present: bool) -> str:
+    if not source_present:
+        return "source_missing"
+    try:
+        c = int(count)
+    except Exception:
+        c = 0
+    return "ok" if c >= int(min_samples) else "insufficient_bucket_history"
+
+
+def _ratio_label(value: Any, high: float = 1.5, low: float = 0.67) -> str:
+    try:
+        v = float(value)
+    except Exception:
+        return "unknown"
+    if not np.isfinite(v):
+        return "unknown"
+    if v >= high:
+        return "above_usual"
+    if v <= low:
+        return "below_usual"
+    return "near_usual"
+
+
+def build_model_feature_dataframe(
+    series_df: pd.DataFrame,
+    interval_label: str,
+    *,
+    bucket_window_days: int = DEFAULT_FEATURE_LOOKBACK_DAYS,
+    min_bucket_samples: int = DEFAULT_FEATURE_MIN_BUCKET_SAMPLES,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    out = add_utc_calendar_session_features(series_df, interval_label)
+    out = out.sort_values("ts").drop_duplicates(subset=["ts"], keep="last").reset_index(drop=True)
+    out["seasonality_hour_bucket"] = out["utc_hour"].astype(int)
+    out["seasonality_4h_slot_bucket"] = (out["utc_hour"].astype(int) // 4).astype(int)
+    out["seasonality_session_weekend_bucket"] = out["session_tag"].astype(str) + "_weekend_" + out["utc_weekend_flag"].astype(str)
+    out["seasonality_weekend_bucket"] = out["utc_weekend_flag"].astype(int)
+    for c in out.columns:
+        if c not in {"asset", "session_tag"} and is_numeric_dtype(out[c]):
+            out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if "atr_pct_14" not in out.columns:
+        out["atr_pct_14"] = np.nan
+    if "activity_state_score_20" not in out.columns:
+        out["activity_state_score_20"] = np.nan
+    if "illiquidity_proxy_20" not in out.columns:
+        out["illiquidity_proxy_20"] = np.nan
+    if "realized_volatility" not in out.columns:
+        out["realized_volatility"] = pd.to_numeric(out.get("ret_std_20", np.nan), errors="coerce")
+
+    baseline_specs = [
+        ("volume", "volume"),
+        ("trades", "trades"),
+        ("dollar_volume", "dollar_volume"),
+        ("true_range_pct", "true_range_pct"),
+        ("atr_pct_14", "atr_pct"),
+        ("realized_volatility", "realized_vol"),
+        ("illiquidity_proxy_20", "illiquidity_proxy"),
+        ("activity_state_score_20", "activity_state_score"),
+        ("log_return", "return"),
+    ]
+    bars_per_day = max(1, int(round(1440 / INTERVAL_TO_MIN.get(interval_label, 1440))))
+    recent_window_bars = max(int(min_bucket_samples), int(bucket_window_days) * bars_per_day)
+    if interval_label == "1H":
+        fallback_group_specs = [
+            ("hour", "seasonality_hour_bucket", max(int(min_bucket_samples), int(bucket_window_days))),
+            ("session_weekend", "seasonality_session_weekend_bucket", max(int(min_bucket_samples), int(bucket_window_days) * 4)),
+        ]
+        hierarchy_names = ["asset_hour_weekday", "asset_hour", "asset_session_weekend", "asset_recent_overall"]
+    elif interval_label == "4H":
+        fallback_group_specs = [
+            ("4h_slot", "seasonality_4h_slot_bucket", max(int(min_bucket_samples), int(bucket_window_days))),
+            ("session_weekend", "seasonality_session_weekend_bucket", max(int(min_bucket_samples), int(bucket_window_days))),
+        ]
+        hierarchy_names = ["asset_4h_slot_weekday", "asset_4h_slot", "asset_session_weekend", "asset_recent_overall"]
+    else:
+        fallback_group_specs = [
+            ("weekend", "seasonality_weekend_bucket", max(int(min_bucket_samples), int(bucket_window_days))),
+        ]
+        hierarchy_names = ["asset_day_of_week", "asset_weekend", "asset_recent_overall"]
+    for value_col, prefix in baseline_specs:
+        out = _add_asof_bucket_baseline(
+            out,
+            value_col=value_col,
+            prefix=prefix,
+            bucket_col="seasonality_bucket",
+            window_days=bucket_window_days,
+            min_samples=min_bucket_samples,
+        )
+        for suffix, group_col, window_obs in fallback_group_specs:
+            out = _add_asof_group_baseline(
+                out,
+                value_col=value_col,
+                prefix=prefix,
+                group_col=group_col,
+                suffix=suffix,
+                window_obs=window_obs,
+                min_samples=min_bucket_samples,
+            )
+        out = _add_asof_recent_baseline(
+            out,
+            value_col=value_col,
+            prefix=prefix,
+            window_bars=recent_window_bars,
+            min_samples=min_bucket_samples,
+        )
+    if "return_bucket_median_asof" in out.columns:
+        out["return_vs_usual_bucket"] = (
+            pd.to_numeric(out["log_return"], errors="coerce")
+            - pd.to_numeric(out["return_bucket_median_asof"], errors="coerce")
+        ).replace([np.inf, -np.inf], np.nan)
+
+    out["volatility_vs_usual_bucket"] = out["atr_pct_vs_usual_bucket"].where(
+        pd.to_numeric(out["atr_pct_vs_usual_bucket"], errors="coerce").notna(),
+        out["true_range_pct_vs_usual_bucket"],
+    )
+    out["volatility_bucket_median_asof"] = out["atr_pct_bucket_median_asof"].where(
+        pd.to_numeric(out["atr_pct_bucket_median_asof"], errors="coerce").notna(),
+        out["true_range_pct_bucket_median_asof"],
+    )
+    out["volatility_bucket_sample_count_asof"] = out[["atr_pct_bucket_sample_count_asof", "true_range_pct_bucket_sample_count_asof"]].max(axis=1)
+    out["volatility_bucket_z_robust"] = out["atr_pct_bucket_z_robust"].where(
+        pd.to_numeric(out["atr_pct_bucket_z_robust"], errors="coerce").notna(),
+        out["true_range_pct_bucket_z_robust"],
+    )
+    out["activity_state_vs_usual_bucket"] = out["activity_state_score_vs_usual_bucket"]
+    out["illiquidity_vs_usual_bucket"] = out["illiquidity_proxy_vs_usual_bucket"]
+    out["volatility_vs_usual_recent_fallback"] = out["atr_pct_vs_usual_recent_fallback"].where(
+        pd.to_numeric(out["atr_pct_vs_usual_recent_fallback"], errors="coerce").notna(),
+        out["true_range_pct_vs_usual_recent_fallback"],
+    )
+    out["volatility_recent_median_asof"] = out["atr_pct_recent_median_asof"].where(
+        pd.to_numeric(out["atr_pct_recent_median_asof"], errors="coerce").notna(),
+        out["true_range_pct_recent_median_asof"],
+    )
+    out["volatility_recent_sample_count_asof"] = out[["atr_pct_recent_sample_count_asof", "true_range_pct_recent_sample_count_asof"]].max(axis=1)
+    out["activity_state_vs_usual_recent_fallback"] = out["activity_state_score_vs_usual_recent_fallback"]
+    out["activity_state_recent_median_asof"] = out["activity_state_score_recent_median_asof"]
+    out["activity_state_recent_sample_count_asof"] = out["activity_state_score_recent_sample_count_asof"]
+    out["illiquidity_vs_usual_recent_fallback"] = out["illiquidity_proxy_vs_usual_recent_fallback"]
+    out["illiquidity_recent_median_asof"] = out["illiquidity_proxy_recent_median_asof"]
+    out["illiquidity_recent_sample_count_asof"] = out["illiquidity_proxy_recent_sample_count_asof"]
+    for suffix, _group_col, _window_obs in fallback_group_specs:
+        out[f"volatility_vs_usual_{suffix}"] = out[f"atr_pct_vs_usual_{suffix}"].where(
+            pd.to_numeric(out[f"atr_pct_vs_usual_{suffix}"], errors="coerce").notna(),
+            out[f"true_range_pct_vs_usual_{suffix}"],
+        )
+        out[f"volatility_{suffix}_median_asof"] = out[f"atr_pct_{suffix}_median_asof"].where(
+            pd.to_numeric(out[f"atr_pct_{suffix}_median_asof"], errors="coerce").notna(),
+            out[f"true_range_pct_{suffix}_median_asof"],
+        )
+        out[f"volatility_{suffix}_sample_count_asof"] = out[
+            [f"atr_pct_{suffix}_sample_count_asof", f"true_range_pct_{suffix}_sample_count_asof"]
+        ].max(axis=1)
+        out[f"activity_state_vs_usual_{suffix}"] = out[f"activity_state_score_vs_usual_{suffix}"]
+        out[f"activity_state_{suffix}_median_asof"] = out[f"activity_state_score_{suffix}_median_asof"]
+        out[f"activity_state_{suffix}_sample_count_asof"] = out[f"activity_state_score_{suffix}_sample_count_asof"]
+        out[f"illiquidity_vs_usual_{suffix}"] = out[f"illiquidity_proxy_vs_usual_{suffix}"]
+        out[f"illiquidity_{suffix}_median_asof"] = out[f"illiquidity_proxy_{suffix}_median_asof"]
+        out[f"illiquidity_{suffix}_sample_count_asof"] = out[f"illiquidity_proxy_{suffix}_sample_count_asof"]
+    source_presence = {
+        "volume": "volume" in out.columns and pd.to_numeric(out["volume"], errors="coerce").notna().any(),
+        "trades": pd.to_numeric(out.get("trades", np.nan), errors="coerce").notna().any(),
+        "dollar_volume": pd.to_numeric(out.get("dollar_volume", np.nan), errors="coerce").notna().any(),
+        "volatility": pd.to_numeric(out["true_range_pct"], errors="coerce").notna().any()
+        or pd.to_numeric(out["atr_pct_14"], errors="coerce").notna().any(),
+        "illiquidity": pd.to_numeric(out.get("illiquidity_proxy_20", np.nan), errors="coerce").notna().any(),
+        "activity_state": pd.to_numeric(out.get("activity_state_score_20", np.nan), errors="coerce").notna().any(),
+        "return": pd.to_numeric(out.get("log_return", np.nan), errors="coerce").notna().any(),
+    }
+    prefix_level_sources = {
+        "volume": ("volume", "volume"),
+        "trades": ("trades", "trades"),
+        "dollar_volume": ("dollar_volume", "dollar_volume"),
+        "volatility": ("volatility", "volatility"),
+        "illiquidity": ("illiquidity_proxy", "illiquidity"),
+        "activity_state": ("activity_state_score", "activity_state"),
+        "return": ("return", "return"),
+    }
+    for selected_prefix, (base_prefix, presence_key) in prefix_level_sources.items():
+        exact_level = (
+            hierarchy_names[0],
+            f"{selected_prefix}_vs_usual_bucket" if selected_prefix in {"volatility", "activity_state", "illiquidity"} else f"{base_prefix}_vs_usual_bucket",
+            f"{base_prefix}_bucket_median_asof",
+            f"{base_prefix}_bucket_sample_count_asof",
+        )
+        levels: list[Tuple[str, str, str, str]] = [exact_level]
+        for i, (suffix, _group_col, _window_obs) in enumerate(fallback_group_specs, start=1):
+            ratio_name_prefix = selected_prefix if selected_prefix in {"volatility", "activity_state", "illiquidity"} else base_prefix
+            median_name_prefix = base_prefix
+            levels.append(
+                (
+                    hierarchy_names[i],
+                    f"{ratio_name_prefix}_vs_usual_{suffix}",
+                    f"{median_name_prefix}_{suffix}_median_asof",
+                    f"{median_name_prefix}_{suffix}_sample_count_asof",
+                )
+            )
+        recent_ratio_prefix = selected_prefix if selected_prefix in {"volatility", "activity_state", "illiquidity"} else base_prefix
+        levels.append(
+            (
+                hierarchy_names[-1],
+                f"{recent_ratio_prefix}_vs_usual_recent_fallback",
+                f"{base_prefix}_recent_median_asof",
+                f"{base_prefix}_recent_sample_count_asof",
+            )
+        )
+        out = _select_hierarchical_ratio(
+            out,
+            prefix=selected_prefix,
+            levels=levels,
+            min_samples=min_bucket_samples,
+            source_present=bool(source_presence[presence_key]),
+        )
+        out = _add_selected_ratio_safety_columns(out, prefix=selected_prefix)
+    out["bucket_sample_count_asof"] = out[
+        [
+            "volume_bucket_sample_count_asof",
+            "trades_bucket_sample_count_asof",
+            "true_range_pct_bucket_sample_count_asof",
+            "atr_pct_bucket_sample_count_asof",
+            "illiquidity_proxy_bucket_sample_count_asof",
+            "activity_state_score_bucket_sample_count_asof",
+        ]
+    ].max(axis=1)
+    out["bucket_window_days"] = int(bucket_window_days)
+    out["bucket_min_samples_required"] = int(min_bucket_samples)
+    core_selected_count = out[
+        [
+            "volume_selected_sample_count_asof",
+            "trades_selected_sample_count_asof",
+            "volatility_selected_sample_count_asof",
+        ]
+    ].max(axis=1)
+    out["bucket_min_samples_met"] = core_selected_count.astype(int) >= int(min_bucket_samples)
+    out["bucket_sparse_flag"] = ~out["bucket_min_samples_met"].astype(bool)
+    core_levels = out[["volume_fallback_level", "trades_fallback_level", "volatility_fallback_level"]].astype(str)
+    out["bucket_fallback_used"] = core_levels.ne(hierarchy_names[0]).any(axis=1)
+    out["bucket_fallback_level"] = core_levels.apply(
+        lambda row: next((v for v in row if v != hierarchy_names[0]), hierarchy_names[0]),
+        axis=1,
+    )
+
+    volume_present = source_presence["volume"]
+    vol_present = pd.to_numeric(out["true_range_pct"], errors="coerce").notna().any()
+    out["seasonality_feature_quality_flag"] = [
+        _label_quality(c, min_bucket_samples, volume_present or vol_present) for c in out["bucket_sample_count_asof"]
+    ]
+    out["bucket_baseline_quality"] = out["seasonality_feature_quality_flag"]
+    out["leakage_policy"] = "asof_strict_prior_same_bucket"
+    out["feature_set_version"] = MODEL_FEATURE_SET_VERSION
+    out["return_seasonality_diagnostic_only"] = True
+
+    ratio_specs = [
+        ("volume", "volume_vs_usual_bucket", "volume_bucket_median_asof", "volume_bucket_sample_count_asof", volume_present),
+        ("trades", "trades_vs_usual_bucket", "trades_bucket_median_asof", "trades_bucket_sample_count_asof", pd.to_numeric(out.get("trades", np.nan), errors="coerce").notna().any()),
+        (
+            "dollar_volume",
+            "dollar_volume_vs_usual_bucket",
+            "dollar_volume_bucket_median_asof",
+            "dollar_volume_bucket_sample_count_asof",
+            pd.to_numeric(out.get("dollar_volume", np.nan), errors="coerce").notna().any(),
+        ),
+        (
+            "volatility",
+            "volatility_vs_usual_bucket",
+            "atr_pct_bucket_median_asof",
+            "atr_pct_bucket_sample_count_asof",
+            vol_present or pd.to_numeric(out["atr_pct_14"], errors="coerce").notna().any(),
+        ),
+        (
+            "illiquidity",
+            "illiquidity_vs_usual_bucket",
+            "illiquidity_proxy_bucket_median_asof",
+            "illiquidity_proxy_bucket_sample_count_asof",
+            pd.to_numeric(out.get("illiquidity_proxy_20", np.nan), errors="coerce").notna().any(),
+        ),
+        (
+            "activity_state",
+            "activity_state_vs_usual_bucket",
+            "activity_state_score_bucket_median_asof",
+            "activity_state_score_bucket_sample_count_asof",
+            pd.to_numeric(out.get("activity_state_score_20", np.nan), errors="coerce").notna().any(),
+        ),
+        ("return", "return_vs_usual_bucket", "return_bucket_median_asof", "return_bucket_sample_count_asof", pd.to_numeric(out.get("log_return", np.nan), errors="coerce").notna().any()),
+    ]
+    for prefix, ratio_col, denom_col, count_col, present in ratio_specs:
+        out = _add_ratio_safety_columns(
+            out,
+            prefix=prefix,
+            ratio_col=ratio_col,
+            denominator_col=denom_col,
+            count_col=count_col,
+            min_samples=min_bucket_samples,
+            source_present=bool(present),
+        )
+
+    volume_vs = pd.to_numeric(out["volume_vs_usual_selected_clipped"], errors="coerce")
+    trades_vs = pd.to_numeric(out["trades_vs_usual_selected_clipped"], errors="coerce")
+    vol_vs = pd.to_numeric(out["volatility_vs_usual_selected_clipped"], errors="coerce")
+    illiq_vs = pd.to_numeric(out["illiquidity_vs_usual_selected_clipped"], errors="coerce")
+    activity_vs = pd.to_numeric(out["activity_state_vs_usual_selected_clipped"], errors="coerce")
+    out["thin_liquidity_bucket_flag"] = ((volume_vs < 0.5) | (trades_vs < 0.5) | (illiq_vs > 1.5)).fillna(False)
+    out["is_low_activity_window"] = ((volume_vs < 0.67) | (trades_vs < 0.67) | (activity_vs < 0.75)).fillna(False)
+    out["is_active_window"] = ((volume_vs > 1.25) | (trades_vs > 1.25) | (activity_vs > 1.15)).fillna(False)
+    out["active_but_stressed_window_flag"] = (out["is_active_window"] & ((vol_vs > 1.5) | (illiq_vs > 1.5))).fillna(False)
+    out["liquidity_condition_bucket_label"] = np.select(
+        [out["thin_liquidity_bucket_flag"], (illiq_vs > 1.25).fillna(False), (volume_vs > 1.25).fillna(False)],
+        ["thin", "stressed", "active"],
+        default="normal",
+    )
+
+    out["bucket_volume_vs_usual"] = out["volume_vs_usual_selected"]
+    out["bucket_volume_vs_usual_clipped"] = out["volume_vs_usual_selected_clipped"]
+    out["bucket_volume_quality_flag"] = out["volume_selected_quality_flag"]
+    out["bucket_trades_vs_usual"] = out["trades_vs_usual_selected"]
+    out["bucket_trades_vs_usual_clipped"] = out["trades_vs_usual_selected_clipped"]
+    out["bucket_trades_quality_flag"] = out["trades_selected_quality_flag"]
+    out["bucket_dollar_volume_vs_usual"] = out["dollar_volume_vs_usual_selected"]
+    out["bucket_volatility_vs_usual"] = out["volatility_vs_usual_selected"]
+    out["bucket_volatility_vs_usual_clipped"] = out["volatility_vs_usual_selected_clipped"]
+    out["bucket_volatility_quality_flag"] = out["volatility_selected_quality_flag"]
+    out["bucket_activity_vs_usual"] = out["activity_state_vs_usual_selected"]
+    out["bucket_liquidity_or_illiquidity_vs_usual"] = out["illiquidity_vs_usual_selected"]
+    out["thin_window_flag"] = out["thin_liquidity_bucket_flag"]
+    out["active_window_flag"] = out["is_active_window"]
+    out["seasonal_volatility_regime_note"] = np.select(
+        [(vol_vs >= 1.5).fillna(False), (vol_vs <= 0.67).fillna(False)],
+        ["volatility_above_usual_context_only", "volatility_below_usual_context_only"],
+        default="volatility_near_usual_or_unknown_context_only",
+    )
+    clip_cols = [
+        "volume_vs_usual_selected_clip_flag",
+        "trades_vs_usual_selected_clip_flag",
+        "dollar_volume_vs_usual_selected_clip_flag",
+        "volatility_vs_usual_selected_clip_flag",
+        "illiquidity_vs_usual_selected_clip_flag",
+        "activity_state_vs_usual_selected_clip_flag",
+    ]
+    clipped_any = out[[c for c in clip_cols if c in out.columns]].any(axis=1) if clip_cols else pd.Series(False, index=out.index)
+    low_core = out[
+        [
+            "volume_selected_quality_flag",
+            "trades_selected_quality_flag",
+            "volatility_selected_quality_flag",
+        ]
+    ].isin(["ratio_denominator_too_small", "ratio_source_missing", "ratio_unreliable_sparse_bucket"]).sum(axis=1)
+    score = 1.0 - (0.25 * out["bucket_sparse_flag"].astype(float)) - (0.20 * clipped_any.astype(float)) - (0.15 * low_core.astype(float))
+    out["seasonality_context_quality_score"] = score.clip(lower=0.0, upper=1.0).round(3)
+    out["seasonality_context_quality"] = np.select(
+        [out["seasonality_context_quality_score"] >= 0.75, out["seasonality_context_quality_score"] >= 0.45],
+        ["high", "medium"],
+        default="low",
+    )
+    warnings: list[str] = []
+    for sparse, clipped, thin, stressed, low_count in zip(
+        out["bucket_sparse_flag"].astype(bool),
+        clipped_any.astype(bool),
+        out["thin_liquidity_bucket_flag"].astype(bool),
+        out["active_but_stressed_window_flag"].astype(bool),
+        low_core.astype(int),
+    ):
+        parts: list[str] = []
+        if sparse:
+            parts.append("sparse_bucket_fallback_used")
+        if clipped:
+            parts.append("extreme_ratio_clipped")
+        if thin:
+            parts.append("thin_or_illiquid_window")
+        if stressed:
+            parts.append("active_but_stressed_window")
+        if low_count:
+            parts.append("low_quality_core_ratio")
+        warnings.append(";".join(parts) if parts else "none")
+    out["seasonality_context_warnings"] = warnings
+    out["context_time_utc"] = pd.to_datetime(out["ts"], unit="s", utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    out["matched_artifact_time_utc"] = out["context_time_utc"]
+    out["context_freshness_status"] = "artifact_row"
+    out["interval"] = interval_label
+    out["seasonal_target_confidence_adjustment"] = np.where(
+        out["thin_window_flag"],
+        "caution_thin_context_only",
+        np.where(out["active_but_stressed_window_flag"], "caution_active_stressed_context_only", "none_context_only"),
+    )
+    out["seasonal_time_rule_note"] = np.where(
+        out["session_overlap_flag"].astype(bool),
+        "utc_session_overlap_context_only",
+        "utc_24_7_crypto_context_only",
+    )
+    if interval_label == "1D":
+        daily_warning = "daily_interval_hour_session_fields_not_applicable"
+        out["utc_hour"] = np.nan
+        out["session_tag"] = None
+        out["session_overlap_flag"] = np.nan
+        out["seasonal_time_rule_note"] = "utc_day_of_week_context_only"
+    else:
+        daily_warning = ""
+    out["seasonality_summary_note"] = [
+        f"volume={_ratio_label(v)}; volatility={_ratio_label(vol)}; liquidity={_ratio_label(ill, high=1.25, low=0.8)}; context_only"
+        for v, vol, ill in zip(out["bucket_volume_vs_usual"], out["bucket_volatility_vs_usual"], out["bucket_liquidity_or_illiquidity_vs_usual"])
+    ]
+    if daily_warning:
+        out["seasonality_context_warnings"] = np.where(
+            out["seasonality_context_warnings"].astype(str).eq("none"),
+            daily_warning,
+            out["seasonality_context_warnings"].astype(str) + ";" + daily_warning,
+        )
+
+    missingness = {
+        c: float(pd.to_numeric(out[c], errors="coerce").isna().mean())
+        for c in MODEL_FEATURE_COLUMNS
+        if c in out.columns and out[c].dtype.kind in {"f", "i", "u", "b"}
+    }
+    quality_flag_distribution = (
+        out["seasonality_context_quality"].value_counts(dropna=False).astype(int).to_dict()
+        if "seasonality_context_quality" in out.columns
+        else {}
+    )
+    ratio_quality_distribution = {
+        c: out[c].value_counts(dropna=False).astype(int).to_dict()
+        for c in out.columns
+        if c.endswith("_vs_usual_bucket_quality_flag")
+    }
+    clipped_ratio_counts = {
+        c: int(pd.Series(out[c]).fillna(False).astype(bool).sum())
+        for c in out.columns
+        if c.endswith("_vs_usual_bucket_clip_flag")
+    }
+    extreme_ratio_counts = {
+        c: int(pd.Series(out[c]).fillna(False).astype(bool).sum())
+        for c in out.columns
+        if c.endswith("_vs_usual_bucket_extreme_flag")
+    }
+    diagnostics = {
+        "feature_set_version": MODEL_FEATURE_SET_VERSION,
+        "module_version": MODULE_VERSION,
+        "input_rows": int(len(series_df)),
+        "output_rows": int(len(out)),
+        "source_start_ts": int(out["ts"].min()) if not out.empty else None,
+        "source_end_ts": int(out["ts"].max()) if not out.empty else None,
+        "bucket_window_days": int(bucket_window_days),
+        "bucket_min_samples": int(min_bucket_samples),
+        "bucket_count": int(out["seasonality_bucket"].nunique()) if "seasonality_bucket" in out else 0,
+        "buckets_failing_min_sample_rows": int((~out["bucket_min_samples_met"].astype(bool)).sum()) if not out.empty else 0,
+        "bucket_sparse_rows": int(out["bucket_sparse_flag"].astype(bool).sum()) if not out.empty else 0,
+        "bucket_fallback_used_rows": int(out["bucket_fallback_used"].astype(bool).sum()) if not out.empty else 0,
+        "bucket_fallback_level_distribution": out["bucket_fallback_level"].value_counts(dropna=False).astype(int).to_dict(),
+        "missingness_summary": missingness,
+        "context_quality_distribution": quality_flag_distribution,
+        "ratio_quality_distribution": ratio_quality_distribution,
+        "clipped_ratio_counts": clipped_ratio_counts,
+        "extreme_ratio_counts": extreme_ratio_counts,
+        "near_zero_denominator_policy": f"denominators <= {RATIO_DENOMINATOR_EPS:g} are nulled and flagged",
+        "ratio_clip_policy": {"min": RATIO_CLIP_MIN, "max": RATIO_CLIP_MAX},
+        "leakage_safety_check_status": "passed_current_row_excluded_from_bucket_baseline",
+        "return_seasonality_policy": "diagnostic_only",
+        "multiple_testing_warning": "return seasonality remains diagnostic only; do not treat bucket return effects as validated directional signals",
+        "session_definitions_utc": SESSION_DEFINITIONS_UTC,
+        "static_full_history_baseline_warning": "legacy profile artifacts are descriptive; model_feature_set_v1 uses strict prior as-of bucket baselines",
+        "model_facing_feature_columns": [c for c in MODEL_FEATURE_COLUMNS if c in out.columns],
+        "manual_context_columns": [c for c in MANUAL_CONTEXT_COLUMNS if c in out.columns],
+    }
+    return out, diagnostics
+
+
+def build_asset_model_feature_artifact(
+    parquet_root: Path,
+    interval_label: str,
+    asset: str,
+    start_ts: int,
+    end_ts: int,
+    prefer_scalar_features_true_range: bool,
+    bucket_window_days: int,
+    min_bucket_samples: int,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    series_df = _prepare_asset_series(
+        parquet_root=parquet_root,
+        interval_label=interval_label,
+        asset=asset,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        prefer_scalar_features_true_range=prefer_scalar_features_true_range,
+    )
+    if series_df.empty:
+        return pd.DataFrame(), {
+            "asset": str(asset),
+            "interval": interval_label,
+            "feature_set_version": MODEL_FEATURE_SET_VERSION,
+            "status": "empty_input",
+            "input_rows": 0,
+            "output_rows": 0,
+        }
+    features, diagnostics = build_model_feature_dataframe(
+        series_df,
+        interval_label,
+        bucket_window_days=bucket_window_days,
+        min_bucket_samples=min_bucket_samples,
+    )
+    diagnostics.update({"asset": str(asset), "interval": interval_label, "status": "built"})
+    return features, diagnostics
+
+
+def manual_context_dataframe(features: pd.DataFrame) -> pd.DataFrame:
+    base_cols = ["asset", "ts", "feature_set_version", *MANUAL_CONTEXT_COLUMNS]
+    cols = [c for c in base_cols if c in features.columns]
+    out = features[cols].copy()
+    out["manual_context_version"] = MANUAL_CONTEXT_VERSION
+    out["manual_context_policy"] = "context_only_not_trade_trigger"
     return out
 
 
@@ -1113,6 +2078,18 @@ def _global_output_path(output_root: Path, interval_label: str) -> Path:
     return output_root / interval_label / "global" / "seasonality.parquet"
 
 
+def _model_feature_output_path(output_root: Path, interval_label: str, asset: str) -> Path:
+    return output_root / interval_label / "model_features_v1" / "assets" / asset / "seasonality_features.parquet"
+
+
+def _manual_context_output_path(output_root: Path, interval_label: str, asset: str) -> Path:
+    return output_root / interval_label / "manual_context_v1" / "assets" / asset / "seasonality_context.parquet"
+
+
+def _feature_diagnostics_path(output_root: Path, interval_label: str) -> Path:
+    return output_root / interval_label / "diagnostics" / f"{MODEL_FEATURE_SET_VERSION}.json"
+
+
 def _manifest_path(output_root: Path, interval_label: str) -> Path:
     return output_root / interval_label / "manifest.json"
 
@@ -1170,6 +2147,9 @@ def _run_single_interval(args: argparse.Namespace, interval_label: str) -> Dict[
             "smoothing_window": int(args.smoothing_window),
             "top_k": int(args.top_k),
             "baseline_method": str(args.baseline_method),
+            "emit_model_features": bool(args.emit_model_features),
+            "feature_lookback_days": int(args.feature_lookback_days),
+            "feature_min_bucket_samples": int(args.feature_min_bucket_samples),
             "candidate_periods": CANDIDATE_PERIODS[interval_label],
             "asset_min_history_years": ASSET_MIN_HISTORY_YEARS,
             "min_asset_coverage_bars": min_asset_coverage_bars,
@@ -1178,12 +2158,24 @@ def _run_single_interval(args: argparse.Namespace, interval_label: str) -> Dict[
         "assets_summary": {},
         "assets_skipped_insufficient_history_count": 0,
         "assets_skipped_insufficient_history": [],
+        "model_feature_set": {
+            "version": MODEL_FEATURE_SET_VERSION,
+            "enabled": bool(args.emit_model_features),
+            "assets_produced": [],
+            "diagnostics_path": str(_feature_diagnostics_path(output_root, interval_label)),
+        },
+        "manual_context": {
+            "version": MANUAL_CONTEXT_VERSION,
+            "enabled": bool(args.emit_model_features),
+            "assets_produced": [],
+        },
         "global": {},
     }
 
     built_assets: Dict[str, ArtifactResult] = {}
     assets_eligible_for_asset_profile: List[str] = []
     skipped_insufficient_history: List[str] = []
+    feature_diagnostics: List[Dict[str, Any]] = []
 
     if args.run_scope in {"asset", "both"}:
         for asset in all_assets:
@@ -1265,9 +2257,69 @@ def _run_single_interval(args: argparse.Namespace, interval_label: str) -> Dict[
                 "overall_quality_score": summ["overall_quality_score"],
                 "overall_usable": summ["overall_usable"],
             }
+            if bool(args.emit_model_features):
+                f_df, f_diag = build_asset_model_feature_artifact(
+                    parquet_root=parquet_root,
+                    interval_label=interval_label,
+                    asset=asset,
+                    start_ts=asset_start_ts,
+                    end_ts=now_ts,
+                    prefer_scalar_features_true_range=bool(args.prefer_scalar_features_true_range),
+                    bucket_window_days=int(args.feature_lookback_days),
+                    min_bucket_samples=int(args.feature_min_bucket_samples),
+                )
+                feature_diagnostics.append(f_diag)
+                if not f_df.empty:
+                    f_path = _model_feature_output_path(output_root, interval_label, asset)
+                    _write_parquet(f_df, f_path)
+                    c_df = manual_context_dataframe(f_df)
+                    c_path = _manual_context_output_path(output_root, interval_label, asset)
+                    _write_parquet(c_df, c_path)
+                    manifest["assets_summary"][asset]["model_feature_path"] = str(f_path)
+                    manifest["assets_summary"][asset]["manual_context_path"] = str(c_path)
+                    manifest["assets_summary"][asset]["model_feature_rows"] = int(len(f_df))
+                    manifest["model_feature_set"]["assets_produced"].append(asset)
+                    manifest["manual_context"]["assets_produced"].append(asset)
 
         manifest["assets_skipped_insufficient_history_count"] = len(skipped_insufficient_history)
         manifest["assets_skipped_insufficient_history"] = sorted(skipped_insufficient_history)
+
+    if bool(args.emit_model_features):
+        rows = int(sum(int(d.get("output_rows", 0) or 0) for d in feature_diagnostics))
+        missing_keys = sorted(
+            {
+                k
+                for d in feature_diagnostics
+                for k in (d.get("missingness_summary", {}) or {}).keys()
+            }
+        )
+        missingness = {
+            k: float(np.nanmean([float((d.get("missingness_summary", {}) or {}).get(k, np.nan)) for d in feature_diagnostics]))
+            for k in missing_keys
+        }
+        diag_payload = {
+            "generated_at_utc": _iso_now(),
+            "interval": interval_label,
+            "feature_set_version": MODEL_FEATURE_SET_VERSION,
+            "manual_context_version": MANUAL_CONTEXT_VERSION,
+            "asof_leakage_policy": "strictly_prior_same_calendar_bucket_current_row_excluded",
+            "input_asset_count": int(len(feature_diagnostics)),
+            "output_row_count": rows,
+            "bucket_window_days": int(args.feature_lookback_days),
+            "bucket_min_samples": int(args.feature_min_bucket_samples),
+            "missingness_summary_mean_by_asset": missingness,
+            "quality_flag_counts": {
+                "ok_assets": int(sum(1 for d in feature_diagnostics if d.get("status") == "built")),
+                "empty_input_assets": int(sum(1 for d in feature_diagnostics if d.get("status") == "empty_input")),
+            },
+            "return_seasonality_policy": "diagnostic_only_not_trusted_model_feature",
+            "multiple_testing_warning": "return bucket diagnostics require out-of-sample validation and multiple-testing control before directional use",
+            "static_full_history_baseline_warning": "legacy profile artifacts remain descriptive; model_features_v1 uses rolling as-of bucket baselines",
+            "model_facing_feature_availability": MODEL_FEATURE_COLUMNS,
+            "asset_diagnostics": feature_diagnostics,
+        }
+        d_path = _feature_diagnostics_path(output_root, interval_label)
+        _write_json(d_path, diag_payload)
 
     if args.run_scope in {"global", "both"}:
         eligible_assets = [
@@ -1396,6 +2448,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--smoothing_window", type=int, default=5)
     p.add_argument("--top_k", type=int, default=10)
     p.add_argument("--baseline_method", choices=["median", "trimmed_mean"], default="median")
+    p.add_argument("--emit_model_features", type=_boolean_arg, default=False)
+    p.add_argument("--feature_lookback_days", type=int, default=DEFAULT_FEATURE_LOOKBACK_DAYS)
+    p.add_argument("--feature_min_bucket_samples", type=int, default=DEFAULT_FEATURE_MIN_BUCKET_SAMPLES)
     p.add_argument("--parquet_root", type=str, default=str(DEFAULT_PARQUET_ROOT))
     p.add_argument("--output_root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
     return p
@@ -1411,6 +2466,12 @@ def main() -> int:
         for interval_label, m in (manifest.get("per_interval", {}) or {}).items():
             per_interval_summary[interval_label] = {
                 "assets_produced": len((m.get("assets_produced", []) if isinstance(m, dict) else [])),
+                "model_feature_assets_produced": len(
+                    (
+                        ((m.get("model_feature_set", {}) if isinstance(m, dict) else {}).get("assets_produced", []))
+                        or []
+                    )
+                ),
                 "global_computed_from_assets_count": int(
                     ((m.get("global", {}) if isinstance(m, dict) else {}).get("computed_from_assets_count", 0) or 0)
                 ),
@@ -1429,6 +2490,7 @@ def main() -> int:
             "interval": args.interval,
             "run_scope": args.run_scope,
             "assets_produced": len(manifest.get("assets_produced", [])),
+            "model_feature_assets_produced": len((manifest.get("model_feature_set", {}) or {}).get("assets_produced", []) or []),
             "global_computed_from_assets_count": int(manifest.get("global", {}).get("computed_from_assets_count", 0) or 0),
             "manifest_path": manifest.get("manifest_path"),
         }
