@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
+from src.forecasting.common.test_diagnostics import TestDiagnosticPacket
 from src.forecasting.common.path_config import resolve_path, selected_profile
 from src.forecasting.common.sandbox_paths import assert_write_allowed, resolve_sandbox_output_roots
 from src.forecasting.ml.shared.test_orchestrator_common import (
@@ -603,9 +604,98 @@ def write_run_state(run_root: Path, args: argparse.Namespace, *, active_model: O
         "health": payload["health"],
         "canonical_profiles": canonical_profiles,
         "stage3_outputs": {model_key: payload["models"][model_key]["stage3"]["artifacts"] for model_key in MODEL_ORDER if payload["models"][model_key]["stage3"]["artifacts"]},
+        "standard_diagnostic_packet": _standard_diagnostic_packet_paths(run_root),
     }
     write_json_atomic(run_root / RUN_SUMMARY_FILE, summary_payload)
+    _emit_standard_test_diagnostic_packet(run_root, payload=payload, summary_payload=summary_payload)
     return payload
+
+
+def _standard_diagnostic_packet_paths(run_root: Path) -> Dict[str, str]:
+    return {
+        "run_summary": str((run_root / "run_summary.json").resolve()),
+        "diagnostic_manifest": str((run_root / "diagnostic_manifest.json").resolve()),
+        "diagnostic_events": str((run_root / "diagnostic_events.jsonl").resolve()),
+        "diagnostic_samples": str((run_root / "diagnostic_samples.csv").resolve()),
+        "top_offenders": str((run_root / "top_offenders.json").resolve()),
+        "output_parity": str((run_root / "output_parity.json").resolve()),
+    }
+
+
+def _emit_standard_test_diagnostic_packet(run_root: Path, *, payload: Dict[str, Any], summary_payload: Dict[str, Any]) -> None:
+    packet = TestDiagnosticPacket.create(
+        run_root,
+        module_name=__name__,
+        run_id=run_root.name,
+        mode="test",
+        max_events=100,
+        max_samples=100,
+        max_top_offenders=25,
+    )
+    health = dict(payload.get("health") or {})
+    models = dict(payload.get("models") or {})
+    packet.record_event(
+        "orchestrator_state",
+        complete=bool(payload.get("complete")),
+        active_model=payload.get("active_model"),
+        active_stage=payload.get("active_stage"),
+        health_status=health.get("status"),
+        health_error_count=int(health.get("error_count") or 0),
+        health_warning_count=int(health.get("warning_count") or 0),
+    )
+    stage0 = dict(payload.get("stage0") or {})
+    packet.record_sample(
+        sample_type="stage_status",
+        name="stage0",
+        stage="stage0",
+        complete=bool(stage0.get("complete")),
+        output_dir=stage0.get("output_dir"),
+        log_path=stage0.get("log_path"),
+    )
+    if not bool(stage0.get("complete")):
+        packet.record_top_offender("stage0", 1.0, category="incomplete_stage", metadata={"stage": "stage0"})
+    for model_key in MODEL_ORDER:
+        model_status = dict(models.get(model_key) or {})
+        for stage_name in ("stage1", "stage2", "stage3"):
+            stage_status = dict(model_status.get(stage_name) or {})
+            complete = bool(stage_status.get("complete"))
+            packet.record_sample(
+                sample_type="stage_status",
+                name=f"{model_key}:{stage_name}",
+                model_key=model_key,
+                stage=stage_name,
+                complete=complete,
+                output_dir=stage_status.get("output_dir") or stage_status.get("output_root"),
+                log_path=stage_status.get("log_path"),
+            )
+            if not complete:
+                packet.record_top_offender(
+                    f"{model_key}:{stage_name}",
+                    1.0,
+                    category="incomplete_stage",
+                    metadata={"model_key": model_key, "stage": stage_name},
+                )
+    if int(health.get("error_count") or 0) > 0:
+        packet.record_top_offender(
+            "test_branch_health_errors",
+            float(health.get("error_count") or 0),
+            category="health",
+            metadata={"health_status": health.get("status"), "health_report_json": health.get("health_report_json")},
+        )
+    packet.set_output_parity(
+        status="not_applicable",
+        row_counts={
+            "model_count": len(models),
+            "stage3_output_model_count": len(summary_payload.get("stage3_outputs") or {}),
+        },
+        notes=["Bayesian numeric Test orchestrator emits artifact-presence diagnostics; model output parity is checked in stage-specific runners."],
+    )
+    packet.update_run_summary(
+        legacy_summary_path=str((run_root / RUN_SUMMARY_FILE).resolve()),
+        production_outputs_written=False,
+        hidden_debug_mode=False,
+    )
+    packet.finalize(status="completed" if bool(payload.get("complete")) else "in_progress", run_summary=summary_payload)
 
 
 def run_stage0(args: argparse.Namespace, run_root: Path, env: Dict[str, str]) -> None:
