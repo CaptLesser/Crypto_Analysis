@@ -5,7 +5,9 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+
+from src.forecasting.common.test_diagnostics import TestDiagnosticPacket
 
 try:
     import psutil
@@ -210,6 +212,135 @@ def summarize_diagnostics(path: Path, *, top_n: int = 10) -> Dict[str, Any]:
         ],
         "slowest_combos": slowest_combos,
         "slowest_units": [row for _seq, row in slowest_units_ranked],
+    }
+
+
+def emit_standard_numeric_diagnostic_packet(
+    *,
+    packet_root: Path,
+    run_result: Mapping[str, Any],
+    diagnostics_summary: Optional[Mapping[str, Any]] = None,
+    mode: str = "test",
+    module_name: str = "numeric_runner",
+    run_id: Optional[str] = None,
+    max_events: int = 100,
+    max_samples: int = 100,
+    max_top_offenders: int = 25,
+) -> Dict[str, str]:
+    """Emit a bounded standard Test diagnostic packet from existing numeric artifacts.
+
+    This is additive: callers keep their existing run summary, JSONL diagnostics, and
+    handoff manifests, and store the standard packet under a separate packet root.
+    """
+    result = dict(run_result)
+    paths = dict(result.get("paths") or {})
+    diagnostics = dict(diagnostics_summary or {})
+    if not diagnostics:
+        diagnostics_path = str(result.get("diagnostics_jsonl") or paths.get("diagnostics_jsonl") or "").strip()
+        if diagnostics_path:
+            try:
+                diagnostics = summarize_diagnostics(Path(diagnostics_path), top_n=max_top_offenders)
+            except Exception:
+                diagnostics = {"path": diagnostics_path, "exists": False}
+
+    packet = TestDiagnosticPacket.create(
+        Path(packet_root),
+        module_name=str(module_name),
+        run_id=str(run_id or result.get("run_id") or Path(packet_root).parent.name),
+        mode=str(mode),
+        max_events=max_events,
+        max_samples=max_samples,
+        max_top_offenders=max_top_offenders,
+    )
+    config = dict(result.get("config") or {})
+    resources = dict(result.get("resources") or {})
+    concurrency = dict(result.get("concurrency") or {})
+    writer_stats = dict(result.get("writer_stats") or diagnostics.get("latest_writer_stats") or {})
+    packet.record_event(
+        "numeric_run_summary",
+        success=bool(result.get("success", True)),
+        return_code=result.get("return_code"),
+        runtime_profile=result.get("runtime_profile"),
+        training_window_label=result.get("training_window_label"),
+        wall_clock_s=(result.get("timing") or {}).get("wall_clock_s"),
+        runner_diagnostics=diagnostics,
+        writer_stats=writer_stats,
+    )
+    packet.record_sample(
+        sample_type="resource_summary",
+        name="process_tree",
+        peak_proc_tree_rss_mb=resources.get("peak_proc_tree_rss_mb"),
+        peak_proc_threads=resources.get("peak_proc_threads"),
+        peak_cpu_total_pct=resources.get("peak_cpu_total_pct"),
+        read_mb_total=resources.get("read_mb_total"),
+        write_mb_total=resources.get("write_mb_total"),
+    )
+    packet.record_sample(
+        sample_type="concurrency",
+        name="requested_effective",
+        requested_workers=config.get("unit_workers") or result.get("workers"),
+        requested_model_threads=config.get("model_threads") or result.get("model_threads"),
+        effective_workers=concurrency.get("effective_workers") or config.get("unit_workers") or result.get("workers"),
+        effective_model_threads=concurrency.get("effective_model_threads") or config.get("model_threads") or result.get("model_threads"),
+        dispatch_mode=concurrency.get("dispatch_mode"),
+        max_parallel_active=concurrency.get("max_parallel_active"),
+    )
+    if writer_stats:
+        packet.record_sample(sample_type="writer_stats", name="latest_writer_stats", **writer_stats)
+
+    for row in diagnostics.get("slowest_units") or []:
+        if isinstance(row, Mapping):
+            score = float(row.get("elapsed_s", 0.0) or 0.0)
+            packet.record_top_offender(
+                str(row.get("asset") or row.get("unit") or "unit"),
+                score,
+                category="slowest_unit",
+                metadata=dict(row),
+            )
+    for row in diagnostics.get("slowest_shards") or []:
+        if isinstance(row, Mapping):
+            score = float(row.get("elapsed_s", 0.0) or 0.0)
+            name = f"{row.get('interval')}:{row.get('horizon_minutes')}:{row.get('task')}:shard={row.get('shard_index')}"
+            packet.record_top_offender(name, score, category="slowest_shard", metadata=dict(row))
+
+    accuracy = result.get("accuracy") if isinstance(result.get("accuracy"), Mapping) else {}
+    verification = result.get("output_verification") if isinstance(result.get("output_verification"), Mapping) else {}
+    row_counts = {
+        "forecast_rows": int(sum(int(row.get("forecast_rows", 0) or 0) for row in diagnostics.get("slowest_shards") or [] if isinstance(row, Mapping))),
+        "accuracy_rows": int(accuracy.get("rows", 0) or accuracy.get("row_count", 0) or 0),
+        "verification_failure_count": len(verification.get("failures") or []) if isinstance(verification.get("failures"), list) else 0,
+    }
+    parity_status = "passed" if row_counts["verification_failure_count"] == 0 else "failed"
+    packet.set_output_parity(
+        status=parity_status,
+        row_counts=row_counts,
+        notes=["Numeric packet alignment preserves existing run_summary.json, diagnostics JSONL, and Stage 2 handoff manifests."],
+    )
+    packet.finalize(
+        status="completed" if bool(result.get("success", True)) else "failed",
+        run_summary={
+            "legacy_run_summary_path": paths.get("run_summary"),
+            "diagnostics_jsonl": result.get("diagnostics_jsonl") or paths.get("diagnostics_jsonl"),
+            "requested_effective_concurrency": {
+                "requested_workers": config.get("unit_workers") or result.get("workers"),
+                "requested_model_threads": config.get("model_threads") or result.get("model_threads"),
+                "effective_workers": concurrency.get("effective_workers") or config.get("unit_workers") or result.get("workers"),
+                "effective_model_threads": concurrency.get("effective_model_threads") or config.get("model_threads") or result.get("model_threads"),
+                "dispatch_mode": concurrency.get("dispatch_mode"),
+                "max_parallel_active": concurrency.get("max_parallel_active"),
+            },
+            "writer_stats": writer_stats,
+            "runner_diagnostics": diagnostics,
+            "production_outputs_written": False,
+        },
+    )
+    return {
+        "run_summary": str(packet.paths.run_summary),
+        "diagnostic_manifest": str(packet.paths.diagnostic_manifest),
+        "diagnostic_events": str(packet.paths.diagnostic_events),
+        "diagnostic_samples": str(packet.paths.diagnostic_samples),
+        "top_offenders": str(packet.paths.top_offenders),
+        "output_parity": str(packet.paths.output_parity),
     }
 
 

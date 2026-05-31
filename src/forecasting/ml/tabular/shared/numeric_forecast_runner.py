@@ -30,7 +30,15 @@ from src.features.scalar_features import (
 from src.forecasting.common.ml_module_utils import horizon_bars_from_minutes as shared_horizon_bars_from_minutes
 from src.forecasting.common.ohlcvt_source import read_ohlcvt
 from src.forecasting.common.path_config import require_pipeline_io, resolve_path, selected_profile
-from src.forecasting.common.runtime_config import cap_model_threads, get_model_threads, get_workers, log_resolved_runtime
+from src.forecasting.common.concurrency import (
+    ConcurrencyProfile,
+    ThreadCapSnapshot,
+    apply_thread_caps,
+    log_concurrency_once,
+    resolve_concurrency_profile,
+    worker_thread_initializer,
+)
+from src.forecasting.common.runtime_config import get_model_threads, get_workers, log_resolved_runtime
 from src.forecasting.common.sandbox_paths import SandboxOutputRoots, assert_write_allowed, resolve_sandbox_output_roots
 from src.forecasting.ml.shared.numeric_runtime_common import (
     ModuleLogFn,
@@ -136,6 +144,54 @@ class NumericFamilyModuleSpec:
     default_training_window_months_for_combo_fn: Callable[[int, int, str], int]
     training_window_bars_for_pair_fn: Callable[[str, int, int], int]
     training_window_bars_from_months_fn: Callable[[int, int], int]
+
+
+def resolve_numeric_concurrency_profile(
+    spec: NumericFamilyModuleSpec,
+    *,
+    unit_workers: int,
+    profile: str = "balanced",
+) -> ConcurrencyProfile:
+    return resolve_concurrency_profile(
+        spec.module_slug,
+        profile=profile,
+        worker_key="unit_workers",
+        model_threads_key="model_threads",
+        requested_workers=max(1, int(unit_workers)),
+        requested_model_threads=get_model_threads(spec.module_slug, spec.default_model_threads),
+        fallback_workers=spec.default_unit_workers,
+        fallback_model_threads=spec.default_model_threads,
+        max_logical_threads=spec.max_logical_threads,
+    )
+
+
+def numeric_concurrency_summary(profile: ConcurrencyProfile, snapshot: ThreadCapSnapshot) -> Dict[str, Any]:
+    optional_status = {
+        name: (payload.get("status") if isinstance(payload, dict) else None)
+        for name, payload in snapshot.status.items()
+        if name in {"threadpoolctl", "numba", "pyarrow"}
+    }
+    return {
+        "schema_version": int(snapshot.schema_version),
+        "module_name": str(profile.module_name),
+        "profile_name": str(profile.profile_name),
+        "requested_workers": int(profile.requested_workers),
+        "effective_workers": int(profile.effective_workers),
+        "requested_model_threads": int(profile.requested_model_threads),
+        "effective_model_threads": int(profile.effective_model_threads),
+        "requested_helper_threads": int(profile.requested_helper_threads),
+        "effective_helper_threads": int(profile.effective_helper_threads),
+        "max_logical_threads": int(profile.max_logical_threads),
+        "worker_source": str(profile.worker_source),
+        "model_threads_source": str(profile.model_threads_source),
+        "effective_thread_product": int(profile.effective_thread_product),
+        "thread_env": dict(snapshot.env),
+        "optional_controls": optional_status,
+    }
+
+
+def init_stage_write_queue_with_thread_caps(profile: ConcurrencyProfile, write_queue: Any) -> ThreadCapSnapshot:
+    return worker_thread_initializer(profile, init_stage_write_queue, write_queue)
 
 def _infer_training_window_months_for_state(
     spec: NumericFamilyModuleSpec,
@@ -376,15 +432,35 @@ def build_numeric_family_module(spec: NumericFamilyModuleSpec) -> Dict[str, Any]
         parser.add_argument("--unit-workers", type=int, default=get_workers(spec.module_slug, "unit_workers", spec.default_unit_workers))
         args = parser.parse_args()
         require_pipeline_io(profile=str(args.profile or pipeline_profile))
-        args.unit_workers = max(1, int(args.unit_workers))
-        resolved_model_threads = cap_model_threads(
-            workers=int(args.unit_workers),
-            model_threads=get_model_threads(spec.module_slug, spec.default_model_threads),
-            max_logical_threads=spec.max_logical_threads,
+        requested_unit_workers = max(1, int(args.unit_workers))
+        concurrency_profile = resolve_numeric_concurrency_profile(
+            spec,
+            unit_workers=requested_unit_workers,
+            profile="balanced",
         )
-        for env_name in spec.thread_env_vars:
-            os.environ[env_name] = str(int(resolved_model_threads))
-        log_resolved_runtime(spec.module_slug, resolved={"unit_workers": int(args.unit_workers), "model_threads": int(resolved_model_threads), "writer_workers": 1})
+        args.unit_workers = int(concurrency_profile.effective_workers)
+        resolved_model_threads = int(concurrency_profile.effective_model_threads)
+        concurrency_snapshot = apply_thread_caps(concurrency_profile)
+        concurrency_summary = numeric_concurrency_summary(concurrency_profile, concurrency_snapshot)
+        log_resolved_runtime(
+            spec.module_slug,
+            resolved={
+                "unit_workers": int(args.unit_workers),
+                "requested_unit_workers": int(concurrency_profile.requested_workers),
+                "model_threads": int(resolved_model_threads),
+                "requested_model_threads": int(concurrency_profile.requested_model_threads),
+                "writer_workers": 1,
+            },
+        )
+        log_concurrency_once(spec.module_slug, concurrency_summary, scope="parent")
+        log(
+            f"{spec.log_prefix}[concurrency] requested_workers={int(concurrency_profile.requested_workers)} "
+            f"effective_workers={int(concurrency_profile.effective_workers)} "
+            f"requested_model_threads={int(concurrency_profile.requested_model_threads)} "
+            f"effective_model_threads={int(concurrency_profile.effective_model_threads)} "
+            f"helper_threads={int(concurrency_profile.effective_helper_threads)} "
+            "standard_diagnostic_packet=deferred reason=direct_numeric_runner_has_no_natural_run_summary_root"
+        )
 
         explicit_combo_list = parse_combo_list_fn(args.combo_list)
         explicit_combo_profile_list = parse_combo_profile_list_fn(args.combo_profile_list)
@@ -655,7 +731,12 @@ def build_numeric_family_module(spec: NumericFamilyModuleSpec) -> Dict[str, Any]
                 last_parallel_exc: Optional[Exception] = None
                 for attempt in range(1, int(STAGE_PARALLEL_INIT_RETRIES) + 1):
                     try:
-                        with ProcessPoolExecutor(max_workers=min(max(1, int(args.unit_workers)), len(group_work_items)), mp_context=mp_ctx, initializer=init_stage_write_queue, initargs=(write_queue,)) as ex:
+                        with ProcessPoolExecutor(
+                            max_workers=min(max(1, int(args.unit_workers)), len(group_work_items)),
+                            mp_context=mp_ctx,
+                            initializer=init_stage_write_queue_with_thread_caps,
+                            initargs=(concurrency_profile, write_queue),
+                        ) as ex:
                             fut_map = {ex.submit(compute_group, engine_config, gw): (gw.asset, int(gw.interval), int(gw.horizon_minutes), int(gw.horizon_bars)) for gw in group_work_items}
                             for fut in as_completed(fut_map):
                                 _asset_done, _interval, _horizon_minutes, horizon_bars = fut_map[fut]

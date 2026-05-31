@@ -44,6 +44,7 @@ from src.forecasting.ml.tabular.shared.tabular_numeric_model_registry import (
     write_runtime_config_for_model,
 )
 from src.forecasting.ml.shared.test_branch_function_telemetry import emit_event_for_path
+from src.forecasting.ml.shared.numeric_runner_diagnostics import emit_standard_numeric_diagnostic_packet
 
 
 DEFAULT_MODEL_KEY = "xgboost"
@@ -1882,6 +1883,15 @@ def run_stage(
     }
     (run_dir / "run_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     result["artifact_count"] = int(write_unit_artifacts(output_dir, result))
+    packet_paths = emit_standard_numeric_diagnostic_packet(
+        packet_root=run_dir / "standard_diagnostic_packet",
+        run_result=result,
+        mode="test",
+        module_name=__name__,
+        run_id=f"{CURRENT_MODEL_SPEC.model_key}_{runtime_profile}_{interval_label}_{training_window_label}",
+    )
+    result["standard_diagnostic_packet"] = packet_paths
+    result.setdefault("paths", {})["standard_diagnostic_packet"] = str(run_dir / "standard_diagnostic_packet")
     (run_dir / "run_summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     emit_stage_function_telemetry(output_dir, CURRENT_MODEL_SPEC.model_key, result)
     if return_code != 0:
