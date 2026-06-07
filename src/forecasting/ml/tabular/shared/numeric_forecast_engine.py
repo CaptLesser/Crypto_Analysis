@@ -2,6 +2,8 @@
 
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import os
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -25,6 +27,7 @@ from src.forecasting.ml.shared.numeric_forecast_io import (
     stage_month_parts,
     ts_monotonic_unique,
 )
+from src.forecasting.ml.shared.numeric_runner_diagnostics import resource_snapshot, worker_resource_telemetry_record
 from src.forecasting.ml.shared.numeric_forecast_targets import add_count, add_elapsed, compute_future_labels
 
 P10_Z = -1.2815515655446004
@@ -44,6 +47,119 @@ class RegressionBundle:
     mean_model: Any
     residual_std: float
     diagnostics: Optional[Dict[str, Any]] = None
+
+
+def _tabular_prepared_array_reuse_enabled() -> bool:
+    raw = str(os.getenv("PIPELINE_TABULAR_PREPARED_ARRAY_REUSE", "1") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _initial_walk_forward_x_cols(
+    engine_config: "NumericForecastEngineConfig",
+    df: pd.DataFrame,
+    *,
+    task: str,
+    horizon_minutes: int,
+    interval_minutes: int,
+    label_base: str,
+    prepared_x_cols: Optional[Sequence[str]] = None,
+) -> List[str]:
+    if prepared_x_cols is not None:
+        return [str(col) for col in list(prepared_x_cols)]
+    return engine_config.select_feature_columns_fn(
+        df.columns,
+        str(task),
+        int(horizon_minutes),
+        int(interval_minutes),
+        {label_base, "future_direction"},
+    )
+
+
+def _state_restored_x_cols(
+    df: pd.DataFrame,
+    x_cols: Sequence[str],
+    initial_state: Optional[Dict[str, Any]],
+) -> List[str]:
+    resolved = [str(col) for col in list(x_cols)]
+    state_x_cols = list(initial_state.get("x_cols", [])) if isinstance(initial_state, dict) else []
+    if state_x_cols and all(c in df.columns for c in state_x_cols):
+        return [str(col) for col in state_x_cols]
+    return resolved
+
+
+class _PreparedArrayCache:
+    def __init__(
+        self,
+        *,
+        detail_counts: Dict[str, int],
+        detail_timing: Dict[str, float],
+        enabled: bool,
+    ) -> None:
+        self._detail_counts = detail_counts
+        self._detail_timing = detail_timing
+        self.enabled = bool(enabled)
+        self._ts_by_frame: Dict[Tuple[int, int, Optional[int], Optional[int]], np.ndarray] = {}
+        self._x_by_key: Dict[Tuple[Tuple[int, int, Optional[int], Optional[int]], Tuple[str, ...]], np.ndarray] = {}
+        self._y_by_key: Dict[Tuple[Tuple[int, int, Optional[int], Optional[int]], str], np.ndarray] = {}
+
+    @staticmethod
+    def _frame_token(df: pd.DataFrame) -> Tuple[int, int, Optional[int], Optional[int]]:
+        if df.empty or "ts" not in df.columns:
+            return (id(df), int(len(df)), None, None)
+        ts = df["ts"]
+        return (id(df), int(len(df)), int(ts.iloc[0]), int(ts.iloc[-1]))
+
+    def _miss(self) -> None:
+        add_count(self._detail_counts, "prepared_array_cache_misses", 1)
+
+    def _hit(self) -> None:
+        add_count(self._detail_counts, "prepared_array_cache_hits", 1)
+        add_count(self._detail_counts, "prepared_array_reuses", 1)
+
+    def _build(self, elapsed_s: float) -> None:
+        add_count(self._detail_counts, "prepared_array_builds", 1)
+        add_elapsed(self._detail_timing, "prepared_array_build_s", float(elapsed_s))
+
+    def prepared_ts(self, df: pd.DataFrame) -> np.ndarray:
+        token = self._frame_token(df)
+        cached = self._ts_by_frame.get(token)
+        if cached is not None:
+            self._hit()
+            return cached
+        self._miss()
+        t0 = time.monotonic()
+        out = df["ts"].to_numpy(dtype=np.int64)
+        self._ts_by_frame[token] = out
+        self._build(time.monotonic() - t0)
+        return out
+
+    def prepared_x(self, df: pd.DataFrame, x_cols: Sequence[str]) -> np.ndarray:
+        token = self._frame_token(df)
+        key = (token, tuple(str(col) for col in x_cols))
+        cached = self._x_by_key.get(key)
+        if cached is not None:
+            self._hit()
+            return cached
+        self._miss()
+        t0 = time.monotonic()
+        out = df[list(key[1])].to_numpy(dtype=DEFAULT_FLOAT_DTYPE)
+        self._x_by_key[key] = out
+        self._build(time.monotonic() - t0)
+        return out
+
+    def prepared_y(self, df: pd.DataFrame, label_base: str) -> np.ndarray:
+        token = self._frame_token(df)
+        key = (token, str(label_base))
+        cached = self._y_by_key.get(key)
+        if cached is not None:
+            self._hit()
+            return cached
+        self._miss()
+        t0 = time.monotonic()
+        out = pd.to_numeric(df[str(label_base)], errors="coerce").to_numpy(dtype=DEFAULT_FLOAT_DTYPE)
+        self._y_by_key[key] = out
+        self._build(time.monotonic() - t0)
+        return out
 
 
 def _record_fit_diagnostics(model: Any, detail_counts: Dict[str, int]) -> None:
@@ -204,16 +320,19 @@ def walk_forward_predict(
         "wf_first_real_idx": -1,
     }
     t_feature_select = time.monotonic()
-    x_cols = (
-        [str(col) for col in list(prepared_x_cols)]
-        if prepared_x_cols is not None
-        else engine_config.select_feature_columns_fn(df.columns, str(task), int(horizon_minutes), int(interval_minutes), {label_base, "future_direction"})
+    x_cols = _initial_walk_forward_x_cols(
+        engine_config,
+        df,
+        task=str(task),
+        horizon_minutes=int(horizon_minutes),
+        interval_minutes=int(interval_minutes),
+        label_base=str(label_base),
+        prepared_x_cols=prepared_x_cols,
     )
     add_elapsed(detail_timing, "wf_feature_select_s", time.monotonic() - t_feature_select)
     t_state_restore = time.monotonic()
     state_x_cols = list(initial_state.get("x_cols", [])) if isinstance(initial_state, dict) else []
-    if state_x_cols and all(c in df.columns for c in state_x_cols):
-        x_cols = list(state_x_cols)
+    x_cols = _state_restored_x_cols(df, x_cols, initial_state)
     add_elapsed(detail_timing, "wf_state_restore_s", time.monotonic() - t_state_restore)
     t_numpy_extract = time.monotonic()
     x = as_default_float_array(prepared_x) if prepared_x is not None else df[x_cols].to_numpy(dtype=DEFAULT_FLOAT_DTYPE)
@@ -587,6 +706,9 @@ def compute_group(engine_config: NumericForecastEngineConfig, work_group: Horizo
     io_config = engine_config.io_config
     if not work_group.works:
         return {"group_id": str(work_group.group_id), "results": []}
+    worker_start_epoch = time.time()
+    worker_start_utc = datetime.now(timezone.utc).isoformat()
+    worker_resource_start = resource_snapshot(include_thread_snapshot=True)
     first_work = work_group.works[0]
     group_label = f"asset={work_group.asset} k={int(work_group.interval)} h={int(work_group.horizon_minutes)}m tasks={','.join(str(w.task) for w in work_group.works)}"
     step_seconds = int(work_group.interval) * 60
@@ -610,6 +732,7 @@ def compute_group(engine_config: NumericForecastEngineConfig, work_group: Horizo
         "apply_head_floor_s": 0.0,
         "empty_chunk_fastpath_s": 0.0,
         "cache_tail_build_s": 0.0,
+        "prepared_array_build_s": 0.0,
     }
     group_detail_counts: Dict[str, int] = {
         "chunk_rows_loaded": 0,
@@ -618,7 +741,14 @@ def compute_group(engine_config: NumericForecastEngineConfig, work_group: Horizo
         "chunk_rows_after_floor": 0,
         "suffix_start_idx": 0,
         "suffix_rows_labeled": 0,
+        "prepared_array_builds": 0,
+        "prepared_array_reuses": 0,
+        "prepared_array_cache_hits": 0,
+        "prepared_array_cache_misses": 0,
+        "prepared_array_reuse_disabled_count": 0,
     }
+    prepared_array_reuse_enabled = _tabular_prepared_array_reuse_enabled()
+    prepared_array_reuse_disabled_reason = "" if prepared_array_reuse_enabled else "env_disabled"
     for work in sorted(work_group.works, key=lambda w: str(w.task)):
         unit_label = f"asset={work.asset} k={int(work.interval)} h={int(work.horizon_minutes)}m task={work.task}"
         regressor_params = engine_config.resolve_model_params_fn(
@@ -774,6 +904,11 @@ def compute_group(engine_config: NumericForecastEngineConfig, work_group: Horizo
                 ctx["current_edge"] = int(chunk_end_ts)
             continue
 
+        prepared_array_cache = _PreparedArrayCache(
+            detail_counts=group_detail_counts,
+            detail_timing=group_detail_timing,
+            enabled=prepared_array_reuse_enabled,
+        )
         pending_chunk_commits: List[Dict[str, Any]] = []
         pending_pred_month_frames: Dict[Tuple[int, int], List[pd.DataFrame]] = {}
         pending_eval_month_frames: Dict[Tuple[int, int], List[pd.DataFrame]] = {}
@@ -787,7 +922,34 @@ def compute_group(engine_config: NumericForecastEngineConfig, work_group: Horizo
             if int(process_from_ts) > int(chunk_end_ts):
                 ctx["current_edge"] = int(chunk_end_ts)
                 continue
-            pred_df, eval_df, tail_fill_ts, meta = walk_forward_predict(engine_config, df=df, task=work.task, horizon_minutes=int(work.horizon_minutes), interval_minutes=int(work.interval), horizon_bars=int(work.horizon_bars), selected_window_bars=int(work.training_window_bars), refit_cadence=work.refit_cadence, initial_state=ctx["state"], process_from_ts=int(process_from_ts), progress_label=str(ctx["unit_label"]), regressor_params=dict(ctx["regressor_params"]))
+            prepared_x_cols_arg: Optional[List[str]] = None
+            prepared_x_arg: Optional[np.ndarray] = None
+            prepared_ts_arg: Optional[np.ndarray] = None
+            prepared_y_arg: Optional[np.ndarray] = None
+            if prepared_array_cache.enabled:
+                try:
+                    label_base = engine_config.task_label[work.task]
+                    prepared_x_cols_arg = _initial_walk_forward_x_cols(
+                        engine_config,
+                        df,
+                        task=str(work.task),
+                        horizon_minutes=int(work.horizon_minutes),
+                        interval_minutes=int(work.interval),
+                        label_base=str(label_base),
+                    )
+                    prepared_x_cols_arg = _state_restored_x_cols(df, prepared_x_cols_arg, ctx["state"])
+                    prepared_ts_arg = prepared_array_cache.prepared_ts(df)
+                    prepared_x_arg = prepared_array_cache.prepared_x(df, prepared_x_cols_arg)
+                    prepared_y_arg = prepared_array_cache.prepared_y(df, str(label_base))
+                except Exception as exc:  # noqa: BLE001 - fallback preserves existing behavior
+                    add_count(group_detail_counts, "prepared_array_reuse_disabled_count", 1)
+                    if not prepared_array_reuse_disabled_reason:
+                        prepared_array_reuse_disabled_reason = f"prepare_failed:{type(exc).__name__}"
+                    prepared_x_cols_arg = None
+                    prepared_x_arg = None
+                    prepared_ts_arg = None
+                    prepared_y_arg = None
+            pred_df, eval_df, tail_fill_ts, meta = walk_forward_predict(engine_config, df=df, task=work.task, horizon_minutes=int(work.horizon_minutes), interval_minutes=int(work.interval), horizon_bars=int(work.horizon_bars), selected_window_bars=int(work.training_window_bars), refit_cadence=work.refit_cadence, initial_state=ctx["state"], process_from_ts=int(process_from_ts), progress_label=str(ctx["unit_label"]), regressor_params=dict(ctx["regressor_params"]), prepared_x_cols=prepared_x_cols_arg, prepared_x=prepared_x_arg, prepared_ts=prepared_ts_arg, prepared_y=prepared_y_arg)
             pending_eval_from_ts = min((int(ts_i) for ts_i in tail_fill_ts), default=None)
             tshort = engine_config.task_short[work.task]
             pref = io_config.naming.prediction_prefix
@@ -916,6 +1078,38 @@ def compute_group(engine_config: NumericForecastEngineConfig, work_group: Horizo
         cached_feature_tail = df if df.empty or int(df["ts"].iloc[0]) >= int(next_tail_start_ts) else df[df["ts"].astype("int64") >= int(next_tail_start_ts)].copy()
 
     wall_s = float(time.monotonic() - run_t0)
+    worker_end_epoch = time.time()
+    worker_end_utc = datetime.now(timezone.utc).isoformat()
+    worker_resource_end = resource_snapshot(include_thread_snapshot=True)
+    worker_telemetry = worker_resource_telemetry_record(
+        module=str(io_config.naming.module_slug),
+        run_id=str(work_group.group_id),
+        task_id=str(work_group.group_id),
+        work_unit_id=str(work_group.group_id),
+        status="completed",
+        start_time_utc=worker_start_utc,
+        end_time_utc=worker_end_utc,
+        start_epoch_s=worker_start_epoch,
+        end_epoch_s=worker_end_epoch,
+        resource_start=worker_resource_start,
+        resource_end=worker_resource_end,
+        phase_timings={
+            "load_read_s": float(data_load_s_total),
+            "read_ohlc_s": float(read_ohlc_s_total),
+            "read_scalar_s": float(read_scalar_s_total),
+            "future_label_s": float(future_label_s_total),
+            "wall_s": float(wall_s),
+        },
+        identity={
+            "asset": str(work_group.asset),
+            "interval": int(work_group.interval),
+            "horizon_minutes": int(work_group.horizon_minutes),
+            "horizon_bars": int(work_group.horizon_bars),
+            "target": ",".join(str(work.task) for work in work_group.works),
+            "model_family": str(io_config.naming.module_slug),
+            "task_count": int(len(work_group.works)),
+        },
+    )
     results: List[Dict[str, Any]] = []
     for task, ctx in sorted(task_ctx.items()):
         work = ctx["work"]
@@ -946,6 +1140,7 @@ def compute_group(engine_config: NumericForecastEngineConfig, work_group: Horizo
             "model_save_s": float(ctx["model_save_s_total"]),
             **detailed_timing,
             **detailed_counts,
+            "prepared_array_reuse_disabled_reason": str(prepared_array_reuse_disabled_reason),
             "accounted_s_total": accounted_s_total,
             "residual_s_total": residual_s_total,
             "detailed_timing_nonoverlap_note": "Detailed timing fields are intended as non-overlapping instrumentation buckets within a unit where measured.",
@@ -953,4 +1148,4 @@ def compute_group(engine_config: NumericForecastEngineConfig, work_group: Horizo
         }
         results.append({"unit_label": ctx["unit_label"], "asset": work.asset, "interval": int(work.interval), "horizon_minutes": int(work.horizon_minutes), "task": work.task, "rows_dropped": int(ctx["rows_dropped_total"]), "ts_start": ctx["ts_start_seen"], "rows_written": int(ctx["rows_written_total"]), "work_start_ts": int(work.work_start_ts), "work_end_ts": int(work.work_end_ts), "next_selected_window": ctx["state"].get("selected_window_bars"), "pred_parts": list(ctx["pred_parts_all"]), "eval_parts": list(ctx["eval_parts_all"]), "diag_summary": diag_summary})
     enqueue_stage_group_done(str(work_group.group_id))
-    return {"group_id": str(work_group.group_id), "results": results}
+    return {"group_id": str(work_group.group_id), "results": results, "worker_telemetry": worker_telemetry}

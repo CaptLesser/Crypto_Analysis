@@ -31,6 +31,7 @@ from src.regimes.core.preprocessing import (
 from src.regimes.core.promotion_gate import PromotionGateInput, evaluate_promotion_gate
 from src.regimes.core.scoreboard import build_regime_scoreboard
 from src.regimes.core.serialization import dumps_json, loads_json, require_json_object, to_jsonable
+from src.regimes.core.splits import split_train_score_by_rows
 from src.regimes.studies.fixtures import synthetic_asset_state_fixture
 from src.regimes.studies.manifest import StudyManifest, default_asset_trend_manifest
 from src.regimes.studies.search_space import StudySearchSpace, build_search_space
@@ -84,15 +85,12 @@ def _write_markdown(path: Path, text: str) -> None:
 
 
 def _split_dataset(frame: pd.DataFrame, split_policy: Mapping[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    row_count = int(len(frame))
-    if row_count < 3:
-        raise ValueError("Regime single trial requires at least three dataset rows")
-    if split_policy.get("train_rows") is not None:
-        train_rows = int(split_policy["train_rows"])
-    else:
-        train_rows = int(row_count * float(split_policy.get("train_fraction", 2.0 / 3.0)))
-    train_rows = max(2, min(row_count - 1, train_rows))
-    return frame.iloc[:train_rows].copy(), frame.iloc[train_rows:].copy()
+    return split_train_score_by_rows(
+        frame,
+        split_policy,
+        min_total_rows=3,
+        min_total_rows_error="Regime single trial requires at least three dataset rows",
+    )
 
 
 def _stability_perturbations(labels: Sequence[int]) -> tuple[dict[str, Any], ...]:

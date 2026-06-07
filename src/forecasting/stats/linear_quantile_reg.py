@@ -34,6 +34,9 @@ from src.forecasting.common.stats_module_utils import (
     write_forecast_parts,
     write_json_atomic,
 )
+from src.forecasting.stats.shared.stats_model_utils import horizon_bars as _horizon_bars
+from src.forecasting.stats.shared.stats_model_utils import parse_int_csv as _parse_int_csv
+from src.forecasting.stats.shared.stats_model_utils import parse_str_csv as _parse_str_csv
 from src.forecasting.stats.shared.stats_numeric_runner import StatsNumericModuleSpec, run_stats_numeric_module
 
 try:
@@ -79,29 +82,11 @@ def log(msg: str) -> None:
     base_log(f"[linear_quantile_reg] {msg}")
 
 
-def _parse_int_csv(raw: str, default_vals: Sequence[int]) -> List[int]:
-    vals = [int(x.strip()) for x in str(raw).split(",") if x.strip()]
-    return sorted(set(vals)) if vals else sorted(set(int(x) for x in default_vals))
-
-
-def _parse_str_csv(raw: str, default_vals: Sequence[str]) -> List[str]:
-    vals = [x.strip() for x in str(raw).split(",") if x.strip()]
-    return sorted(set(vals)) if vals else sorted(set(str(x) for x in default_vals))
-
-
 def _parse_quantiles(raw: str) -> List[float]:
     vals = [float(x.strip()) for x in str(raw).split(",") if x.strip()]
     q = vals if vals else list(DEFAULT_QUANTILES)
     q = sorted(set(float(x) for x in q if 0.0 < float(x) < 1.0))
     return q if q else list(DEFAULT_QUANTILES)
-
-
-def _horizon_bars(horizon_minutes: int, interval_minutes: int) -> int:
-    hm = int(horizon_minutes)
-    iv = int(interval_minutes)
-    if hm <= 0 or iv <= 0 or hm % iv != 0:
-        raise ValueError(f"invalid horizon/interval pair: horizon={hm} interval={iv}")
-    return hm // iv
 
 
 def _build_supervised(y_vals: np.ndarray, lags: Sequence[int]) -> Tuple[np.ndarray, np.ndarray]:

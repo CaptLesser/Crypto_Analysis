@@ -102,6 +102,7 @@ from src.forecasting.ml.shared.numeric_forecast_io import (
 )
 from src.forecasting.ml.shared.production_time import production_start_ts
 from src.forecasting.ml.shared.numeric_forecast_targets import compute_future_labels, future_window_views, safe_log_return, safe_true_range
+from src.forecasting.ml.shared.numeric_runner_diagnostics import append_diagnostic_event, reset_diagnostics_file
 MIN_PLANNING_WORKERS = 14
 STAGE_PARALLEL_INIT_RETRIES = 3
 STAGE_PARALLEL_INIT_RETRY_SECONDS = 0.25
@@ -461,6 +462,28 @@ def build_numeric_family_module(spec: NumericFamilyModuleSpec) -> Dict[str, Any]
             f"helper_threads={int(concurrency_profile.effective_helper_threads)} "
             "standard_diagnostic_packet=deferred reason=direct_numeric_runner_has_no_natural_run_summary_root"
         )
+        worker_diagnostics_path = (
+            state_root / f"{spec.module_slug}_run_diagnostics.jsonl"
+            if bool(getattr(sandbox_roots, "enabled", False))
+            else None
+        )
+        if worker_diagnostics_path is not None:
+            reset_diagnostics_file(worker_diagnostics_path)
+
+        def _emit_group_worker_telemetry(group_payload: Dict[str, Any]) -> None:
+            telemetry = group_payload.get("worker_telemetry") if isinstance(group_payload, dict) else None
+            if worker_diagnostics_path is None or not isinstance(telemetry, dict):
+                return
+            append_diagnostic_event(
+                worker_diagnostics_path,
+                "worker_resource",
+                {
+                    "run_id": str(telemetry.get("run_id") or group_payload.get("group_id") or ""),
+                    "module_tag": str(spec.module_slug),
+                    "family_label": str(spec.family_name),
+                    "worker_telemetry": telemetry,
+                },
+            )
 
         explicit_combo_list = parse_combo_list_fn(args.combo_list)
         explicit_combo_profile_list = parse_combo_profile_list_fn(args.combo_profile_list)
@@ -721,7 +744,9 @@ def build_numeric_family_module(spec: NumericFamilyModuleSpec) -> Dict[str, Any]
             if (not parallel_allowed) or args.unit_workers <= 1 or len(group_work_items) <= 1:
                 for idx, gw in enumerate(group_work_items, start=1):
                     log(f"{spec.log_prefix}[dispatch] mode=serial idx={idx}/{len(group_work_items)} asset={gw.asset} k={gw.interval} h={gw.horizon_minutes}m tasks={','.join(w.task for w in gw.works)}")
-                    group_results = finalize_group_results_fn(compute_group(engine_config, gw), writer_state, writer_cv)
+                    group_payload = compute_group(engine_config, gw)
+                    _emit_group_worker_telemetry(group_payload)
+                    group_results = finalize_group_results_fn(group_payload, writer_state, writer_cv)
                     unit_results.extend(group_results)
                     for res in group_results:
                         completed_units += 1
@@ -740,7 +765,9 @@ def build_numeric_family_module(spec: NumericFamilyModuleSpec) -> Dict[str, Any]
                             fut_map = {ex.submit(compute_group, engine_config, gw): (gw.asset, int(gw.interval), int(gw.horizon_minutes), int(gw.horizon_bars)) for gw in group_work_items}
                             for fut in as_completed(fut_map):
                                 _asset_done, _interval, _horizon_minutes, horizon_bars = fut_map[fut]
-                                group_results = finalize_group_results_fn(fut.result(), writer_state, writer_cv)
+                                group_payload = fut.result()
+                                _emit_group_worker_telemetry(group_payload)
+                                group_results = finalize_group_results_fn(group_payload, writer_state, writer_cv)
                                 unit_results.extend(group_results)
                                 for res in group_results:
                                     completed_units += 1
@@ -760,7 +787,9 @@ def build_numeric_family_module(spec: NumericFamilyModuleSpec) -> Dict[str, Any]
                     log(f"{spec.log_prefix}[runtime-fallback] process pool unavailable after retries; forcing serial execution: {last_parallel_exc}")
                     for idx, gw in enumerate(group_work_items, start=1):
                         log(f"{spec.log_prefix}[dispatch] mode=serial idx={idx}/{len(group_work_items)} asset={gw.asset} k={gw.interval} h={gw.horizon_minutes}m tasks={','.join(w.task for w in gw.works)}")
-                        group_results = finalize_group_results_fn(compute_group(engine_config, gw), writer_state, writer_cv)
+                        group_payload = compute_group(engine_config, gw)
+                        _emit_group_worker_telemetry(group_payload)
+                        group_results = finalize_group_results_fn(group_payload, writer_state, writer_cv)
                         unit_results.extend(group_results)
                         for res in group_results:
                             completed_units += 1

@@ -29,6 +29,7 @@ from src.regimes.core.paths import default_foundation_report_root, is_relative_t
 from src.regimes.core.preprocessing import fit_preprocessing_pipeline, transform_score_window_preprocessor
 from src.regimes.core.promotion_gate import PROMOTION_STATUS_BLOCKED, PromotionGateInput, evaluate_promotion_gate
 from src.regimes.core.serialization import dumps_json, loads_json, require_json_object, to_jsonable
+from src.regimes.core.splits import split_train_score_by_rows
 from src.regimes.studies.fixtures import synthetic_asset_state_fixture
 from src.regimes.studies.manifest import StudyManifest
 from src.regimes.studies.search_space import build_search_space
@@ -111,9 +112,7 @@ def foundation_smoke_study_manifest(
 
 
 def _split_dataset(frame: pd.DataFrame, manifest: StudyManifest) -> tuple[pd.DataFrame, pd.DataFrame]:
-    train_rows = int(manifest.split_policy.get("train_rows") or max(2, int(len(frame) * 2 / 3)))
-    train_rows = max(2, min(int(len(frame)) - 1, train_rows))
-    return frame.iloc[:train_rows].copy(), frame.iloc[train_rows:].copy()
+    return split_train_score_by_rows(frame, manifest.split_policy)
 
 
 def _source_lineage(source_path: Path) -> tuple[SourceArtifactLineage, ...]:

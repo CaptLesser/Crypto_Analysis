@@ -21,7 +21,22 @@ from src.forecasting.common.path_config import resolve_path, selected_profile
 from src.forecasting.common.stats_module_utils import NUMERIC_TASK_TO_TARGET_COLUMN
 from src.forecasting.ml.bayesian.shared.bayesian_stage1_profile import resolve_execution_profile
 from src.forecasting.ml.bayesian.shared.bayesian_numeric_cohort import FIXED_BAYESIAN_NUMERIC_COHORT
-from src.forecasting.ml.shared.numeric_forecast_targets import compute_future_labels
+from src.forecasting.ml.shared.stage3_dataset_builder import (
+    Stage3DatasetBuildConfig,
+    Stage3DatasetBuildHooks,
+    Stage3FeatureProfile,
+    build_evaluation_arrays,
+    build_stage3_datasets,
+    evaluate_window as shared_evaluate_window,
+    label_frame as shared_label_frame,
+    load_stage3_asset_frame,
+    sample_origins as shared_sample_origins,
+)
+from src.forecasting.ml.shared.numeric_origin_evaluator import (
+    OriginEvaluationInput,
+    evaluate_origin_predictions,
+    metric_values,
+)
 from src.forecasting.ml.shared.test_branch_function_telemetry import (
     emit_event_for_path,
     emit_stage3_study_summary_for_path,
@@ -113,6 +128,77 @@ class MetricResult:
     last_prediction_ts: Optional[int]
     params_label: str
     training_window_months: Optional[int] = None
+
+
+@dataclass
+class _EvaluationArrayCacheEntry:
+    dataset_id: int
+    frame_id: int
+    factor_map_id: int
+    ts_vec: np.ndarray
+    y_vec: np.ndarray
+    feat_cols: Tuple[str, ...]
+    feat_matrix: Optional[np.ndarray]
+    factor_values: Optional[np.ndarray]
+
+
+class _EvaluationArrayCache:
+    def __init__(self) -> None:
+        self._entries: Dict[int, _EvaluationArrayCacheEntry] = {}
+        self._hits = 0
+        self._misses = 0
+        self._builds = 0
+        self._reuses = 0
+        self._fallback_reason = ""
+
+    @staticmethod
+    def _readonly(array: np.ndarray) -> np.ndarray:
+        array.setflags(write=False)
+        return array
+
+    def get(self, dataset: Dataset, *, needs_factor_cache: bool) -> _EvaluationArrayCacheEntry:
+        dataset_id = id(dataset)
+        frame_id = id(dataset.frame)
+        factor_map_id = id(dataset.factor_map)
+        cached = self._entries.get(dataset_id)
+        if cached is not None and cached.frame_id == frame_id and cached.factor_map_id == factor_map_id:
+            self._hits += 1
+            self._reuses += 1
+            return cached
+        self._misses += 1
+        self._builds += 1
+        arrays = build_evaluation_arrays(
+            dataset.frame,
+            target_col=str(dataset.target_col),
+            selected_feature_columns=dataset.selected_dynamic_feature_columns,
+            use_dynamic_features=bool(dataset.use_dynamic_features),
+        )
+        factor_values = None
+        if bool(needs_factor_cache):
+            factor_values = np.asarray([dataset.factor_map.get(int(ts), np.nan) for ts in arrays.ts_vec], dtype=float)
+            factor_values = self._readonly(factor_values)
+        entry = _EvaluationArrayCacheEntry(
+            dataset_id=dataset_id,
+            frame_id=frame_id,
+            factor_map_id=factor_map_id,
+            ts_vec=self._readonly(arrays.ts_vec),
+            y_vec=self._readonly(arrays.y_vec),
+            feat_cols=tuple(arrays.feat_cols),
+            feat_matrix=self._readonly(arrays.feat_matrix) if arrays.feat_matrix is not None else None,
+            factor_values=factor_values,
+        )
+        self._entries[dataset_id] = entry
+        return entry
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "evaluation_array_cache_entries": int(len(self._entries)),
+            "evaluation_array_builds": int(self._builds),
+            "evaluation_array_reuses": int(self._reuses),
+            "evaluation_array_cache_hits": int(self._hits),
+            "evaluation_array_cache_misses": int(self._misses),
+            "fallback_reason": str(self._fallback_reason),
+        }
 
 
 class _Stage3SetupCache:
@@ -396,10 +482,7 @@ def _setup_common_key(
 
 
 def _evaluate_window(edge_ts: int, recent_eval_days: int, history_window_months: int) -> Tuple[int, int]:
-    eval_end_ts = int(edge_ts)
-    eval_start_ts = int(edge_ts) - int(recent_eval_days) * 86400
-    history_start_ts = int(edge_ts) - int(history_window_months) * 31 * 86400
-    return history_start_ts, eval_end_ts
+    return shared_evaluate_window(edge_ts, recent_eval_days, history_window_months)
 
 
 def _combo_history_window_months(combo: ComboSpec, args: Optional[argparse.Namespace] = None) -> int:
@@ -414,46 +497,30 @@ def _combo_history_window_months(combo: ComboSpec, args: Optional[argparse.Names
 
 
 def _load_asset_frame(asset: str, combo: ComboSpec, history_start_ts: int, eval_end_ts: int, selected_dynamic_feature_columns: Optional[Sequence[str]] = None) -> pd.DataFrame:
-    ohlc_columns = ["open", "high", "low", "close", "volume", "trades"]
-    feature_columns = [NUMERIC_TASK_TO_TARGET_COLUMN[str(combo.task)]]
-    if selected_dynamic_feature_columns is None:
-        feature_columns.extend([str(c) for c in CURRENT_NUMERICS.MODULE_SPEC.dynamic_feature_candidates])
-    else:
-        feature_columns.extend([str(c) for c in selected_dynamic_feature_columns if str(c)])
-    ohlc_frame = read_ohlcvt(
-        root=_source_ohlcvt_root().resolve(),
+    return load_stage3_asset_frame(
         asset=str(asset),
-        interval_min=int(combo.interval),
-        start_ts=int(history_start_ts),
-        end_ts=int(eval_end_ts),
-        columns=["ts", "asset", *ohlc_columns],
+        combo=combo,
+        history_start_ts=int(history_start_ts),
+        eval_end_ts=int(eval_end_ts),
+        ohlcvt_root=_source_ohlcvt_root().resolve(),
+        feature_root=_source_feature_root(fallback=_source_ohlcvt_root()).resolve(),
+        selected_feature_columns=selected_dynamic_feature_columns,
+        dynamic_feature_candidates=CURRENT_NUMERICS.MODULE_SPEC.dynamic_feature_candidates,
+        include_dynamic_default=True,
+        merge_how="outer",
+        add_missing_columns=True,
+        return_empty_ohlcvt=False,
+        read_ohlcvt_fn=read_ohlcvt,
+        read_feature_window_columns_fn=read_feature_window_columns,
     )
-    feature_frame = read_feature_window_columns(
-        root=_source_feature_root(fallback=_source_ohlcvt_root()).resolve(),
-        interval_minutes=int(combo.interval),
-        asset=str(asset),
-        columns=list(dict.fromkeys(feature_columns)),
-        start_ts=int(history_start_ts),
-        end_ts=int(eval_end_ts),
-    )
-    merged = ohlc_frame.merge(feature_frame, on=["ts", "asset"], how="outer", sort=True)
-    for column in [*ohlc_columns, *feature_columns]:
-        if column not in merged.columns:
-            merged[column] = np.nan
-    return merged.sort_values("ts").reset_index(drop=True)
 
 
 def _label_frame(frame: pd.DataFrame, combo: ComboSpec) -> pd.DataFrame:
-    labels, _stats = compute_future_labels(frame.loc[:, ["high", "low", "close"]].reset_index(drop=True), int(combo.horizon_bars), future_direction_deadzone=0.0)
-    return labels
+    return shared_label_frame(frame, combo)
 
 
 def _sample_origins(ts_values: Sequence[int], *, eval_start_ts: int, eval_end_ts: int, max_eval_origins: int) -> List[int]:
-    eligible = [int(ts) for ts in ts_values if int(eval_start_ts) <= int(ts) <= int(eval_end_ts)]
-    if len(eligible) <= int(max_eval_origins):
-        return eligible
-    idx = np.linspace(0, len(eligible) - 1, int(max_eval_origins)).astype(int)
-    return [eligible[int(i)] for i in idx]
+    return shared_sample_origins(ts_values, eval_start_ts=eval_start_ts, eval_end_ts=eval_end_ts, max_eval_origins=max_eval_origins)
 
 
 def _build_factor_maps(frames: Dict[str, pd.DataFrame], combo: ComboSpec) -> Dict[str, Dict[int, float]]:
@@ -522,161 +589,46 @@ def build_datasets(
             if feature_profile_json is not None
             else None
         )
-        frames: Dict[str, pd.DataFrame] = {}
-        frame_keys: Dict[str, Tuple[Any, ...]] = {}
-        for asset in assets:
-            selected_dynamic_feature_columns = (
-                tuple(str(value) for value in combo_profile.selected_dynamic_feature_columns)
-                if combo_profile is not None and combo_profile.use_dynamic_features
-                else ()
-            ) if combo_profile is not None else None
-            use_dynamic_features = (
-                bool(combo_profile.use_dynamic_features)
-                if combo_profile is not None
-                else bool(CURRENT_NUMERICS.MODULE_SPEC.needs_dynamic_features)
+        feature_profile = (
+            Stage3FeatureProfile(
+                selected_dynamic_feature_columns=tuple(str(value) for value in combo_profile.selected_dynamic_feature_columns),
+                use_dynamic_features=bool(combo_profile.use_dynamic_features),
+                use_seasonality=bool(combo_profile.use_seasonality),
             )
-            use_seasonality = (
-                bool(combo_profile.use_seasonality)
-                if combo_profile is not None
-                else bool(CURRENT_NUMERICS.MODULE_SPEC.use_seasonality)
-            )
-            common_key = _setup_common_key(
-                combo=combo,
-                args=args,
-                feature_profile_json=feature_profile_json,
-                selected_feature_columns=selected_dynamic_feature_columns,
-                history_start_ts=int(history_start_ts),
-                eval_end_ts=int(eval_end_ts),
-                history_window_months=int(history_window_months),
-                use_dynamic_features=use_dynamic_features,
-                use_seasonality=use_seasonality,
-            )
-            frame_key = ("asset_frame", str(asset), common_key)
-            frame_keys[str(asset)] = frame_key
-            frame = setup_cache.get(frame_key) if setup_cache is not None else None
-            if frame is None:
-                frame = _load_asset_frame(
-                    str(asset),
-                    combo,
-                    int(history_start_ts),
-                    int(eval_end_ts),
-                    selected_dynamic_feature_columns=selected_dynamic_feature_columns,
-                )
-                if setup_cache is not None and not frame.empty:
-                    setup_cache.put(frame_key, frame)
-            if frame.empty:
-                continue
-            label_key = ("labels", str(asset), common_key)
-            labels = setup_cache.get(label_key) if setup_cache is not None else None
-            if labels is None:
-                labels = _label_frame(frame, combo)
-                if setup_cache is not None:
-                    setup_cache.put(label_key, labels)
-            label_col = NUMERIC_TASK_TO_TARGET_COLUMN[str(combo.task)]
-            if label_col in frame.columns and label_col in labels.columns:
-                frame = frame.drop(columns=[label_col])
-            merged = pd.concat([frame.reset_index(drop=True), labels.reset_index(drop=True)], axis=1)
-            if merged.columns.has_duplicates:
-                merged = merged.loc[:, ~merged.columns.duplicated(keep="last")].copy()
-            frames[str(asset)] = merged
-        factor_key = (
-            "factor_maps",
-            tuple(str(asset) for asset in assets),
-            tuple(frame_keys.get(str(asset)) for asset in assets),
-            bool(CURRENT_NUMERICS.MODULE_SPEC.needs_factor_cache),
+            if combo_profile is not None
+            else None
         )
-        factor_maps = setup_cache.get(factor_key) if setup_cache is not None else None
-        if factor_maps is None:
-            factor_started = time.perf_counter()
-            factor_maps = _build_factor_maps(frames, combo)
-            emit_event_for_path(
-                telemetry_path,
+        datasets = build_stage3_datasets(
+            combo=combo,
+            assets=assets,
+            args=args,
+            setup_cache=setup_cache,
+            config=Stage3DatasetBuildConfig(
                 family="Bayesian_Numeric",
                 model=str(CURRENT_MODEL_SPEC.model_key),
-                stage="stage3",
-                function_name="_build_factor_maps",
                 module_name=__name__,
-                phase_name="factor_map_build",
-                parent_phase="dataset_construction",
-                combo_key=combo.tuple_label,
-                interval_minutes=int(combo.interval),
-                horizon_minutes=int(combo.horizon_minutes),
-                training_window_months=int(history_window_months),
-                task=str(combo.task),
-                elapsed_seconds=time.perf_counter() - factor_started,
-                input_rows=sum(len(frame) for frame in frames.values()),
-                output_rows=sum(len(mapping) for mapping in factor_maps.values()),
-                asset_count=len(frames),
-                cache_hit_count=0,
-                cache_miss_count=1,
-            )
-            if setup_cache is not None:
-                setup_cache.put(factor_key, factor_maps)
-        else:
-            emit_event_for_path(
-                telemetry_path,
-                family="Bayesian_Numeric",
-                model=str(CURRENT_MODEL_SPEC.model_key),
-                stage="stage3",
-                function_name="_build_factor_maps",
-                module_name=__name__,
-                phase_name="factor_map_build",
-                parent_phase="dataset_construction",
-                combo_key=combo.tuple_label,
-                interval_minutes=int(combo.interval),
-                horizon_minutes=int(combo.horizon_minutes),
-                training_window_months=int(history_window_months),
-                task=str(combo.task),
-                elapsed_seconds=0.0,
-                input_rows=sum(len(frame) for frame in frames.values()),
-                output_rows=sum(len(mapping) for mapping in factor_maps.values()),
-                asset_count=len(frames),
-                cache_hit_count=1,
-                cache_miss_count=0,
-            )
-        datasets: List[Dataset] = []
-        label_col = NUMERIC_TASK_TO_TARGET_COLUMN[str(combo.task)]
-        for asset, frame in frames.items():
-            label_values = frame[label_col]
-            if isinstance(label_values, pd.DataFrame):
-                label_values = label_values.iloc[:, -1]
-            valid = frame[np.isfinite(pd.to_numeric(label_values, errors="coerce"))].copy()
-            origins = _sample_origins(
-                valid["ts"].astype("int64").tolist(),
+                telemetry_path=telemetry_path,
+                history_window_months=int(history_window_months),
+                history_start_ts=int(history_start_ts),
                 eval_start_ts=int(eval_start_ts),
-                eval_end_ts=int(eval_end_ts - int(combo.horizon_minutes) * 60),
+                eval_end_ts=int(eval_end_ts),
                 max_eval_origins=int(args.max_eval_origins),
-            )
-            if not origins:
-                continue
-            datasets.append(
-                Dataset(
-                    asset=str(asset),
-                    combo=combo,
-                    frame=frame,
-                    target_col=str(label_col),
-                    history_start_ts=int(history_start_ts),
-                    eval_start_ts=int(eval_start_ts),
-                    eval_end_ts=int(eval_end_ts),
-                    origins=origins,
-                    factor_map=factor_maps.get(str(asset), {}),
-                    selected_dynamic_feature_columns=(
-                        tuple(str(value) for value in combo_profile.selected_dynamic_feature_columns)
-                        if combo_profile is not None
-                        else tuple(str(value) for value in CURRENT_NUMERICS.MODULE_SPEC.dynamic_feature_candidates)
-                    ),
-                    use_dynamic_features=(
-                        bool(combo_profile.use_dynamic_features)
-                        if combo_profile is not None
-                        else bool(CURRENT_NUMERICS.MODULE_SPEC.needs_dynamic_features)
-                    ),
-                    use_seasonality=(
-                        bool(combo_profile.use_seasonality)
-                        if combo_profile is not None
-                        else bool(CURRENT_NUMERICS.MODULE_SPEC.use_seasonality)
-                    ),
-                )
-            )
+                feature_profile_json=feature_profile_json,
+                feature_profile=feature_profile,
+                default_dynamic_feature_columns=tuple(str(value) for value in CURRENT_NUMERICS.MODULE_SPEC.dynamic_feature_candidates),
+                default_use_dynamic_features=bool(CURRENT_NUMERICS.MODULE_SPEC.needs_dynamic_features),
+                default_use_seasonality=bool(CURRENT_NUMERICS.MODULE_SPEC.use_seasonality),
+                factor_cache_enabled=bool(CURRENT_NUMERICS.MODULE_SPEC.needs_factor_cache),
+            ),
+            hooks=Stage3DatasetBuildHooks(
+                setup_common_key=_setup_common_key,
+                load_asset_frame=_load_asset_frame,
+                label_frame=_label_frame,
+                sample_origins=_sample_origins,
+                dataset_factory=Dataset,
+                factor_maps_factory=_build_factor_maps,
+            ),
+        )
         scope.update(
             output_rows=sum(len(dataset.frame) for dataset in datasets),
             reason_code="" if datasets else "objective_dataset_empty",
@@ -708,19 +660,26 @@ def _build_datasets_with_telemetry(
             return build_datasets(combo, assets, args)
 
 
-def evaluate_dataset(dataset: Dataset, params: Dict[str, Any], params_label: str) -> MetricResult:
-    frame = dataset.frame.reset_index(drop=True)
+def evaluate_dataset(dataset: Dataset, params: Dict[str, Any], params_label: str, array_cache: Optional[_EvaluationArrayCache] = None) -> MetricResult:
     training_window_months = _positive_int(getattr(dataset.combo, "training_window_months", None))
-    ts_vec = pd.to_numeric(frame["ts"], errors="coerce").fillna(-1).astype("int64").to_numpy()
-    y_vec = pd.to_numeric(frame[dataset.target_col], errors="coerce").to_numpy(dtype=float)
-    valid_target_idx = np.flatnonzero(np.isfinite(y_vec))
-    feat_cols = [str(c) for c in dataset.selected_dynamic_feature_columns if str(c) in frame.columns]
-    feat_matrix = None
-    if dataset.use_dynamic_features and feat_cols:
-        feat_frame = frame.loc[:, feat_cols].apply(pd.to_numeric, errors="coerce")
-        feat_cols = [str(col) for col in feat_cols if feat_frame[str(col)].notna().any()]
-        if feat_cols:
-            feat_matrix = feat_frame.loc[:, feat_cols].to_numpy(dtype=float)
+    needs_factor_cache = bool(CURRENT_NUMERICS.MODULE_SPEC.needs_factor_cache)
+    factor_values = None
+    if array_cache is not None:
+        arrays = array_cache.get(dataset, needs_factor_cache=needs_factor_cache)
+        ts_vec = arrays.ts_vec
+        y_vec = arrays.y_vec
+        feat_matrix = arrays.feat_matrix
+        factor_values = arrays.factor_values
+    else:
+        arrays = build_evaluation_arrays(
+            dataset.frame,
+            target_col=str(dataset.target_col),
+            selected_feature_columns=dataset.selected_dynamic_feature_columns,
+            use_dynamic_features=bool(dataset.use_dynamic_features),
+        )
+        ts_vec = arrays.ts_vec
+        y_vec = arrays.y_vec
+        feat_matrix = arrays.feat_matrix
     seasonal_period_bars = None
     if dataset.use_seasonality:
         from src.forecasting.common.forecast_family_core import seasonality_info
@@ -731,53 +690,51 @@ def evaluate_dataset(dataset: Dataset, params: Dict[str, Any], params_label: str
             asset=str(dataset.asset),
         )
         seasonal_period_bars = seas.get("seasonality_period_bars") if seas.get("seasonality_usable") else None
-    predictions: List[float] = []
-    actuals: List[float] = []
-    pred_ts: List[int] = []
-    for idx_origin, origin_ts in enumerate(dataset.origins):
-        idx = int(np.searchsorted(ts_vec, int(origin_ts), side="right") - 1)
-        if idx < 0:
-            continue
-        valid_pos = int(np.searchsorted(valid_target_idx, int(idx), side="right")) - 1
-        if valid_pos < 47:
-            continue
-        hist_idx = valid_target_idx[: valid_pos + 1]
-        y_hist = y_vec[hist_idx]
-        x_hist = None
-        x_last = None
-        if dataset.use_dynamic_features:
-            if feat_matrix is None:
-                continue
-            fmat = feat_matrix[hist_idx]
-            med = np.nanmedian(fmat, axis=0)
-            fmat = np.where(np.isfinite(fmat), fmat, med)
-            x_hist = fmat
-            x_last = fmat[-1]
-        factor_hist = None
-        factor_last = None
-        if CURRENT_NUMERICS.MODULE_SPEC.needs_factor_cache:
-            ts_hist = ts_vec[hist_idx]
-            values = np.asarray([dataset.factor_map.get(int(ts), np.nan) for ts in ts_hist], dtype=float)
-            if not np.isfinite(values).any():
-                continue
-            med = float(np.nanmedian(values)) if np.isfinite(values).any() else 0.0
-            factor_hist = np.where(np.isfinite(values), values, med)
-            factor_last = float(factor_hist[-1])
-        try:
-            qvals, _meta = CURRENT_NUMERICS.MODULE_SPEC.predict_fn(y_hist=y_hist, horizon_bars=int(dataset.combo.horizon_bars), quantiles=[0.1, 0.5, 0.9], seasonal_period_bars=(int(seasonal_period_bars) if seasonal_period_bars is not None else None), seed=17 + idx_origin, model_params=dict(params), x_hist=x_hist, x_last=x_last, factor_hist=factor_hist, factor_last=factor_last)
-        except Exception:
-            continue
-        y_true = y_vec[idx]
-        if not math.isfinite(float(y_true)):
-            continue
-        predictions.append(float(qvals.get(0.5, np.nan)))
-        actuals.append(float(y_true))
-        pred_ts.append(int(origin_ts))
-    if not predictions:
+    def predict_origin(origin: OriginEvaluationInput) -> Dict[float, float]:
+        qvals, _meta = CURRENT_NUMERICS.MODULE_SPEC.predict_fn(
+            y_hist=origin.y_hist,
+            horizon_bars=int(dataset.combo.horizon_bars),
+            quantiles=[0.1, 0.5, 0.9],
+            seasonal_period_bars=(int(seasonal_period_bars) if seasonal_period_bars is not None else None),
+            seed=17 + int(origin.idx_origin),
+            model_params=dict(params),
+            x_hist=origin.x_hist,
+            x_last=origin.x_last,
+            factor_hist=origin.factor_hist,
+            factor_last=origin.factor_last,
+        )
+        return qvals
+
+    payload = evaluate_origin_predictions(
+        dataset=dataset,
+        params=dict(params),
+        ts_vec=ts_vec,
+        y_vec=y_vec,
+        origins=dataset.origins,
+        predict_origin=predict_origin,
+        feat_matrix=feat_matrix,
+        use_dynamic_features=bool(dataset.use_dynamic_features),
+        trailing_history=False,
+        require_any_finite_feature=False,
+        needs_factor_cache=needs_factor_cache,
+        factor_map=dataset.factor_map,
+        factor_values=factor_values,
+        min_valid_targets=48,
+    )
+    if payload.rows <= 0:
         return MetricResult(combo=dataset.combo.tuple_label, asset=dataset.asset, rows=0, rmse=None, mae=None, first_prediction_ts=None, last_prediction_ts=None, params_label=params_label, training_window_months=training_window_months)
-    pred = np.asarray(predictions, dtype=float)
-    act = np.asarray(actuals, dtype=float)
-    return MetricResult(combo=dataset.combo.tuple_label, asset=dataset.asset, rows=int(len(predictions)), rmse=float(np.sqrt(np.mean((pred - act) ** 2))), mae=float(np.mean(np.abs(pred - act))), first_prediction_ts=min(pred_ts), last_prediction_ts=max(pred_ts), params_label=params_label, training_window_months=training_window_months)
+    rmse, mae = metric_values(payload)
+    return MetricResult(combo=dataset.combo.tuple_label, asset=dataset.asset, rows=int(payload.rows), rmse=rmse, mae=mae, first_prediction_ts=min(payload.prediction_timestamps), last_prediction_ts=max(payload.prediction_timestamps), params_label=params_label, training_window_months=training_window_months)
+
+
+def _evaluate_dataset_with_array_cache(dataset: Dataset, params: Dict[str, Any], params_label: str, array_cache: _EvaluationArrayCache) -> MetricResult:
+    try:
+        return evaluate_dataset(dataset, params, params_label, array_cache=array_cache)
+    except TypeError as exc:
+        if "array_cache" not in str(exc) and "unexpected keyword" not in str(exc):
+            raise
+        array_cache._fallback_reason = "evaluate_dataset_signature_without_array_cache"
+        return evaluate_dataset(dataset, params, params_label)
 
 
 def summarize_metrics(metrics: Sequence[MetricResult]) -> Dict[str, Any]:
@@ -807,6 +764,7 @@ def finalize_model_params(params: Dict[str, Any], combo: ComboSpec) -> Dict[str,
 def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials_per_combo: int, sampler_seed: int, storage: Optional[str], study_name_prefix: str, resume_study: bool, model_threads: int, telemetry_path: Optional[Path] = None) -> Tuple[Dict[str, Any], List[MetricResult], List[MetricResult], List[Dict[str, Any]]]:
     training_window_months = _positive_int(getattr(combo, "training_window_months", None))
     baseline_params = finalize_model_params(baseline_params_with_threads(combo, model_threads), combo)
+    eval_array_cache = _EvaluationArrayCache()
     with telemetry_scope_for_path(
         telemetry_path,
         family="Bayesian_Numeric",
@@ -824,8 +782,8 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         input_rows=sum(len(dataset.frame) for dataset in datasets),
         asset_count=len(datasets),
     ) as baseline_scope:
-        baseline_metrics = [evaluate_dataset(dataset, baseline_params, "baseline") for dataset in datasets]
-        baseline_scope.update(output_rows=sum(int(metric.rows) for metric in baseline_metrics))
+        baseline_metrics = [_evaluate_dataset_with_array_cache(dataset, baseline_params, "baseline", eval_array_cache) for dataset in datasets]
+        baseline_scope.update(output_rows=sum(int(metric.rows) for metric in baseline_metrics), **eval_array_cache.stats())
     baseline_summary = summarize_metrics(baseline_metrics)
     if int(baseline_summary.get("rows", 0) or 0) <= 0:
         emit_event_for_path(
@@ -879,7 +837,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         mae_num = 0.0
         rows = 0
         for step_idx, dataset in enumerate(datasets, start=1):
-            metric = evaluate_dataset(dataset, params, f"trial_{trial.number}")
+            metric = _evaluate_dataset_with_array_cache(dataset, params, f"trial_{trial.number}", eval_array_cache)
             if metric.rmse is not None and metric.rows > 0:
                 rmse_num += float(metric.rmse) * int(metric.rows)
                 mae_num += float(metric.mae or 0.0) * int(metric.rows)
@@ -970,7 +928,7 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
             asset_count=len(datasets),
         ) as optimize_scope:
             study.optimize(objective, n_trials=int(trials_per_combo), show_progress_bar=False)
-            optimize_scope.update(output_rows=len(trial_rows))
+            optimize_scope.update(output_rows=len(trial_rows), **eval_array_cache.stats())
     study_elapsed_s = time.perf_counter() - study_started
     best_params = dict(baseline_params)
     complete_trials = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
@@ -998,8 +956,8 @@ def run_study_for_combo(combo: ComboSpec, datasets: Sequence[Dataset], *, trials
         input_rows=sum(len(dataset.frame) for dataset in datasets),
         asset_count=len(datasets),
     ) as tuned_scope:
-        tuned_metrics = [evaluate_dataset(dataset, best_params, "tuned") for dataset in datasets]
-        tuned_scope.update(output_rows=sum(int(metric.rows) for metric in tuned_metrics))
+        tuned_metrics = [_evaluate_dataset_with_array_cache(dataset, best_params, "tuned", eval_array_cache) for dataset in datasets]
+        tuned_scope.update(output_rows=sum(int(metric.rows) for metric in tuned_metrics), **eval_array_cache.stats())
     tuned_summary = summarize_metrics(tuned_metrics)
     emit_event_for_path(
         telemetry_path,

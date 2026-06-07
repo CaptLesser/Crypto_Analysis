@@ -264,6 +264,12 @@ def write_relationship_selection_artifacts(
             production_enabled=production_enabled,
         ),
         write_relationship_jsonl_rows(
+            result.candidate_edges,
+            output_root=output_root,
+            relative_path=base / "candidate_edges.jsonl",
+            production_enabled=production_enabled,
+        ),
+        write_relationship_jsonl_rows(
             result.selected_edges,
             output_root=output_root,
             relative_path=base / "selected_edges.jsonl",

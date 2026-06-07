@@ -21,7 +21,22 @@ from src.forecasting.common.path_config import resolve_path, selected_profile
 from src.forecasting.common.stats_module_utils import NUMERIC_TASK_TO_TARGET_COLUMN
 from src.forecasting.ml.neural.shared.neural_numeric_cohort import FIXED_NEURAL_NUMERIC_COHORT
 from src.forecasting.ml.neural.shared.neural_stage1_profile import resolve_execution_profile
-from src.forecasting.ml.shared.numeric_forecast_targets import compute_future_labels
+from src.forecasting.ml.shared.stage3_dataset_builder import (
+    Stage3DatasetBuildConfig,
+    Stage3DatasetBuildHooks,
+    Stage3FeatureProfile,
+    build_evaluation_arrays,
+    build_stage3_datasets,
+    evaluate_window as shared_evaluate_window,
+    label_frame as shared_label_frame,
+    load_stage3_asset_frame,
+    sample_origins as shared_sample_origins,
+)
+from src.forecasting.ml.shared.numeric_origin_evaluator import (
+    OriginEvaluationInput,
+    evaluate_origin_predictions,
+    metric_values,
+)
 from src.forecasting.ml.shared.test_branch_function_telemetry import (
     emit_event_for_path,
     emit_stage3_study_summary_for_path,
@@ -130,16 +145,16 @@ class _EvaluationArrayCache:
             self._hits += 1
             return cached
         self._misses += 1
-        frame = dataset.frame.reset_index(drop=True)
-        ts_vec = self._readonly(pd.to_numeric(frame["ts"], errors="coerce").fillna(-1).astype("int64").to_numpy(copy=True))
-        y_vec = self._readonly(pd.to_numeric(frame[dataset.target_col], errors="coerce").to_numpy(dtype=float, copy=True))
-        feat_cols = [str(col) for col in dataset.selected_dynamic_feature_columns if str(col) in frame.columns]
-        feat_matrix = None
-        if bool(dataset.use_dynamic_features) and feat_cols:
-            feat_frame = frame.loc[:, feat_cols].apply(pd.to_numeric, errors="coerce")
-            feat_cols = [str(col) for col in feat_cols if feat_frame[str(col)].notna().any()]
-            if feat_cols:
-                feat_matrix = self._readonly(feat_frame.loc[:, feat_cols].to_numpy(dtype=float, copy=True))
+        arrays = build_evaluation_arrays(
+            dataset.frame,
+            target_col=str(dataset.target_col),
+            selected_feature_columns=dataset.selected_dynamic_feature_columns,
+            use_dynamic_features=bool(dataset.use_dynamic_features),
+        )
+        ts_vec = self._readonly(arrays.ts_vec)
+        y_vec = self._readonly(arrays.y_vec)
+        feat_cols = arrays.feat_cols
+        feat_matrix = self._readonly(arrays.feat_matrix) if arrays.feat_matrix is not None else None
         entry = _EvaluationArrayCacheEntry(
             dataset_id=dataset_id,
             frame_id=frame_id,
@@ -376,6 +391,9 @@ def _setup_common_key(
     selected_feature_columns: Optional[Sequence[str]],
     history_start_ts: int,
     eval_end_ts: int,
+    history_window_months: Optional[int] = None,
+    use_dynamic_features: Optional[bool] = None,
+    use_seasonality: Optional[bool] = None,
 ) -> Tuple[Any, ...]:
     ohlc_root = _source_ohlcvt_root().resolve()
     feature_root = _source_feature_root(fallback=ohlc_root).resolve()
@@ -401,58 +419,34 @@ def _setup_common_key(
 
 
 def _evaluate_window(edge_ts: int, recent_eval_days: int, history_window_months: int) -> Tuple[int, int]:
-    eval_end_ts = int(edge_ts)
-    eval_start_ts = int(edge_ts) - int(recent_eval_days) * 86400
-    history_start_ts = int(edge_ts) - int(history_window_months) * 31 * 86400
-    return history_start_ts, eval_end_ts
+    return shared_evaluate_window(edge_ts, recent_eval_days, history_window_months)
 
 
 def _load_asset_frame(asset: str, combo: ComboSpec, history_start_ts: int, eval_end_ts: int, selected_feature_columns: Optional[Sequence[str]] = None) -> pd.DataFrame:
-    feature_columns = [NUMERIC_TASK_TO_TARGET_COLUMN[str(combo.task)]]
-    if selected_feature_columns is not None:
-        feature_columns.extend(str(col) for col in selected_feature_columns if str(col))
-    elif bool(getattr(CURRENT_NUMERICS.MODULE_SPEC, "needs_dynamic_features", False)):
-        feature_columns.extend(str(col) for col in getattr(CURRENT_NUMERICS.MODULE_SPEC, "dynamic_feature_candidates", ()))
-    ohlcvt_frame = read_ohlcvt(
+    return load_stage3_asset_frame(
         asset=str(asset),
-        interval_min=int(combo.interval),
-        start_ts=int(history_start_ts),
-        end_ts=int(eval_end_ts),
-        columns=["ts", "asset", "open", "high", "low", "close", "volume", "trades"],
-        root=_source_ohlcvt_root().resolve(),
+        combo=combo,
+        history_start_ts=int(history_start_ts),
+        eval_end_ts=int(eval_end_ts),
+        ohlcvt_root=_source_ohlcvt_root().resolve(),
+        feature_root=_source_feature_root(fallback=_source_ohlcvt_root()).resolve(),
+        selected_feature_columns=selected_feature_columns,
+        dynamic_feature_candidates=getattr(CURRENT_NUMERICS.MODULE_SPEC, "dynamic_feature_candidates", ()),
+        include_dynamic_default=bool(getattr(CURRENT_NUMERICS.MODULE_SPEC, "needs_dynamic_features", False)),
+        merge_how="left",
+        add_missing_columns=False,
+        return_empty_ohlcvt=True,
+        read_ohlcvt_fn=read_ohlcvt,
+        read_feature_window_columns_fn=read_feature_window_columns,
     )
-    feature_frame = read_feature_window_columns(
-        root=_source_feature_root(fallback=_source_ohlcvt_root()).resolve(),
-        interval_minutes=int(combo.interval),
-        asset=str(asset),
-        columns=list(dict.fromkeys(feature_columns)),
-        start_ts=int(history_start_ts),
-        end_ts=int(eval_end_ts),
-    )
-    if ohlcvt_frame.empty:
-        return ohlcvt_frame.sort_values("ts").reset_index(drop=True)
-    merged = ohlcvt_frame.merge(
-        feature_frame,
-        on=["ts", "asset"],
-        how="left",
-        suffixes=("", "_feature"),
-    )
-    if merged.columns.has_duplicates:
-        merged = merged.loc[:, ~merged.columns.duplicated(keep="first")].copy()
-    return merged.sort_values("ts").reset_index(drop=True)
 
 
 def _label_frame(frame: pd.DataFrame, combo: ComboSpec) -> pd.DataFrame:
-    labels, _stats = compute_future_labels(frame.loc[:, ["high", "low", "close"]].reset_index(drop=True), int(combo.horizon_bars), future_direction_deadzone=0.0)
-    return labels
+    return shared_label_frame(frame, combo)
 
 
 def _sample_origins(ts_values: Sequence[int], *, eval_start_ts: int, eval_end_ts: int, max_eval_origins: int) -> List[int]:
-    eligible = [int(ts) for ts in ts_values if int(eval_start_ts) <= int(ts) <= int(eval_end_ts)]
-    if len(eligible) <= int(max_eval_origins):
-        return eligible
-    idx = np.linspace(0, len(eligible) - 1, int(max_eval_origins)).astype(int)
-    return [eligible[int(i)] for i in idx]
+    return shared_sample_origins(ts_values, eval_start_ts=eval_start_ts, eval_end_ts=eval_end_ts, max_eval_origins=max_eval_origins)
 
 
 def _default_seq_len(combo: ComboSpec) -> int:
@@ -512,84 +506,54 @@ def build_datasets(
             if feature_profile_json is not None
             else None
         )
-        datasets: List[Dataset] = []
-        label_col = NUMERIC_TASK_TO_TARGET_COLUMN[str(combo.task)]
-        for asset in assets:
-            selected_feature_columns = (
-                tuple(str(value) for value in combo_profile.selected_dynamic_feature_columns)
-                if combo_profile is not None and combo_profile.use_dynamic_features
-                else ()
-                if combo_profile is not None
-                else None
+        feature_profile = (
+            Stage3FeatureProfile(
+                selected_dynamic_feature_columns=tuple(str(value) for value in combo_profile.selected_dynamic_feature_columns),
+                use_dynamic_features=bool(combo_profile.use_dynamic_features),
+                use_seasonality=False,
             )
-            common_key = _setup_common_key(
-                combo=combo,
-                args=args,
-                feature_profile_json=feature_profile_json,
-                selected_feature_columns=selected_feature_columns,
+            if combo_profile is not None
+            else None
+        )
+        datasets = build_stage3_datasets(
+            combo=combo,
+            assets=assets,
+            args=args,
+            setup_cache=setup_cache,
+            config=Stage3DatasetBuildConfig(
+                family="Neural_Numeric",
+                model=str(CURRENT_MODEL_SPEC.model_key),
+                module_name=__name__,
+                telemetry_path=telemetry_path,
+                history_window_months=int(args.history_window_months),
                 history_start_ts=int(history_start_ts),
-                eval_end_ts=int(eval_end_ts),
-            )
-            frame_key = ("asset_frame", str(asset), common_key)
-            frame = setup_cache.get(frame_key) if setup_cache is not None else None
-            if frame is None:
-                frame = _load_asset_frame(
-                    str(asset),
-                    combo,
-                    int(history_start_ts),
-                    int(eval_end_ts),
-                    selected_feature_columns=selected_feature_columns,
-                )
-                if setup_cache is not None and not frame.empty:
-                    setup_cache.put(frame_key, frame)
-            if frame.empty:
-                continue
-            label_key = ("labels", str(asset), common_key)
-            labels = setup_cache.get(label_key) if setup_cache is not None else None
-            if labels is None:
-                labels = _label_frame(frame, combo)
-                if setup_cache is not None:
-                    setup_cache.put(label_key, labels)
-            merged = frame.reset_index(drop=True).copy()
-            if label_col in merged.columns and label_col in labels.columns:
-                merged = merged.drop(columns=[label_col])
-            merged = pd.concat([merged, labels.reset_index(drop=True)], axis=1)
-            if merged.columns.has_duplicates:
-                merged = merged.loc[:, ~merged.columns.duplicated(keep="last")].copy()
-            label_values = merged[label_col]
-            if isinstance(label_values, pd.DataFrame):
-                label_values = label_values.iloc[:, -1]
-            valid = merged[np.isfinite(pd.to_numeric(label_values, errors="coerce"))].copy()
-            origins = _sample_origins(
-                valid["ts"].astype("int64").tolist(),
                 eval_start_ts=int(eval_start_ts),
-                eval_end_ts=int(eval_end_ts - int(combo.horizon_minutes) * 60),
+                eval_end_ts=int(eval_end_ts),
                 max_eval_origins=int(args.max_eval_origins),
-            )
-            if not origins:
-                continue
-            datasets.append(
-                Dataset(
-                    asset=str(asset),
-                    combo=combo,
-                    frame=merged,
-                    target_col=str(label_col),
-                    history_start_ts=int(history_start_ts),
-                    eval_start_ts=int(eval_start_ts),
-                    eval_end_ts=int(eval_end_ts),
-                    origins=origins,
-                    selected_dynamic_feature_columns=(
-                        tuple(str(value) for value in combo_profile.selected_dynamic_feature_columns)
-                        if combo_profile is not None
-                        else tuple(str(value) for value in getattr(CURRENT_NUMERICS.MODULE_SPEC, "dynamic_feature_candidates", ()))
-                    ),
-                    use_dynamic_features=(
-                        bool(combo_profile.use_dynamic_features)
-                        if combo_profile is not None
-                        else bool(getattr(CURRENT_NUMERICS.MODULE_SPEC, "needs_dynamic_features", False))
-                    ),
-                )
-            )
+                feature_profile_json=feature_profile_json,
+                feature_profile=feature_profile,
+                default_dynamic_feature_columns=tuple(str(value) for value in getattr(CURRENT_NUMERICS.MODULE_SPEC, "dynamic_feature_candidates", ())),
+                default_use_dynamic_features=bool(getattr(CURRENT_NUMERICS.MODULE_SPEC, "needs_dynamic_features", False)),
+            ),
+            hooks=Stage3DatasetBuildHooks(
+                setup_common_key=_setup_common_key,
+                load_asset_frame=_load_asset_frame,
+                label_frame=_label_frame,
+                sample_origins=_sample_origins,
+                dataset_factory=lambda **kwargs: Dataset(
+                    asset=kwargs["asset"],
+                    combo=kwargs["combo"],
+                    frame=kwargs["frame"],
+                    target_col=kwargs["target_col"],
+                    history_start_ts=kwargs["history_start_ts"],
+                    eval_start_ts=kwargs["eval_start_ts"],
+                    eval_end_ts=kwargs["eval_end_ts"],
+                    origins=kwargs["origins"],
+                    selected_dynamic_feature_columns=kwargs["selected_dynamic_feature_columns"],
+                    use_dynamic_features=kwargs["use_dynamic_features"],
+                ),
+            ),
+        )
         scope.update(
             output_rows=sum(len(dataset.frame) for dataset in datasets),
             reason_code="" if datasets else "objective_dataset_empty",
@@ -665,46 +629,36 @@ def evaluate_dataset(dataset: Dataset, params: Dict[str, Any], params_label: str
                 feat_matrix = feat_frame.loc[:, feat_cols].to_numpy(dtype=float)
     seq_len = _resolve_sequence_length(dict(params), dataset.combo)
     effective_history_bars = max(64, int(seq_len))
-    predictions: List[float] = []
-    actuals: List[float] = []
-    pred_ts: List[int] = []
-    for idx_origin, origin_ts in enumerate(dataset.origins):
-        idx = int(np.searchsorted(ts_vec, int(origin_ts), side="right") - 1)
-        if idx < 0:
-            continue
-        y_hist_full = y_vec[: idx + 1]
-        valid_target_idx = np.flatnonzero(np.isfinite(y_hist_full))
-        if int(valid_target_idx.size) < 48:
-            continue
-        hist_idx = valid_target_idx[-int(effective_history_bars) :]
-        y_hist = y_hist_full[hist_idx]
-        x_hist = None
-        x_last = None
-        if bool(dataset.use_dynamic_features):
-            if feat_matrix is None:
-                continue
-            fmat = feat_matrix[: idx + 1][hist_idx]
-            if not np.isfinite(fmat).any():
-                continue
-            med = np.nanmedian(fmat, axis=0)
-            fmat = np.where(np.isfinite(fmat), fmat, med)
-            x_hist = fmat
-            x_last = fmat[-1]
-        try:
-            qvals, _meta = _predict_model(dataset, y_hist, dict(params), idx_origin, x_hist=x_hist, x_last=x_last)
-        except Exception:
-            continue
-        y_true = y_vec[idx]
-        if not math.isfinite(float(y_true)):
-            continue
-        predictions.append(float(qvals.get(0.5, np.nan)))
-        actuals.append(float(y_true))
-        pred_ts.append(int(origin_ts))
-    if not predictions:
+    def predict_origin(origin: OriginEvaluationInput) -> Dict[float, float]:
+        qvals, _meta = _predict_model(
+            dataset,
+            origin.y_hist,
+            dict(params),
+            int(origin.idx_origin),
+            x_hist=origin.x_hist,
+            x_last=origin.x_last,
+        )
+        return qvals
+
+    payload = evaluate_origin_predictions(
+        dataset=dataset,
+        params=dict(params),
+        ts_vec=ts_vec,
+        y_vec=y_vec,
+        origins=dataset.origins,
+        predict_origin=predict_origin,
+        feat_matrix=feat_matrix,
+        use_dynamic_features=bool(dataset.use_dynamic_features),
+        effective_history_bars=int(effective_history_bars),
+        trailing_history=True,
+        require_any_finite_feature=True,
+        needs_factor_cache=False,
+        min_valid_targets=48,
+    )
+    if payload.rows <= 0:
         return MetricResult(combo=dataset.combo.tuple_label, asset=dataset.asset, rows=0, rmse=None, mae=None, first_prediction_ts=None, last_prediction_ts=None, params_label=params_label)
-    pred = np.asarray(predictions, dtype=float)
-    act = np.asarray(actuals, dtype=float)
-    return MetricResult(combo=dataset.combo.tuple_label, asset=dataset.asset, rows=int(len(predictions)), rmse=float(np.sqrt(np.mean((pred - act) ** 2))), mae=float(np.mean(np.abs(pred - act))), first_prediction_ts=min(pred_ts), last_prediction_ts=max(pred_ts), params_label=params_label)
+    rmse, mae = metric_values(payload)
+    return MetricResult(combo=dataset.combo.tuple_label, asset=dataset.asset, rows=int(payload.rows), rmse=rmse, mae=mae, first_prediction_ts=min(payload.prediction_timestamps), last_prediction_ts=max(payload.prediction_timestamps), params_label=params_label)
 
 
 def _evaluate_dataset_with_array_cache(dataset: Dataset, params: Dict[str, Any], params_label: str, array_cache: _EvaluationArrayCache) -> MetricResult:

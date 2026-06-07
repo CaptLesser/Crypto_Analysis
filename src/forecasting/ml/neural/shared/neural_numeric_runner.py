@@ -82,6 +82,10 @@ from src.forecasting.ml.shared.numeric_runner_diagnostics import (
     resource_snapshot,
 )
 from src.forecasting.ml.shared.numeric_float_policy import DEFAULT_FLOAT_DTYPE, as_default_float_array
+from src.forecasting.ml.shared.numeric_origin_windows import (
+    build_production_origin_arrays,
+    prepare_production_origin_window,
+)
 from src.forecasting.ml.shared.numeric_forecast_targets import compute_future_labels
 from src.forecasting.common.pipeline_parquet_utils import decide_range_from_disk_edges
 from src.forecasting.common.forecast_family_core import (
@@ -613,9 +617,24 @@ def _run_neural_asset(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     if df.empty:
         return ukey, {"status": "skipped", "reason": "missing_feature_rows", "edge_ts": int(edge_ts)}
     df = df.sort_values("ts").reset_index(drop=True)
-    ts_vec = pd.to_numeric(df["ts"], errors="coerce").fillna(-1).astype("int64").to_numpy()
-    y_vec = pd.to_numeric(df[target_col], errors="coerce").to_numpy(dtype=DEFAULT_FLOAT_DTYPE)
-    valid_target_idx = np.flatnonzero(np.isfinite(y_vec))
+    if combo_profile is not None:
+        feat_cols = [col for col in combo_profile.selected_dynamic_feature_columns if col in df.columns]
+    else:
+        feat_cols = [col for col in spec.dynamic_feature_candidates if col in df.columns]
+    use_dynamic_features = combo_profile.use_dynamic_features if combo_profile is not None else spec.needs_dynamic_features
+    origin_arrays = build_production_origin_arrays(
+        frame=df,
+        target_col=str(target_col),
+        selected_feature_columns=feat_cols,
+        use_dynamic_features=bool(use_dynamic_features),
+        as_float_array=_as_runtime_float_array,
+        float_dtype=DEFAULT_FLOAT_DTYPE,
+        needs_factor_cache=False,
+        coerce_ts=True,
+    )
+    ts_vec = origin_arrays.ts_vec
+    y_vec = origin_arrays.y_vec
+    valid_target_idx = origin_arrays.valid_target_idx
     effective_start_ts = int(start_for_mode)
     min_history_bars = _min_required_history_bars(spec=spec, seq_len=int(seq_len), model_params=dict(combo_model_params))
     if int(valid_target_idx.size) >= int(min_history_bars):
@@ -623,16 +642,6 @@ def _run_neural_asset(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     finalized_idx = _finalized_origin_indices(ts_vec, start_ts=int(effective_start_ts), end_ts=int(target_tail), predict_latest_only=bool(args_predict_latest_only))
     if not finalized_idx:
         return ukey, {"status": "done", "reason": "no_origins", "edge_ts": int(edge_ts)}
-    if combo_profile is not None:
-        feat_cols = [col for col in combo_profile.selected_dynamic_feature_columns if col in df.columns]
-    else:
-        feat_cols = [col for col in spec.dynamic_feature_candidates if col in df.columns]
-    feat_matrix = None
-    if (combo_profile.use_dynamic_features if combo_profile is not None else spec.needs_dynamic_features) and feat_cols:
-        feat_frame = df.loc[:, feat_cols].apply(pd.to_numeric, errors="coerce")
-        feat_cols = [str(col) for col in feat_cols if feat_frame[str(col)].notna().any()]
-        if feat_cols:
-            feat_matrix = _as_runtime_float_array(feat_frame.loc[:, feat_cols].to_numpy(dtype=DEFAULT_FLOAT_DTYPE))
     persisted_state = _load_unit_state(
         state_root=state_root,
         asset=str(asset),
@@ -773,42 +782,34 @@ def _run_neural_asset(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
 
     for j, idx in enumerate(finalized_idx):
         origin_ts = int(ts_vec[idx])
-        valid_pos = int(np.searchsorted(valid_target_idx, int(idx), side="right")) - 1
-        if valid_pos < int(min_history_bars) - 1:
+        window_result = prepare_production_origin_window(
+            arrays=origin_arrays,
+            idx=int(idx),
+            min_history_bars=int(min_history_bars),
+            history_bars=int(effective_history_bars),
+            use_dynamic_features=bool(use_dynamic_features),
+            needs_factor_cache=False,
+            as_float_array=_as_runtime_float_array,
+        )
+        if window_result.window is None:
+            reason = str(window_result.reason)
             if allow_partial:
                 failed += 1
                 continue
-            raise RuntimeError(f"[{spec.module_tag}] origin failure asset={asset} interval={interval} horizon={hm} task={task} origin_ts={origin_ts} reason=insufficient_valid_history valid_pos={valid_pos} required_history_bars={int(min_history_bars)}")
-        hist_start = max(0, valid_pos - int(effective_history_bars) + 1)
-        hist_idx = valid_target_idx[hist_start : valid_pos + 1]
-        y_hist = _as_runtime_float_array(y_vec[hist_idx])
-        ts_hist = ts_vec[hist_idx]
+            if reason == "insufficient_valid_history":
+                raise RuntimeError(f"[{spec.module_tag}] origin failure asset={asset} interval={interval} horizon={hm} task={task} origin_ts={origin_ts} reason=insufficient_valid_history valid_pos={int(window_result.valid_pos if window_result.valid_pos is not None else -1)} required_history_bars={int(min_history_bars)}")
+            raise RuntimeError(f"[{spec.module_tag}] origin failure asset={asset} interval={interval} horizon={hm} task={task} origin_ts={origin_ts} reason={reason}")
+        window = window_result.window
+        y_hist = window.y_hist
+        ts_hist = window.ts_hist
         if last_refit_ts is None or should_refit(str(refit_cadence), last_refit_ts, int(origin_ts)):
             last_refit_ts = int(origin_ts)
             refit_count += 1
-        x_hist = None
-        x_last = None
-        if combo_profile.use_dynamic_features if combo_profile is not None else spec.needs_dynamic_features:
-            if feat_matrix is None:
-                if allow_partial:
-                    failed += 1
-                    continue
-                raise RuntimeError(f"[{spec.module_tag}] origin failure asset={asset} interval={interval} horizon={hm} task={task} origin_ts={origin_ts} reason=missing_feature_matrix")
-            fmat = feat_matrix[hist_idx]
-            if not np.isfinite(fmat).any():
-                if allow_partial:
-                    failed += 1
-                    continue
-                raise RuntimeError(f"[{spec.module_tag}] origin failure asset={asset} interval={interval} horizon={hm} task={task} origin_ts={origin_ts} reason=nonfinite_feature_history")
-            med = np.nanmedian(fmat, axis=0)
-            fmat = np.where(np.isfinite(fmat), fmat, med)
-            x_hist = _as_runtime_float_array(fmat)
-            x_last = x_hist[-1]
         origin_batch.append({
             "origin_ts": int(origin_ts),
             "train_start_ts": int(ts_hist[0]),
             "train_end_ts": int(ts_hist[-1]),
-            "actual_value": float(y_vec[idx]),
+            "actual_value": float(window.actual_value),
             "fit_bars": int(y_hist.size),
             "refit_count": int(refit_count),
             "last_refit_ts": int(last_refit_ts) if last_refit_ts is not None else None,
@@ -819,8 +820,8 @@ def _run_neural_asset(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
                 "seq_len": int(seq_len),
                 "seed": 42 + j,
                 "model_params": dict(combo_model_params),
-                "x_hist": x_hist,
-                "x_last": x_last,
+                "x_hist": window.x_hist,
+                "x_last": window.x_last,
             },
         })
         if len(origin_batch) >= int(origin_batch_size):

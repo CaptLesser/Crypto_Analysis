@@ -81,6 +81,10 @@ from src.forecasting.ml.shared.numeric_runner_diagnostics import (
     resource_snapshot,
 )
 from src.forecasting.ml.shared.numeric_float_policy import DEFAULT_FLOAT_DTYPE, as_default_float_array
+from src.forecasting.ml.shared.numeric_origin_windows import (
+    build_production_origin_arrays,
+    prepare_production_origin_window,
+)
 from src.forecasting.common.pipeline_parquet_utils import decide_range_from_disk_edges
 from src.forecasting.common.forecast_family_core import (
     DEFAULT_BACKFILL_DAYS,
@@ -699,9 +703,28 @@ def _run_bayesian_asset(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     )
     refit_count = int(persisted_state.get("refit_count", 0) or 0)
     df = df.sort_values("ts").reset_index(drop=True)
-    ts_vec = df["ts"].astype("int64").to_numpy()
-    y_vec = pd.to_numeric(df[target_col], errors="coerce").to_numpy(dtype=DEFAULT_FLOAT_DTYPE)
-    valid_target_idx = np.flatnonzero(np.isfinite(y_vec))
+    if combo_profile is not None:
+        feat_cols = [str(c) for c in combo_profile.selected_dynamic_feature_columns if str(c) in df.columns]
+    else:
+        feat_cols = [c for c in spec.dynamic_feature_candidates if c in df.columns]
+    use_dynamic_features = combo_profile.use_dynamic_features if combo_profile is not None else spec.needs_dynamic_features
+    factor_map: Optional[Dict[int, float]] = None
+    if spec.needs_factor_cache:
+        factor_map = factor_cache_map if factor_cache_map is not None else _factor_cache_map_from_frame(factor_cache)
+    origin_arrays = build_production_origin_arrays(
+        frame=df,
+        target_col=str(target_col),
+        selected_feature_columns=feat_cols,
+        use_dynamic_features=bool(use_dynamic_features),
+        as_float_array=_as_runtime_float_array,
+        float_dtype=DEFAULT_FLOAT_DTYPE,
+        factor_map=factor_map,
+        needs_factor_cache=bool(spec.needs_factor_cache),
+        coerce_ts=False,
+    )
+    ts_vec = origin_arrays.ts_vec
+    y_vec = origin_arrays.y_vec
+    valid_target_idx = origin_arrays.valid_target_idx
     effective_start_ts = int(start_for_mode)
     min_history_bars = _min_required_history_bars(interval_minutes=int(interval), fit_days=int(args_fit_days))
     if int(valid_target_idx.size) >= int(min_history_bars):
@@ -718,20 +741,6 @@ def _run_bayesian_asset(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     if predict_batch_fn is None:
         def predict_batch_fn(*, origin_batch: Sequence[Dict[str, Any]]) -> Sequence[Tuple[Dict[float, float], Dict[str, Any]]]:
             return [spec.predict_fn(**item) for item in origin_batch]
-    if combo_profile is not None:
-        feat_cols = [str(c) for c in combo_profile.selected_dynamic_feature_columns if str(c) in df.columns]
-    else:
-        feat_cols = [c for c in spec.dynamic_feature_candidates if c in df.columns]
-    feat_matrix = None
-    if (combo_profile.use_dynamic_features if combo_profile is not None else spec.needs_dynamic_features) and feat_cols:
-        feat_frame = df.loc[:, feat_cols].apply(pd.to_numeric, errors="coerce")
-        feat_cols = [str(col) for col in feat_cols if feat_frame[str(col)].notna().any()]
-        if feat_cols:
-            feat_matrix = _as_runtime_float_array(feat_frame.loc[:, feat_cols].to_numpy(dtype=DEFAULT_FLOAT_DTYPE))
-    factor_values = None
-    if spec.needs_factor_cache:
-        factor_map = factor_cache_map if factor_cache_map is not None else _factor_cache_map_from_frame(factor_cache)
-        factor_values = _as_runtime_float_array([factor_map.get(int(t), np.nan) for t in ts_vec])
 
     origin_batch: List[Dict[str, Any]] = []
 
@@ -817,60 +826,36 @@ def _run_bayesian_asset(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
 
     for idx_origin, idx in enumerate(finalized_idx):
         origin_ts = int(ts_vec[idx])
-        valid_pos = int(np.searchsorted(valid_target_idx, int(idx), side="right")) - 1
-        if valid_pos < int(min_history_bars) - 1:
-            failed_origins += 1
-            insufficient_history_origins += 1
-            continue
         fit_bars = max(64, int(min_history_bars))
-        hist_start = max(0, valid_pos - int(fit_bars) + 1)
-        hist_idx = valid_target_idx[hist_start : valid_pos + 1]
-        y_hist = _as_runtime_float_array(y_vec[hist_idx])
-        ts_hist = ts_vec[hist_idx]
+        window_result = prepare_production_origin_window(
+            arrays=origin_arrays,
+            idx=int(idx),
+            min_history_bars=int(min_history_bars),
+            history_bars=int(fit_bars),
+            use_dynamic_features=bool(use_dynamic_features),
+            needs_factor_cache=bool(spec.needs_factor_cache),
+            as_float_array=_as_runtime_float_array,
+        )
+        if window_result.window is None:
+            reason = str(window_result.reason)
+            failed_origins += 1
+            if reason == "insufficient_valid_history":
+                insufficient_history_origins += 1
+                continue
+            if allow_partial:
+                continue
+            raise RuntimeError(f"[{spec.module_tag}] origin failure asset={asset} interval={interval} horizon={hm} task={task} origin_ts={origin_ts} reason={reason}")
+        window = window_result.window
+        y_hist = window.y_hist
+        ts_hist = window.ts_hist
         if last_refit_ts is None or should_refit(str(refit_cadence), last_refit_ts, int(origin_ts)):
             last_refit_ts = int(origin_ts)
             refit_count += 1
-        x_hist = None
-        x_last = None
-        if combo_profile.use_dynamic_features if combo_profile is not None else spec.needs_dynamic_features:
-            if feat_matrix is None:
-                if allow_partial:
-                    failed_origins += 1
-                    continue
-                raise RuntimeError(f"[{spec.module_tag}] origin failure asset={asset} interval={interval} horizon={hm} task={task} origin_ts={origin_ts} reason=missing_feature_matrix")
-            fmat = feat_matrix[hist_idx]
-            if not np.isfinite(fmat).any():
-                if allow_partial:
-                    failed_origins += 1
-                    continue
-                raise RuntimeError(f"[{spec.module_tag}] origin failure asset={asset} interval={interval} horizon={hm} task={task} origin_ts={origin_ts} reason=nonfinite_feature_history")
-            med = np.nanmedian(fmat, axis=0)
-            fmat = np.where(np.isfinite(fmat), fmat, med)
-            x_hist = _as_runtime_float_array(fmat)
-            x_last = x_hist[-1]
-        factor_hist = None
-        factor_last = None
-        if spec.needs_factor_cache:
-            if factor_values is None:
-                if allow_partial:
-                    failed_origins += 1
-                    continue
-                raise RuntimeError(f"[{spec.module_tag}] origin failure asset={asset} interval={interval} horizon={hm} task={task} origin_ts={origin_ts} reason=missing_factor_cache")
-            fh = factor_values[hist_idx]
-            if not np.isfinite(fh).any():
-                if allow_partial:
-                    failed_origins += 1
-                    continue
-                raise RuntimeError(f"[{spec.module_tag}] origin failure asset={asset} interval={interval} horizon={hm} task={task} origin_ts={origin_ts} reason=nonfinite_factor_history")
-            med_f = float(np.nanmedian(fh)) if np.isfinite(fh).any() else 0.0
-            fh = np.where(np.isfinite(fh), fh, med_f)
-            factor_hist = _as_runtime_float_array(fh)
-            factor_last = float(factor_hist[-1])
         origin_batch.append({
             "origin_ts": int(origin_ts),
             "train_start_ts": int(ts_hist[0]),
             "train_end_ts": int(ts_hist[-1]),
-            "actual_value": float(y_vec[idx]),
+            "actual_value": float(window.actual_value),
             "fit_bars": int(y_hist.size),
             "refit_count": int(refit_count),
             "last_refit_ts": int(last_refit_ts) if last_refit_ts is not None else None,
@@ -881,10 +866,10 @@ def _run_bayesian_asset(payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
                 "seasonal_period_bars": int(period_bars) if period_bars is not None else None,
                 "seed": 42 + idx_origin,
                 "model_params": dict(combo_model_params),
-                "x_hist": x_hist,
-                "x_last": x_last,
-                "factor_hist": factor_hist,
-                "factor_last": factor_last,
+                "x_hist": window.x_hist,
+                "x_last": window.x_last,
+                "factor_hist": window.factor_hist,
+                "factor_last": window.factor_last,
             },
         })
         if len(origin_batch) >= int(origin_batch_size):

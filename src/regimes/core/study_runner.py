@@ -43,6 +43,7 @@ from src.regimes.core.foundation_contracts import (
 )
 from src.regimes.core.pathway_artifacts import require_pathway_diagnostics_root
 from src.regimes.core.scoring import REGIME_SCORING_SCHEMA_VERSION, RegimeTrialScoreInput, score_regime_trial
+from src.regimes.core.splits import split_train_validation_frame
 
 
 REGIME_STUDY_MANIFEST_SCHEMA_VERSION = 1
@@ -429,51 +430,8 @@ def _target_columns_for_horizons(frame: pd.DataFrame, horizons: Sequence[int]) -
 
 
 def _split_frame(frame: pd.DataFrame, split_policy: Mapping[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    if frame.empty:
-        raise ValueError("Regime single-trial runner requires a non-empty feature frame")
-    policy = dict(split_policy)
-    if "train_row_count" in policy:
-        train_rows = int(policy["train_row_count"])
-    elif "train_fraction" in policy:
-        fraction = float(policy["train_fraction"])
-        if fraction <= 0.0 or fraction >= 1.0:
-            raise ValueError("Regime split_policy.train_fraction must be between 0 and 1")
-        train_rows = max(1, min(len(frame) - 1, int(math.floor(len(frame) * fraction))))
-    elif {"train_start_ts", "train_end_ts"}.issubset(policy):
-        ts_col = str(policy.get("timestamp_column", "ts"))
-        if ts_col not in frame.columns:
-            raise ValueError(f"Regime split timestamp column {ts_col!r} not found")
-        ts = pd.to_numeric(frame[ts_col], errors="coerce")
-        train_mask = (ts >= int(policy["train_start_ts"])) & (ts <= int(policy["train_end_ts"]))
-        validation_start = policy.get("validation_start_ts")
-        validation_end = policy.get("validation_end_ts")
-        if validation_start is not None and validation_end is not None:
-            validation_mask = (ts >= int(validation_start)) & (ts <= int(validation_end))
-        else:
-            validation_mask = ~train_mask
-        train = frame.loc[train_mask].copy()
-        validation = frame.loc[validation_mask].copy()
-        if train.empty:
-            raise ValueError("Regime split produced an empty train frame")
-        return train, validation, {
-            "split_policy": "timestamp_window",
-            "timestamp_column": ts_col,
-            "train_rows": int(len(train)),
-            "validation_rows": int(len(validation)),
-        }
-    else:
-        raise ValueError("Unsupported Regime split_policy")
-    if train_rows <= 0:
-        raise ValueError("Regime train row count must be positive")
-    if train_rows >= len(frame):
-        raise ValueError("Regime train row count must leave at least one validation row")
-    train = frame.iloc[:train_rows].copy()
-    validation = frame.iloc[train_rows:].copy()
-    return train, validation, {
-        "split_policy": "row_order",
-        "train_rows": int(len(train)),
-        "validation_rows": int(len(validation)),
-    }
+    split = split_train_validation_frame(frame, split_policy)
+    return split.train, split.validation, split.metadata
 
 
 def _result_dir(manifest: RegimeStudyManifest, trial_id: str) -> Path:

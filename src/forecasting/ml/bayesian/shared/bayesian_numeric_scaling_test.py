@@ -22,6 +22,8 @@ from src.forecasting.ml.bayesian.shared.bayesian_numeric_model_registry import B
 from src.forecasting.ml.bayesian.shared.bayesian_runtime_bootstrap import configure_bayesian_thread_env
 from src.forecasting.ml.bayesian.shared.bayesian_stage1_profile import resolve_execution_profile
 from src.forecasting.ml.shared.numeric_forecast_targets import compute_future_labels
+from src.forecasting.ml.shared.numeric_float_policy import DEFAULT_FLOAT_DTYPE, as_default_float_array
+from src.forecasting.ml.shared.numeric_origin_windows import build_production_origin_arrays, prepare_production_origin_window
 from src.forecasting.ml.shared.test_branch_function_telemetry import emit_event_for_path, telemetry_scope_for_path
 
 DEFAULT_STAGE2_INTERVALS = (5, 15, 30, 60, 240, 720, 1440)
@@ -384,18 +386,27 @@ def _origin_metrics(
     if label_col in merged.columns and label_col in labels.columns:
         merged = merged.drop(columns=[label_col])
     merged = pd.concat([merged, labels.reset_index(drop=True)], axis=1)
-    ts_vec = pd.to_numeric(merged["ts"], errors="coerce").fillna(-1).astype("int64").to_numpy()
-    y_vec = pd.to_numeric(merged[label_col], errors="coerce").to_numpy(dtype=float)
     candidate_cols = [str(c) for c in module.MODULE_SPEC.dynamic_feature_candidates if str(c) in merged.columns]
     if selected_feature_columns is None:
         feat_cols = candidate_cols
     else:
         feat_cols = [str(c) for c in selected_feature_columns if str(c) in merged.columns]
     feat_cols = [str(c) for c in feat_cols if str(c) in merged.columns and merged[str(c)].notna().any()]
-    feat_matrix = None
-    if module.MODULE_SPEC.needs_dynamic_features and feat_cols:
-        feat_matrix = merged.loc[:, feat_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-    valid_target_idx = np.flatnonzero(np.isfinite(y_vec))
+    use_dynamic_features = bool(module.MODULE_SPEC.needs_dynamic_features and feat_cols)
+    origin_arrays = build_production_origin_arrays(
+        frame=merged,
+        target_col=str(label_col),
+        selected_feature_columns=feat_cols,
+        use_dynamic_features=use_dynamic_features,
+        as_float_array=as_default_float_array,
+        float_dtype=DEFAULT_FLOAT_DTYPE,
+        factor_map=factor_map,
+        needs_factor_cache=bool(module.MODULE_SPEC.needs_factor_cache),
+        coerce_ts=True,
+    )
+    ts_vec = origin_arrays.ts_vec
+    y_vec = origin_arrays.y_vec
+    valid_target_idx = origin_arrays.valid_target_idx
     emit_event_for_path(
         telemetry_path,
         **base_event,
@@ -427,51 +438,37 @@ def _origin_metrics(
         origin_ts = int(ts_vec[idx])
         if origin_ts < int(eval_start_ts):
             continue
-        valid_pos = int(np.searchsorted(valid_target_idx, int(idx), side="right")) - 1
-        if valid_pos < 47:
+        window_result = prepare_production_origin_window(
+            arrays=origin_arrays,
+            idx=int(idx),
+            min_history_bars=48,
+            history_bars=int(train_bars),
+            use_dynamic_features=use_dynamic_features,
+            needs_factor_cache=bool(module.MODULE_SPEC.needs_factor_cache),
+            as_float_array=as_default_float_array,
+        )
+        if window_result.window is None:
             skipped_origins += 1
             continue
-        hist_start = max(0, valid_pos - int(train_bars) + 1)
-        valid_mask_indices = valid_target_idx[hist_start : valid_pos + 1]
-        y_hist = y_vec[valid_mask_indices]
-        x_hist = None
-        x_last = None
-        if module.MODULE_SPEC.needs_dynamic_features:
-            if feat_matrix is not None:
-                fmat = feat_matrix[valid_mask_indices]
-                med = np.nanmedian(fmat, axis=0)
-                fmat = np.where(np.isfinite(fmat), fmat, med)
-                x_hist = fmat
-                x_last = fmat[-1]
-        factor_hist = None
-        factor_last = None
-        if module.MODULE_SPEC.needs_factor_cache:
-            hist_ts = ts_vec[valid_mask_indices]
-            vals = np.asarray([factor_map.get(int(ts), np.nan) for ts in hist_ts], dtype=float)
-            if not np.isfinite(vals).any():
-                skipped_origins += 1
-                continue
-            med = float(np.nanmedian(vals)) if np.isfinite(vals).any() else 0.0
-            factor_hist = np.where(np.isfinite(vals), vals, med)
-            factor_last = float(factor_hist[-1])
+        window = window_result.window
         try:
             attempted_origins += 1
             qvals, _meta = module.MODULE_SPEC.predict_fn(
-                y_hist=y_hist,
+                y_hist=window.y_hist,
                 horizon_bars=int(horizon_minutes) // int(interval),
                 quantiles=[0.1, 0.5, 0.9],
                 seasonal_period_bars=(int(seasonal_period_bars) if seasonal_period_bars is not None else None),
                 seed=17 + idx,
                 model_params=dict(module.MODULE_SPEC.model_params),
-                x_hist=x_hist,
-                x_last=x_last,
-                factor_hist=factor_hist,
-                factor_last=factor_last,
+                x_hist=window.x_hist,
+                x_last=window.x_last,
+                factor_hist=window.factor_hist,
+                factor_last=window.factor_last,
             )
         except Exception:
             failed_origins += 1
             continue
-        y_true = y_vec[idx]
+        y_true = window.actual_value
         if not math.isfinite(float(y_true)):
             skipped_origins += 1
             continue
