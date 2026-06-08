@@ -254,12 +254,22 @@ def run_regime_production_canonical_writer(
             branch: int(result.get("logical_partitions_written") or 0)
             for branch, result in branch_results.items()
         },
+        "compute_execution_by_branch": {
+            branch: _branch_compute_execution(result)
+            for branch, result in branch_results.items()
+        },
         "runtime_telemetry": {
             "elapsed_seconds": round(float(elapsed), 6),
             "subprocess_invocations_by_writer": 0,
             "writer_execution_mode": "single_process_partitioned_atomic_parquet_canonical_writer",
+            "compute_execution_by_branch": {
+                branch: _branch_compute_execution(result)
+                for branch, result in branch_results.items()
+            },
             "full_branch_default": cfg.max_logical_partitions_per_branch is None,
             "operator_approval_required": bool(cfg.require_operator_approval),
+            "parent_finalizer_writes_only": True,
+            "writer_workers": 1,
         },
         "operator_approval_required": bool(cfg.require_operator_approval),
         "production_writer_requested": bool(cfg.production_writer_enabled),
@@ -577,6 +587,13 @@ def write_regime_production_canonical_branch_partitions(
             "source_plan_artifact_kind": REGIME_PRODUCTION_NO_WRITE_PLAN_ARTIFACT_KIND,
             "source_plan_unit_count": len(plan.planning_units),
             "label_materialization": materialized.materialization_summary,
+            "compute_execution": dict(materialized.materialization_summary.get("execution") or {}),
+            "worker_profile_honored_by_materializer": bool(
+                materialized.materialization_summary.get("worker_profile_honored")
+            ),
+            "parent_finalizer_writes_only": True,
+            "workers_compute_only": True,
+            "workers_write_outputs": False,
             "source_tail_summary": source_tail_summary,
             "incremental_resume": _resume_manifest_payload(active_resume),
             "canonical_output_root_contract": _canonical_output_root_contract(branch_name, output_root),
@@ -1827,6 +1844,27 @@ def _load_json(path: str | Path, *, project_root: str | Path | None) -> dict[str
     if not isinstance(payload, dict):
         raise ValueError("Regime Production canonical writer expected a JSON object")
     return payload
+
+
+def _branch_compute_execution(result: Mapping[str, Any]) -> dict[str, Any]:
+    materialization = dict(result.get("label_materialization") or {})
+    execution = dict(materialization.get("execution") or result.get("compute_execution") or {})
+    return to_jsonable(
+        {
+            "execution_mode": execution.get("execution_mode"),
+            "backend": execution.get("backend"),
+            "worker_profile_honored": bool(execution.get("worker_profile_honored")),
+            "configured_workers": execution.get("configured_workers"),
+            "effective_workers": execution.get("effective_workers"),
+            "model_threads": execution.get("model_threads"),
+            "writer_workers": int(execution.get("writer_workers") or 1),
+            "parallel_processes_used": int(execution.get("parallel_processes_used") or 0),
+            "parallel_threads_used": int(execution.get("parallel_threads_used") or 0),
+            "workers_compute_only": bool(execution.get("workers_compute_only")),
+            "workers_write_outputs": bool(execution.get("workers_write_outputs")),
+            "parent_finalizer_writes_only": bool(execution.get("parent_finalizer_writes_only")),
+        }
+    )
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:

@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
@@ -93,39 +95,232 @@ def materialize_regime_production_label_rows(
 
     branch = _branch_name(plan.branch)
     schema = default_regime_production_label_output_schema(branch)
+    rows, execution = _materialize_rows_for_plan(
+        plan,
+        branch=branch,
+        schema_id=schema.schema_id,
+        run_id=run_id,
+    )
+    summary = _materialization_summary(
+        plan,
+        branch=branch,
+        schema_id=schema.schema_id,
+        mode=mode,
+        rows=rows,
+        execution=execution,
+    )
+    return RegimeProductionMaterializedLabelBatch(
+        branch=branch,
+        run_id=run_id,
+        rows=rows,
+        materialization_summary=summary,
+    )
+
+
+def _materialize_rows_for_plan(
+    plan: RegimeProductionNoWritePlan,
+    *,
+    branch: str,
+    schema_id: str,
+    run_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    job_matrix = dict(plan.job_matrix or {})
+    worker_profile = dict(job_matrix.get("worker_profile") or {})
+    job_batches = tuple(dict(item) for item in job_matrix.get("job_batches") or ())
+    work_unit_count = len(plan.planning_units)
+    effective_workers = int(job_matrix.get("effective_workers") or worker_profile.get("effective_workers") or 1)
+    backend = str(job_matrix.get("backend") or worker_profile.get("backend") or "serial").strip().lower()
+    model_threads = int(job_matrix.get("model_threads") or worker_profile.get("model_threads") or 1)
+    use_parallel = (
+        effective_workers > 1
+        and len(job_batches) > 1
+        and backend in {"process", "thread", "hybrid"}
+    )
+    if not use_parallel:
+        rows = _materialize_unit_rows(
+            tuple(plan.planning_units),
+            branch=branch,
+            fallback_clamp=dict(plan.planner_contract.get("clamp_policy") or {}),
+            schema_id=schema_id,
+            run_id=run_id,
+        )
+        return rows, {
+            "schema_version": REGIME_PRODUCTION_LABEL_MATERIALIZER_SCHEMA_VERSION,
+            "artifact_kind": "regime_production_label_materialization_execution",
+            "execution_mode": "serial",
+            "backend": "serial" if backend == "serial" else backend,
+            "worker_profile_honored": bool(job_matrix),
+            "configured_workers": int(job_matrix.get("workers") or worker_profile.get("workers") or 1),
+            "effective_workers": 1,
+            "model_threads": model_threads,
+            "writer_workers": 1,
+            "job_batch_count": len(job_batches) if job_batches else 1,
+            "work_unit_count": work_unit_count,
+            "parallel_processes_used": 0,
+            "parallel_threads_used": 0,
+            "workers_compute_only": True,
+            "parent_finalizer_writes_only": True,
+        }
+
+    unit_by_id = {unit.unit_id: unit for unit in plan.planning_units}
+    tasks: list[tuple[int, tuple[Any, ...]]] = []
+    for index, batch in enumerate(job_batches):
+        units = tuple(unit_by_id[unit_id] for unit_id in tuple(batch.get("work_unit_ids") or ()) if unit_id in unit_by_id)
+        if units:
+            tasks.append((index, units))
+    if not tasks:
+        return [], {
+            "schema_version": REGIME_PRODUCTION_LABEL_MATERIALIZER_SCHEMA_VERSION,
+            "artifact_kind": "regime_production_label_materialization_execution",
+            "execution_mode": "serial_empty",
+            "backend": backend,
+            "worker_profile_honored": True,
+            "configured_workers": int(job_matrix.get("workers") or worker_profile.get("workers") or 1),
+            "effective_workers": 0,
+            "model_threads": model_threads,
+            "writer_workers": 1,
+            "job_batch_count": 0,
+            "work_unit_count": work_unit_count,
+            "parallel_processes_used": 0,
+            "parallel_threads_used": 0,
+            "workers_compute_only": True,
+            "parent_finalizer_writes_only": True,
+        }
+
+    max_workers = max(1, min(int(effective_workers), len(tasks)))
+    executor_cls = ThreadPoolExecutor if backend == "thread" else ProcessPoolExecutor
+    execution_backend = "thread" if backend == "thread" else "process"
+    fallback_clamp = dict(plan.planner_contract.get("clamp_policy") or {})
+    results: dict[int, list[dict[str, Any]]] = {}
+    with executor_cls(max_workers=max_workers, initializer=_materializer_worker_init, initargs=(model_threads,)) as executor:
+        futures = {
+            executor.submit(
+                _materialize_unit_batch_worker,
+                units,
+                branch,
+                fallback_clamp,
+                schema_id,
+                run_id,
+            ): index
+            for index, units in tasks
+        }
+        for future in as_completed(futures):
+            results[futures[future]] = list(future.result())
+    unit_order = {unit.unit_id: index for index, unit in enumerate(plan.planning_units)}
+    rows = [
+        row
+        for index in sorted(results)
+        for row in results[index]
+    ]
+    rows.sort(key=lambda row: _row_sort_key(row, unit_order=unit_order))
+    return rows, {
+        "schema_version": REGIME_PRODUCTION_LABEL_MATERIALIZER_SCHEMA_VERSION,
+        "artifact_kind": "regime_production_label_materialization_execution",
+        "execution_mode": f"{execution_backend}_pool",
+        "backend": execution_backend,
+        "worker_profile_honored": True,
+        "configured_workers": int(job_matrix.get("workers") or worker_profile.get("workers") or max_workers),
+        "effective_workers": int(max_workers),
+        "model_threads": int(model_threads),
+        "writer_workers": 1,
+        "job_batch_count": len(tasks),
+        "work_unit_count": work_unit_count,
+        "parallel_processes_used": int(max_workers) if execution_backend == "process" else 0,
+        "parallel_threads_used": int(max_workers) if execution_backend == "thread" else 0,
+        "workers_compute_only": True,
+        "workers_write_outputs": False,
+        "parent_finalizer_writes_only": True,
+    }
+
+
+def _materialize_unit_batch_worker(
+    units: Sequence[Any],
+    branch: str,
+    fallback_clamp: Mapping[str, Any],
+    schema_id: str,
+    run_id: str,
+) -> list[dict[str, Any]]:
+    return _materialize_unit_rows(
+        tuple(units),
+        branch=branch,
+        fallback_clamp=fallback_clamp,
+        schema_id=schema_id,
+        run_id=run_id,
+    )
+
+
+def _materializer_worker_init(model_threads: int) -> None:
+    threads = str(max(1, int(model_threads)))
+    for name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "BLIS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ[name] = threads
+
+
+def _materialize_unit_rows(
+    units: Sequence[Any],
+    *,
+    branch: str,
+    fallback_clamp: Mapping[str, Any],
+    schema_id: str,
+    run_id: str,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    status_counts: dict[str, int] = {}
-    mask_reason_counts: dict[str, int] = {}
-    cadence_counts: dict[str, int] = {}
-    timestamp_counts: dict[str, int] = {}
-    selected_rows = 0
-    masked_rows = 0
-    timestamp_min: str | None = None
-    timestamp_max: str | None = None
-    for unit in plan.planning_units:
+    for unit in units:
         cadence = _cadence_for_unit(unit)
-        timestamps = _timestamps_for_unit(unit, fallback_clamp=dict(plan.planner_contract.get("clamp_policy") or {}), cadence=cadence)
-        cadence_counts[cadence] = int(cadence_counts.get(cadence, 0)) + 1
-        timestamp_counts[cadence] = int(timestamp_counts.get(cadence, 0)) + len(timestamps)
+        timestamps = _timestamps_for_unit(unit, fallback_clamp=fallback_clamp, cadence=cadence)
         for boundary_index, timestamp in enumerate(timestamps):
             row = _row_for_unit_timestamp(
                 unit,
                 branch=branch,
                 timestamp=timestamp,
                 definition_refit_boundary_index=boundary_index,
-                schema_id=schema.schema_id,
+                schema_id=schema_id,
                 run_id=run_id,
                 cadence=movement_safe_cadence(cadence),
             )
             rows.append(row)
-            status = str(row.get("availability_status"))
-            status_counts[status] = int(status_counts.get(status, 0)) + 1
-            if status == LABEL_PLANNING_STATUS_SELECTED:
-                selected_rows += 1
-            if row.get("mask_reason") not in (None, ""):
-                masked_rows += 1
-                reason = str(row["mask_reason"])
-                mask_reason_counts[reason] = int(mask_reason_counts.get(reason, 0)) + 1
+    return rows
+
+
+def _materialization_summary(
+    plan: RegimeProductionNoWritePlan,
+    *,
+    branch: str,
+    schema_id: str,
+    mode: str,
+    rows: Sequence[Mapping[str, Any]],
+    execution: Mapping[str, Any],
+) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    mask_reason_counts: dict[str, int] = {}
+    timestamp_counts: dict[str, int] = {}
+    cadence_counts: dict[str, int] = {}
+    selected_rows = 0
+    masked_rows = 0
+    timestamp_min: str | None = None
+    timestamp_max: str | None = None
+    for unit in plan.planning_units:
+        cadence = movement_safe_cadence(_cadence_for_unit(unit))
+        timestamps = _timestamps_for_unit(unit, fallback_clamp=dict(plan.planner_contract.get("clamp_policy") or {}), cadence=cadence)
+        cadence_counts[cadence] = int(cadence_counts.get(cadence, 0)) + 1
+        timestamp_counts[cadence] = int(timestamp_counts.get(cadence, 0)) + len(timestamps)
+    for row in rows:
+        status = str(row.get("availability_status"))
+        status_counts[status] = int(status_counts.get(status, 0)) + 1
+        if status == LABEL_PLANNING_STATUS_SELECTED:
+            selected_rows += 1
+        if row.get("mask_reason") not in (None, ""):
+            masked_rows += 1
+            reason = str(row["mask_reason"])
+            mask_reason_counts[reason] = int(mask_reason_counts.get(reason, 0)) + 1
+        timestamp = str(row.get("timestamp") or "")
+        if timestamp:
             timestamp_min = timestamp if timestamp_min is None else min(timestamp_min, timestamp)
             timestamp_max = timestamp if timestamp_max is None else max(timestamp_max, timestamp)
     summary = {
@@ -135,7 +330,7 @@ def materialize_regime_production_label_rows(
         "source_plan_status": plan.safety_status,
         "source_artifact_path": plan.artifact_path,
         "source_artifact_hash": plan.profile_artifact_hash,
-        "output_schema_id": schema.schema_id,
+        "output_schema_id": schema_id,
         "materialization_mode": mode,
         "label_assignment_method": LABEL_ASSIGNMENT_METHOD_PROFILE_STATE_SCHEDULE,
         "planned_unit_count": len(plan.planning_units),
@@ -148,6 +343,14 @@ def materialize_regime_production_label_rows(
         "timestamp_row_counts_by_cadence": timestamp_counts,
         "range_start": timestamp_min,
         "range_end": timestamp_max,
+        "execution": to_jsonable(dict(execution)),
+        "worker_profile_honored": bool(dict(execution).get("worker_profile_honored")),
+        "materializer_execution_mode": dict(execution).get("execution_mode"),
+        "materializer_effective_workers": dict(execution).get("effective_workers"),
+        "writer_workers": 1,
+        "parent_finalizer_writes_only": True,
+        "workers_compute_only": True,
+        "workers_write_outputs": False,
         "tail_fill_policy": "rows_after_selected_profile_source_tail_marked_for_recompute_in_lineage",
         "full_clamp_cadence_materialized": True,
         "sandbox_source_rows_used": False,
@@ -160,12 +363,13 @@ def materialize_regime_production_label_rows(
         "production_outputs_written": False,
         "canonical_production_state_outputs_written": False,
     }
-    return RegimeProductionMaterializedLabelBatch(
-        branch=branch,
-        run_id=run_id,
-        rows=rows,
-        materialization_summary=summary,
-    )
+    return summary
+
+
+def _row_sort_key(row: Mapping[str, Any], *, unit_order: Mapping[str, int]) -> tuple[int, str]:
+    lineage = dict(row.get("lineage") or {})
+    unit_id = str(lineage.get("source_planning_unit_id") or "")
+    return int(unit_order.get(unit_id, len(unit_order))), str(row.get("timestamp") or "")
 
 
 def _row_for_unit_timestamp(
