@@ -21,7 +21,11 @@ from src.features.numeric_forecast_profiles import normalize_refit_cadence
 from src.forecasting.common.io_atomic import atomic_replace, sibling_temp_path
 from src.forecasting.common.sandbox_paths import assert_write_allowed
 from src.forecasting.ml.shared.production_time import production_start_ts
-from src.forecasting.ml.shared.numeric_runner_diagnostics import append_diagnostic_event, resource_snapshot
+from src.forecasting.ml.shared.numeric_runner_diagnostics import (
+    append_diagnostic_event,
+    resource_snapshot,
+    worker_resource_telemetry_record,
+)
 from src.forecasting.ml.shared.numeric_forecast_io import (
     NumericForecastIOConfig,
     NumericForecastNamingConfig,
@@ -80,6 +84,71 @@ DEFAULT_NUMERIC_TASK_LABEL: Dict[str, str] = {
     "range_efficiency": "future_range_efficiency",
     "direction": "future_direction",
 }
+
+_NUMERIC_WORKER_TELEMETRY_SENTINEL = "__numeric_worker_telemetry_result__"
+
+
+def _utc_now_iso_for_worker_telemetry() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _invoke_numeric_worker_with_telemetry(
+    fn: Callable[[Dict[str, Any]], Any],
+    payload: Dict[str, Any],
+    telemetry_context: Dict[str, Any],
+) -> Dict[str, Any]:
+    start_epoch = time.time()
+    start_iso = _utc_now_iso_for_worker_telemetry()
+    start_resource = resource_snapshot(include_thread_snapshot=True)
+    status = "completed"
+    error_payload: Dict[str, Any] = {}
+    result: Any = None
+    try:
+        result = fn(payload)
+    except Exception as exc:
+        status = "failed"
+        error_payload = {"error_type": type(exc).__name__, "error_message": str(exc)}
+    end_epoch = time.time()
+    end_iso = _utc_now_iso_for_worker_telemetry()
+    end_resource = resource_snapshot(include_thread_snapshot=True)
+    worker_telemetry = worker_resource_telemetry_record(
+        module=str(telemetry_context.get("module") or telemetry_context.get("module_tag") or "numeric_runner"),
+        run_id=str(telemetry_context.get("run_id") or ""),
+        task_id=str(telemetry_context.get("task_id") or telemetry_context.get("work_unit_id") or ""),
+        work_unit_id=str(telemetry_context.get("work_unit_id") or telemetry_context.get("task_id") or ""),
+        status=status,
+        start_time_utc=start_iso,
+        end_time_utc=end_iso,
+        start_epoch_s=start_epoch,
+        end_epoch_s=end_epoch,
+        submitted_epoch_s=telemetry_context.get("submitted_epoch_s"),
+        resource_start=start_resource,
+        resource_end=end_resource,
+        phase_timings=telemetry_context.get("phase_timings") if isinstance(telemetry_context.get("phase_timings"), dict) else {},
+        identity=telemetry_context.get("identity") if isinstance(telemetry_context.get("identity"), dict) else {},
+        error=error_payload.get("error_message") if error_payload else None,
+    )
+    return {
+        _NUMERIC_WORKER_TELEMETRY_SENTINEL: True,
+        "ok": status == "completed",
+        "result": result,
+        "worker_telemetry": worker_telemetry,
+        "error": error_payload,
+    }
+
+
+def _unwrap_numeric_worker_result(raw: Any) -> Tuple[Any, Optional[Dict[str, Any]]]:
+    if isinstance(raw, dict) and raw.get(_NUMERIC_WORKER_TELEMETRY_SENTINEL):
+        telemetry = raw.get("worker_telemetry") if isinstance(raw.get("worker_telemetry"), dict) else None
+        if not bool(raw.get("ok", False)):
+            error = raw.get("error") if isinstance(raw.get("error"), dict) else {}
+            message = str(error.get("error_message") or "numeric worker failed")
+            error_type = str(error.get("error_type") or "RuntimeError")
+            raise RuntimeError(f"{error_type}: {message}")
+        return raw.get("result"), telemetry
+    return raw, None
 
 
 def canonical_table_slug(raw: str) -> str:
@@ -1895,6 +1964,31 @@ def execute_sharded_combo_jobs(
             "assets": int(len(payload.get("assets") or [])),
         }
 
+    def _worker_context(payload: Dict[str, Any], *, submitted_epoch_s: float) -> Dict[str, Any]:
+        fields = _payload_diag_fields(payload)
+        task_id = (
+            f"{fields['module_tag']}|{fields['interval']}|{fields['horizon_minutes']}|"
+            f"{fields['task']}|shard={fields['shard_index']}"
+        )
+        return {
+            "module": str(module_name),
+            "module_tag": str(module_tag),
+            "run_id": str(fields["run_id"]),
+            "task_id": task_id,
+            "work_unit_id": task_id,
+            "submitted_epoch_s": float(submitted_epoch_s),
+            "identity": {
+                **fields,
+                "target": fields["task"],
+                "model_family": str(family_label),
+            },
+        }
+
+    def _emit_worker_telemetry(payload: Dict[str, Any], telemetry: Optional[Dict[str, Any]]) -> None:
+        if not telemetry:
+            return
+        _diag("worker_resource", {**_payload_diag_fields(payload), "worker_telemetry": telemetry})
+
     def _queue_update_rows(
         *,
         combo_key: Tuple[int, int, str],
@@ -1991,8 +2085,19 @@ def execute_sharded_combo_jobs(
                                     "resource": resource_snapshot(),
                                 },
                             )
-                            fut = ex.submit(run_shard_fn, {key: value for key, value in payload.items() if not str(key).startswith("_")})
+                            clean_payload = {key: value for key, value in payload.items() if not str(key).startswith("_")}
                             payload["_submitted_monotonic"] = float(time.monotonic())
+                            submitted_epoch_s = float(time.time())
+                            payload["_submitted_epoch_s"] = submitted_epoch_s
+                            if diagnostics_path is not None:
+                                fut = ex.submit(
+                                    _invoke_numeric_worker_with_telemetry,
+                                    run_shard_fn,
+                                    clean_payload,
+                                    _worker_context(payload, submitted_epoch_s=submitted_epoch_s),
+                                )
+                            else:
+                                fut = ex.submit(run_shard_fn, clean_payload)
                             fut_map[fut] = payload
                         if fut_map:
                             done, _ = wait(set(fut_map.keys()), timeout=max(0.25, pressure_guard.seconds_until_next_sample()), return_when=FIRST_COMPLETED)
@@ -2003,7 +2108,9 @@ def execute_sharded_combo_jobs(
                                 payload = fut_map.pop(fut)
                                 completed_jobs += 1
                                 combo_key = payload["_combo_key"]
-                                combo_updates = list(fut.result())
+                                raw_result, worker_telemetry = _unwrap_numeric_worker_result(fut.result())
+                                _emit_worker_telemetry(payload, worker_telemetry)
+                                combo_updates = list(raw_result)
                                 shard_elapsed_s = float(time.monotonic()) - float(payload.get("_submitted_monotonic", time.monotonic()))
                                 updates_by_combo.setdefault(combo_key, []).extend(combo_updates)
                                 raise_writer_fatal(writer_state, family_label)
@@ -2090,7 +2197,18 @@ def execute_sharded_combo_jobs(
             },
         )
         shard_started = time.monotonic()
-        combo_updates = run_shard_fn({key: value for key, value in payload.items() if not str(key).startswith("_")})
+        clean_payload = {key: value for key, value in payload.items() if not str(key).startswith("_")}
+        if diagnostics_path is not None:
+            raw_result = _invoke_numeric_worker_with_telemetry(
+                run_shard_fn,
+                clean_payload,
+                _worker_context(payload, submitted_epoch_s=float(time.time())),
+            )
+            raw_result, worker_telemetry = _unwrap_numeric_worker_result(raw_result)
+            _emit_worker_telemetry(payload, worker_telemetry)
+            combo_updates = raw_result
+        else:
+            combo_updates = run_shard_fn(clean_payload)
         shard_elapsed_s = float(time.monotonic()) - float(shard_started)
         updates_by_combo.setdefault(combo_key, []).extend(combo_updates)
         raise_writer_fatal(writer_state, family_label)
@@ -2176,6 +2294,31 @@ def execute_grouped_horizon_jobs(
             "assets": int(len(payload.get("assets") or [])),
         }
 
+    def _worker_context(payload: Dict[str, Any], *, submitted_epoch_s: float) -> Dict[str, Any]:
+        fields = _payload_diag_fields(payload)
+        task_id = (
+            f"{fields['module_tag']}|{fields['interval']}|{fields['horizon_minutes']}|"
+            f"group_shard={fields['shard_index']}"
+        )
+        return {
+            "module": str(module_name),
+            "module_tag": str(module_tag),
+            "run_id": str(fields["run_id"]),
+            "task_id": task_id,
+            "work_unit_id": task_id,
+            "submitted_epoch_s": float(submitted_epoch_s),
+            "identity": {
+                **fields,
+                "target": "grouped_horizon",
+                "model_family": str(family_label),
+            },
+        }
+
+    def _emit_worker_telemetry(payload: Dict[str, Any], telemetry: Optional[Dict[str, Any]]) -> None:
+        if not telemetry:
+            return
+        _diag("worker_resource", {**_payload_diag_fields(payload), "worker_telemetry": telemetry})
+
     def _queue_updates(payload: Dict[str, Any], grouped_updates: Sequence[Tuple[Tuple[int, int, str], str, Dict[str, Any]]]) -> Tuple[int, int, int, int]:
         counts = [0, 0, 0, 0]
         by_combo: Dict[Tuple[int, int, str], List[Tuple[str, Dict[str, Any]]]] = {}
@@ -2254,8 +2397,19 @@ def execute_grouped_horizon_jobs(
                                 f"shard={int(payload['_shard_index'])}/{int(payload['_shard_count'])} assets={len(payload['assets'])}"
                             )
                             _diag("dispatch_submit", {**_payload_diag_fields(payload), "mode": "parallel", "total_jobs": int(len(group_jobs)), "resource": resource_snapshot()})
-                            fut = ex.submit(run_group_shard_fn, {key: value for key, value in payload.items() if not str(key).startswith("_")})
+                            clean_payload = {key: value for key, value in payload.items() if not str(key).startswith("_")}
+                            submitted_epoch_s = float(time.time())
+                            if diagnostics_path is not None:
+                                fut = ex.submit(
+                                    _invoke_numeric_worker_with_telemetry,
+                                    run_group_shard_fn,
+                                    clean_payload,
+                                    _worker_context(payload, submitted_epoch_s=submitted_epoch_s),
+                                )
+                            else:
+                                fut = ex.submit(run_group_shard_fn, clean_payload)
                             payload["_submitted_monotonic"] = float(time.monotonic())
+                            payload["_submitted_epoch_s"] = submitted_epoch_s
                             fut_map[fut] = payload
                         if fut_map:
                             done, _ = wait(set(fut_map.keys()), timeout=max(0.25, pressure_guard.seconds_until_next_sample()), return_when=FIRST_COMPLETED)
@@ -2265,7 +2419,9 @@ def execute_grouped_horizon_jobs(
                             for fut in done:
                                 payload = fut_map.pop(fut)
                                 completed_jobs += 1
-                                grouped_updates = list(fut.result())
+                                raw_result, worker_telemetry = _unwrap_numeric_worker_result(fut.result())
+                                _emit_worker_telemetry(payload, worker_telemetry)
+                                grouped_updates = list(raw_result)
                                 _record_group_result(payload, grouped_updates)
                                 raise_writer_fatal(writer_state, family_label)
                                 counts = _queue_updates(payload, grouped_updates)
@@ -2293,7 +2449,18 @@ def execute_grouped_horizon_jobs(
         )
         _diag("dispatch_submit", {**_payload_diag_fields(payload), "mode": "serial", "total_jobs": int(len(group_jobs)), "resource": resource_snapshot()})
         started = time.monotonic()
-        grouped_updates = list(run_group_shard_fn({key: value for key, value in payload.items() if not str(key).startswith("_")}))
+        clean_payload = {key: value for key, value in payload.items() if not str(key).startswith("_")}
+        if diagnostics_path is not None:
+            raw_result = _invoke_numeric_worker_with_telemetry(
+                run_group_shard_fn,
+                clean_payload,
+                _worker_context(payload, submitted_epoch_s=float(time.time())),
+            )
+            raw_result, worker_telemetry = _unwrap_numeric_worker_result(raw_result)
+            _emit_worker_telemetry(payload, worker_telemetry)
+            grouped_updates = list(raw_result)
+        else:
+            grouped_updates = list(run_group_shard_fn(clean_payload))
         _record_group_result(payload, grouped_updates)
         raise_writer_fatal(writer_state, family_label)
         counts = _queue_updates(payload, grouped_updates)

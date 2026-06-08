@@ -23,6 +23,7 @@ from src.forecasting.common.io_atomic import atomic_replace, sibling_temp_path
 from src.forecasting.common.path_config import resolve_path, selected_profile
 from src.forecasting.common.runtime_config import RUNTIME_CONFIG_PATH, get_workers, log_resolved_runtime
 from src.forecasting.common.sandbox_paths import SandboxOutputRoots, resolve_sandbox_output_roots
+from src.forecasting.ml.shared.numeric_runner_diagnostics import resource_snapshot, worker_resource_telemetry_record
 from src.regimes.core import artifacts as regime_artifacts
 from sklearn.preprocessing import RobustScaler, StandardScaler
 
@@ -2399,6 +2400,9 @@ def process_asset(
     if hdbscan is None:
         raise RuntimeError("hdbscan is required for regime clustering.")
     asset_start = time.perf_counter()
+    worker_start_epoch = time.time()
+    worker_start_utc = datetime.now(timezone.utc).isoformat()
+    worker_start_resource = resource_snapshot(include_thread_snapshot=True)
     band_states: dict = {}
     band_errors: List[Dict[str, str]] = []
     diagnostics = DiagnosticCollector(asset=str(asset))
@@ -2446,12 +2450,16 @@ def process_asset(
                 f"final_unknown_fraction={float(row.get('assignments', {}).get('final_unknown_fraction', 1.0)):.6f}"
             )
         log(f"[diag] asset={asset} wrote {len(diagnostics_rows)} category records -> {diagnostics_path}")
+    total_s = round(float(time.perf_counter() - asset_start), 6)
+    worker_end_epoch = time.time()
+    worker_end_utc = datetime.now(timezone.utc).isoformat()
+    worker_end_resource = resource_snapshot(include_thread_snapshot=True)
     return {
         "asset": asset,
         "band_states": band_states,
         "errors": band_errors,
         "timings_s": {
-            "total": round(float(time.perf_counter() - asset_start), 6),
+            "total": total_s,
             "diagnostic_write": round(float(diagnostic_write_s), 6),
         },
         "rows_written": int(sum(int(state.get("rows_written", 0)) for state in band_states.values())),
@@ -2461,6 +2469,28 @@ def process_asset(
         ),
         "parquet_write_events": int(sum(int(state.get("parquet_write_events", 0)) for state in band_states.values())),
         "diagnostic_write_events": int(diagnostic_write_events),
+        "worker_telemetry": worker_resource_telemetry_record(
+            module="regime_clustering",
+            run_id=str(uuid.uuid5(uuid.NAMESPACE_DNS, str(asset))),
+            task_id=f"regime_clustering|asset={asset}",
+            work_unit_id=f"regime_clustering|{asset}",
+            status="failed" if band_errors else "completed",
+            start_time_utc=worker_start_utc,
+            end_time_utc=worker_end_utc,
+            start_epoch_s=worker_start_epoch,
+            end_epoch_s=worker_end_epoch,
+            resource_start=worker_start_resource,
+            resource_end=worker_end_resource,
+            phase_timings={"asset_total_s": total_s, "diagnostic_write_s": float(diagnostic_write_s)},
+            identity={
+                "asset": str(asset),
+                "target": "regime_labels",
+                "model_family": "regime_clustering",
+                "profile": str(feature_strategy),
+                "band": ",".join(str(band.name) for band in band_specs),
+            },
+            error=("; ".join(str(item.get("error", "")) for item in band_errors) if band_errors else None),
+        ),
     }
 
 
@@ -2580,6 +2610,10 @@ def run(
         "diagnostic_write_events": int(
             sum(int(result.get("diagnostic_write_events", 0)) for result in asset_results)
         ),
+        "worker_resource_telemetry": {
+            "count": int(sum(1 for result in asset_results if isinstance(result.get("worker_telemetry"), dict))),
+            "records": [result["worker_telemetry"] for result in asset_results if isinstance(result.get("worker_telemetry"), dict)][:100],
+        },
         "asset_results": asset_results,
     }
     log(

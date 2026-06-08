@@ -175,6 +175,7 @@ class RelationshipPrototypeArtifactWriteResult:
     method_manifest: RelationshipArtifactWriteResult
     refit_snapshot_manifest: RelationshipArtifactWriteResult
     asset_relationship_profiles: RelationshipTabularWriteResult
+    candidate_relationship_edges: RelationshipTabularWriteResult
     selected_relationship_edges: RelationshipTabularWriteResult
     relationship_stability_scores: RelationshipTabularWriteResult
     edge_alias_manifest: RelationshipTabularWriteResult
@@ -186,6 +187,7 @@ class RelationshipPrototypeArtifactWriteResult:
     def as_dict(self) -> dict[str, Any]:
         tabular = (
             self.asset_relationship_profiles,
+            self.candidate_relationship_edges,
             self.selected_relationship_edges,
             self.relationship_stability_scores,
             self.edge_alias_manifest,
@@ -246,6 +248,7 @@ def write_relationship_prototype_artifacts(
     profile_rows = _with_source_tail_from_known_at(
         profile.as_dict() for comparison in prototype_result.comparisons.values() for method in comparison.methods for profile in method.profiles
     )
+    candidate_edge_rows = _candidate_edge_rows(selection_result)
     selected_edge_rows = _with_source_tail_from_known_at(edge.as_dict() for edge in selection_result.selected_edges)
     stability_rows = _with_stability_metadata(selection_result, refit_snapshot=refit_snapshot)
     alias_rows = [row.as_dict() for row in build_edge_alias_manifest_rows(selection_result, refit_snapshot=refit_snapshot)]
@@ -256,6 +259,14 @@ def write_relationship_prototype_artifacts(
         output_root=root,
         stem="asset_relationship_profiles",
         logical_name="asset_relationship_profiles",
+        prefer_parquet=prefer_parquet,
+        production_enabled=production_enabled,
+    )
+    candidate_edges_write = _write_tabular(
+        candidate_edge_rows,
+        output_root=root,
+        stem="candidate_relationship_edges",
+        logical_name="candidate_relationship_edges",
         prefer_parquet=prefer_parquet,
         production_enabled=production_enabled,
     )
@@ -306,6 +317,7 @@ def write_relationship_prototype_artifacts(
             "method_manifest": _first_path(method_manifest, root=root),
             "refit_snapshot_manifest": _first_path(refit_manifest, root=root),
             "asset_relationship_profiles": _relative_path_or_none(profiles_write.path, root),
+            "candidate_relationship_edges": _relative_path_or_none(candidate_edges_write.path, root),
             "selected_relationship_edges": _relative_path_or_none(edges_write.path, root),
             "relationship_stability_scores": _relative_path_or_none(stability_write.path, root),
             "edge_alias_manifest": _relative_path_or_none(aliases_write.path, root),
@@ -319,13 +331,14 @@ def write_relationship_prototype_artifacts(
         relative_path="relationship_scoreboard.json",
         production_enabled=production_enabled,
     )
-    row_count = sum(item.row_count for item in (profiles_write, edges_write, stability_write, aliases_write, isolated_write))
+    row_count = sum(item.row_count for item in (profiles_write, candidate_edges_write, edges_write, stability_write, aliases_write, isolated_write))
     return RelationshipPrototypeArtifactWriteResult(
         status=RELATIONSHIP_PROTOTYPE_WRITE_STATUS_WRITTEN if row_count > 0 else RELATIONSHIP_PROTOTYPE_WRITE_STATUS_NO_ROWS,
         output_root=root,
         method_manifest=method_manifest,
         refit_snapshot_manifest=refit_manifest,
         asset_relationship_profiles=profiles_write,
+        candidate_relationship_edges=candidate_edges_write,
         selected_relationship_edges=edges_write,
         relationship_stability_scores=stability_write,
         edge_alias_manifest=aliases_write,
@@ -344,6 +357,39 @@ def _with_source_tail_from_known_at(rows: Iterable[Mapping[str, Any]]) -> list[d
             enriched["source_tail_ts"] = enriched["known_at_ts"]
         out.append(enriched)
     return out
+
+
+def _candidate_edge_rows(selection_result: RelationshipEdgeSelectionResult) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for selected in selection_result.candidate_edges:
+        row = dict(selected.as_dict())
+        row["artifact_kind"] = "candidate_relationship_edge"
+        row["candidate_support"] = True
+        row["selected_top3"] = bool(selected.selected and int(selected.selection_rank) <= 3)
+        row["rank"] = int(selected.selection_rank)
+        row["selection_score"] = row.get("abs_value")
+        if "abs_relationship_strength" not in row and "abs_value" in row:
+            row["abs_relationship_strength"] = row["abs_value"]
+        if "relationship_strength" not in row and "value" in row:
+            row["relationship_strength"] = row["value"]
+        if "edge_weight" not in row and "abs_relationship_strength" in row:
+            row["edge_weight"] = row["abs_relationship_strength"]
+        if "asset_id" not in row and "asset" in row:
+            row["asset_id"] = row["asset"]
+        if "peer_asset_id" not in row and "related_asset_or_benchmark" in row:
+            row["peer_asset_id"] = row["related_asset_or_benchmark"]
+        if "peer_asset" not in row and "related_asset_or_benchmark" in row:
+            row["peer_asset"] = row["related_asset_or_benchmark"]
+        row["support_definition_id"] = "all_eligible_candidate_edges_weighted_v1"
+        row["value_status"] = "valid"
+        row["mask_reason"] = None
+        if "known_at_ts" in row and "source_tail_ts" not in row:
+            row["source_tail_ts"] = row["known_at_ts"]
+        row["production_enabled"] = False
+        row["production_outputs_written"] = False
+        row["canonical_production_state_outputs_written"] = False
+        rows.append(row)
+    return rows
 
 
 def _with_stability_metadata(

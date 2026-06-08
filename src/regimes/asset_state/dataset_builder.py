@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +20,7 @@ from src.regimes.core.paths import (
     is_production_adjacent_path,
     require_foundation_report_root,
 )
+from src.regimes.core.splits import three_way_fraction_bounds, window_values
 
 from .data_contracts import (
     DATASET_BUILD_STATUS_READY,
@@ -255,6 +255,35 @@ def resolve_scalar_feature_source_tail_ts(
     return None
 
 
+def resolve_scalar_feature_source_bounds_ts(
+    source_feature_root: str | Path,
+    *,
+    interval: int,
+    asset: str,
+) -> tuple[int, int] | None:
+    """Return min/max observed ts for one asset/interval."""
+    partitions = resolve_scalar_feature_partitions(source_feature_root, interval=int(interval), asset=str(asset))
+    min_ts: int | None = None
+    max_ts: int | None = None
+    for path in partitions:
+        try:
+            frame = pd.read_parquet(path, columns=[TIMESTAMP_COLUMN])
+        except Exception:
+            continue
+        if frame.empty or TIMESTAMP_COLUMN not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[TIMESTAMP_COLUMN], errors="coerce").dropna()
+        if values.empty:
+            continue
+        part_min = int(values.min())
+        part_max = int(values.max())
+        min_ts = part_min if min_ts is None else min(int(min_ts), part_min)
+        max_ts = part_max if max_ts is None else max(int(max_ts), part_max)
+    if min_ts is None or max_ts is None:
+        return None
+    return int(min_ts), int(max_ts)
+
+
 def resolve_asset_state_band_source_tail_ts(
     source_feature_root: str | Path,
     *,
@@ -274,6 +303,28 @@ def resolve_asset_state_band_source_tail_ts(
             return None
         tails.append(int(tail))
     return min(tails) if tails else None
+
+
+def resolve_asset_state_band_source_bounds_ts(
+    source_feature_root: str | Path,
+    *,
+    asset: str,
+    band: str,
+) -> tuple[int, int] | None:
+    """Return the safe common source window for an Asset-State band."""
+    band_spec = default_asset_state_taxonomy().band_spec(str(band))
+    starts: list[int] = []
+    tails: list[int] = []
+    for interval in tuple(int(value) for value in band_spec.member_intervals):
+        bounds = resolve_scalar_feature_source_bounds_ts(source_feature_root, interval=int(interval), asset=str(asset))
+        if bounds is None:
+            return None
+        start, tail = bounds
+        starts.append(int(start))
+        tails.append(int(tail))
+    if not starts or not tails:
+        return None
+    return max(starts), min(tails)
 
 
 def build_asset_state_study_dataset(
@@ -1041,14 +1092,13 @@ def _split_panel(
         return train, validation, holdout
 
     n = int(panel.shape[0])
-    total = split.train_fraction + split.validation_fraction + split.holdout_fraction
-    train_n = int(math.floor(n * (split.train_fraction / total)))
-    validation_n = int(math.floor(n * (split.validation_fraction / total)))
-    if train_n >= n and n > 0:
-        train_n = n - 1
-    validation_start = train_n
-    validation_end = min(n, validation_start + validation_n)
-    train = panel.iloc[:train_n].copy()
+    validation_start, validation_end = three_way_fraction_bounds(
+        n,
+        train_fraction=float(split.train_fraction),
+        validation_fraction=float(split.validation_fraction),
+        holdout_fraction=float(split.holdout_fraction),
+    )
+    train = panel.iloc[:validation_start].copy()
     validation = panel.iloc[validation_start:validation_end].copy()
     holdout = panel.iloc[validation_end:].copy()
     return train, validation, holdout
@@ -1061,7 +1111,14 @@ def _window_split(
 ) -> pd.DataFrame:
     if start_ts is None or end_ts is None:
         return pd.DataFrame(columns=panel.columns)
-    return _filter_window(panel, int(start_ts), int(end_ts))
+    timestamps = window_values(
+        tuple(pd.to_numeric(panel[TIMESTAMP_COLUMN], errors="coerce").dropna().astype("int64").tolist()),
+        int(start_ts),
+        int(end_ts),
+    )
+    if not timestamps:
+        return pd.DataFrame(columns=panel.columns)
+    return panel.loc[panel[TIMESTAMP_COLUMN].astype("int64").isin(set(timestamps))].copy()
 
 
 def _compute_forward_targets(

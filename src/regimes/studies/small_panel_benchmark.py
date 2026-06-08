@@ -28,6 +28,7 @@ from src.regimes.core.preprocessing import fit_preprocessing_pipeline, transform
 from src.regimes.core.promotion_gate import PROMOTION_STATUS_BLOCKED, PromotionGateInput, evaluate_promotion_gate
 from src.regimes.core.scoreboard import build_regime_scoreboard
 from src.regimes.core.serialization import dumps_json, loads_json, require_json_object, to_jsonable
+from src.regimes.core.splits import split_panel_by_timestamp_train_rows
 from src.regimes.studies.manifest import StudyManifest
 from src.regimes.studies.search_space import build_search_space
 
@@ -208,14 +209,11 @@ def _clusterer_params(family: str, *, seed: int) -> dict[str, Any]:
 
 
 def _split_panel(frame: pd.DataFrame, manifest: StudyManifest) -> tuple[pd.DataFrame, pd.DataFrame]:
-    unique_timestamps = list(dict.fromkeys(frame["timestamp"].tolist()))
-    train_rows = int(manifest.split_policy["train_rows"])
-    rows_per_timestamp = int(frame.groupby("timestamp").size().median())
-    train_timestamp_count = max(1, min(len(unique_timestamps) - 1, train_rows // max(rows_per_timestamp, 1)))
-    train_timestamps = set(unique_timestamps[:train_timestamp_count])
-    train = frame[frame["timestamp"].isin(train_timestamps)].copy()
-    score = frame[~frame["timestamp"].isin(train_timestamps)].copy()
-    return train, score
+    return split_panel_by_timestamp_train_rows(
+        frame,
+        timestamp_column="timestamp",
+        train_rows=int(manifest.split_policy["train_rows"]),
+    )
 
 
 def _stability_perturbations(labels: Sequence[int]) -> tuple[dict[str, Any], ...]:
