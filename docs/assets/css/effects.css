@@ -1,0 +1,23 @@
+@layer utilities {
+  .surface-grid {
+    position: relative;
+    isolation: isolate;
+  }
+
+  .surface-grid::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    opacity: var(--noise-opacity);
+    background-image:
+      radial-gradient(circle at 18% 20%, var(--accent), transparent 22rem),
+      radial-gradient(circle at 82% 8%, var(--accent-2), transparent 18rem);
+    filter: blur(18px);
+  }
+
+  .glass {
+    background: rgb(255 255 255 / var(--glass-alpha));
+    backdrop-filter: blur(var(--blur-panel));
+  }
+}

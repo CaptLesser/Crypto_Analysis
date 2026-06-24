@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Explain the numeric forecasting model families, methods, targets, horizons, Test workflow stages, and orchestration workflow shape visible in public source.">
+    <title>Numerics Forecasting | Crypto_Analysis</title>
+    <link rel="stylesheet" href="assets/css/layers.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/reset.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/tokens.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/base.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/layout.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/components.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/utilities.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/effects.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/theme.css?v=20260623-copy1">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <nav class="nav site-shell" aria-label="Primary" data-nav>
+        <a class="nav__brand" href="index.html">Crypto_Analysis <span class="muted">Source Guide</span></a>
+        <ul class="nav__links">
+          <li><a href="index.html">Overview</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+<li><a href="scalar-features.html">Features</a></li>
+<li><a href="regimes.html">Regimes</a></li>
+<li><a href="numerics-forecasting.html" aria-current="page">Numerics Forecasting</a></li>
+<li><a href="roadmap-source.html">Source Map</a></li>
+        </ul>
+      </nav>
+    </header>
+
+    <main id="main-content" tabindex="-1">
+      
+      <section class="section site-shell">
+        <div class="hero hero-banner page-hero-banner surface-grid">
+          <figure class="hero-banner__media" aria-hidden="true"><img src="assets/media/graphics/forecasting-model-layers.png?v=20260623-copy1" alt="" width="1254" height="1254" loading="eager" fetchpriority="high" decoding="async"></figure>
+          <div class="hero__copy hero-banner__copy">
+          <img class="asset-badge page-title__badge" src="assets/media/badges/badge_forecasting_v2.svg?v=20260623-copy1" alt="Forecasting badge" width="1600" height="520" loading="lazy" decoding="async">
+          <h1>Numerics Forecasting</h1>
+          <p class="measure">Explain the numeric forecasting model families, methods, targets, horizons, Test workflow stages, and orchestration workflow shape visible in public source.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section site-shell doc-layout reveal">
+        
+        <div class="doc-rail-shell" data-doc-rail-shell>
+          <nav class="doc-rail" aria-label="Documentation sections" data-doc-rail>
+            <button class="doc-rail__toggle" type="button" aria-expanded="true" aria-controls="numerics_forecasting-contents" data-doc-rail-toggle>
+              <span class="doc-rail__heading">Contents</span>
+              <span class="doc-rail__toggle-state" data-doc-rail-toggle-label>Hide</span>
+            </button>
+            <div class="doc-rail__content" id="numerics_forecasting-contents" data-doc-rail-content>
+              <a href="#forecasting-overview">Numeric forecasting overview</a><a href="#model-families">Model families and methods</a><a href="#targets-and-horizons">Targets and horizons</a><a href="#test-workflow">Test workflow stages</a><a href="#orchestration-workflow">Orchestration workflow</a><a href="#source-files">Source files</a><a href="#terms">Terms</a>
+            </div>
+          </nav>
+          <button class="doc-rail__edge-toggle" type="button" aria-expanded="false" aria-controls="numerics_forecasting-contents" aria-label="Show contents" data-doc-rail-edge-toggle hidden>
+            <span aria-hidden="true">+</span>
+          </button>
+        </div>
+        <article class="stack measure">
+          
+          <section class="stack" id="forecasting-overview">
+            <p class="eyebrow">forecasting overview</p>
+            <h2>Numeric forecasting overview</h2>
+            <p>Numerics Forecasting produces future numeric target estimates rather than state labels. The public source groups the work into tabular machine-learning, neural, Bayesian, and statistical families.</p>
+<p>This page emphasizes model families, targets, horizons, and Test workflow stages. It does not claim model accuracy, trading utility, deployment status, or generated forecast values.</p>
+            
+            
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting">src/forecasting</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/features/numeric_forecast_profiles.py">src/features/numeric_forecast_profiles.py</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="model-families">
+            <p class="eyebrow">model families</p>
+            <h2>Model families and methods</h2>
+            <p>The public registry files name the model families and source entry points. Presenting them as a grouped table is clearer than making the orchestration package the main topic.</p>
+<p>Seasonality is not a standalone feature family on this page. It is mentioned only where source code resolves or consumes a usable seasonality profile.</p>
+            
+            <div class="table-wrap" role="region" aria-label="Numeric forecasting families" tabindex="0"><table class="report-table data-table"><caption>Numeric forecasting families</caption><thead><tr><th scope="col">Family</th><th scope="col">Methods</th><th scope="col">Input or representation</th><th scope="col">Source-visible intervals</th><th scope="col">Primary output</th></tr></thead><tbody><tr><td>Tabular machine learning</td><td>XGBoost, LightGBM, CatBoost, Random Forest, ElasticNet</td><td>Tabular scalar-feature and numeric target matrices, with shared feature-experiment, scaling-test, and tuning source.</td><td>Stage 1 defaults include 15, 30, 60, 240, 720, and 1440 minutes; default combos are resolved per model profile.</td><td>Numeric forecast rows and evaluation rows with family-specific prediction prefixes and diagnostics.</td></tr><tr><td>Neural</td><td>LSTM, TCN, N-BEATS</td><td>Sequence-style target and feature windows handled by shared neural runner and profile modules.</td><td>Profile defaults include 5, 30, 60, 240, 720, and 1440 minutes.</td><td>Numeric forecast rows from neural family runners plus profile, scaling, and tuning artifacts.</td></tr><tr><td>Bayesian</td><td>DLM/TVP, Stochastic Volatility, Dynamic Regression Shrinkage, Copula Dependency, Tail Risk</td><td>Target history, optional factor or exogenous arrays, Bayesian profile parameters, and seasonality only when a module profile enables it.</td><td>Profile defaults include 30, 60, 240, and 1440 minutes.</td><td>Numeric forecasts and quantile-style prediction metadata from shared Bayesian runners.</td></tr><tr><td>Statistical</td><td>SARIMAX, Local Linear Trend, EGARCH, Quantile Regression</td><td>Target-history series and deterministic seasonal inputs when source-resolved seasonality profiles are usable. SARIMAX and LLT directly resolve seasonality profiles; EGARCH focuses on volatility and range targets; Quantile Regression supports all numeric tasks.</td><td>SARIMAX, LLT, and EGARCH defaults include 60, 240, and 1440 minutes; Quantile Regression defaults include 240 and 1440 minutes.</td><td>Statistical numeric forecast rows, fit metadata, and stage summaries including selected seasonal settings when present.</td></tr></tbody></table></div>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/tabular/shared/tabular_numeric_model_registry.py">src/forecasting/ml/tabular/shared/tabular_numeric_model_registry.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/neural/shared/neural_numeric_model_registry.py">src/forecasting/ml/neural/shared/neural_numeric_model_registry.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/bayesian/shared/bayesian_numeric_model_registry.py">src/forecasting/ml/bayesian/shared/bayesian_numeric_model_registry.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/stats/shared/stats_numeric_model_registry.py">src/forecasting/stats/shared/stats_numeric_model_registry.py</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="targets-and-horizons">
+            <p class="eyebrow">targets and horizons</p>
+            <h2>Targets and horizons</h2>
+            <p>A target is the supervised forecasting value the model is trained to estimate. A horizon is the future lead time, in minutes, for that target.</p>
+<p>The shared numeric target mapping and tabular horizon matrix expose the public target names and source-visible horizon coverage.</p>
+            
+            <div class="table-wrap" role="region" aria-label="Numeric targets and source-visible horizons" tabindex="0"><table class="report-table data-table"><caption>Numeric targets and source-visible horizons</caption><thead><tr><th scope="col">Task</th><th scope="col">Target column</th><th scope="col">Horizon minutes</th><th scope="col">Notes</th></tr></thead><tbody><tr><td>log_return</td><td>future_log_return</td><td>60, 240, 720, 1440</td><td>Supported by the shared tabular horizon matrix and by SARIMAX/LLT/Quantile Regression in the statistical capability matrix.</td></tr><tr><td>realized_vol</td><td>future_realized_vol</td><td>60, 1440</td><td>Supported by all statistical families listed in the capability matrix.</td></tr><tr><td>true_range</td><td>future_true_range</td><td>60, 240, 720, 1440</td><td>Supported by SARIMAX, LLT, EGARCH, and Quantile Regression.</td></tr><tr><td>max_drawdown</td><td>future_max_drawdown</td><td>60, 1440</td><td>Supported by the shared tabular horizon matrix and Quantile Regression.</td></tr><tr><td>max_runup</td><td>future_max_runup</td><td>60, 1440</td><td>Supported by the shared tabular horizon matrix and Quantile Regression.</td></tr><tr><td>range_efficiency</td><td>future_range_efficiency</td><td>60, 240, 720, 1440</td><td>Supported by the shared tabular horizon matrix and Quantile Regression.</td></tr></tbody></table></div>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/features/numeric_forecast_profiles.py">src/features/numeric_forecast_profiles.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/common/stats_module_utils.py">src/forecasting/common/stats_module_utils.py</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="test-workflow">
+            <p class="eyebrow">test workflow</p>
+            <h2>Test workflow stages</h2>
+            <p>The Test workflow runs staged evaluation before selected profiles are used by orchestration workflow code. The exact modules vary by family, but the stage shape is consistent across tabular, neural, Bayesian, and statistical source.</p>
+<p>The public page should summarize stage purpose and source files rather than listing every command-line flag.</p>
+            
+            <div class="table-wrap" role="region" aria-label="Test workflow stages" tabindex="0"><table class="report-table data-table"><caption>Test workflow stages</caption><thead><tr><th scope="col">Stage</th><th scope="col">Purpose</th><th scope="col">Representative source</th></tr></thead><tbody><tr><td>Stage 0: profile sweep</td><td>Build candidate profiles or candidate combinations for the family and record which tasks, horizons, intervals, and assets are viable for deeper testing.</td><td>tabular_numeric_stage0_profile.py, neural_numeric_stage0_profile.py, bayesian_numeric_stage0_profile.py, stats_numeric_stage0_profile.py</td></tr><tr><td>Stage 1: feature experiment</td><td>Evaluate feature or formulation choices. Tabular and neural families evaluate feature candidates; Bayesian and statistical stages capture family-specific formulation and seasonality/window evidence where relevant.</td><td>family-specific *_feature_experiment modules and stats_stage_runner.py</td></tr><tr><td>Stage 2: numeric scaling test</td><td>Run bounded scaling tests for surviving candidates, collect fit and prediction metadata, and verify that the family can run across the selected numeric combinations.</td><td>family-specific *_numeric_scaling_test modules</td></tr><tr><td>Stage 3: tuning</td><td>Run bounded Optuna tuning for surviving combinations and collect combo results, trials, unit metrics, summaries, and representative samples.</td><td>family-specific *_numeric_optuna_tuning modules</td></tr></tbody></table></div>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/tabular/shared/tabular_numeric_test_orchestrator.py">src/forecasting/ml/tabular/shared/tabular_numeric_test_orchestrator.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/neural/shared/neural_numeric_test_orchestrator.py">src/forecasting/ml/neural/shared/neural_numeric_test_orchestrator.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/bayesian/shared/bayesian_numeric_test_orchestrator.py">src/forecasting/ml/bayesian/shared/bayesian_numeric_test_orchestrator.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/stats/shared/stats_numeric_test_orchestrator.py">src/forecasting/stats/shared/stats_numeric_test_orchestrator.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/stats/shared/stats_stage_runner.py">src/forecasting/stats/shared/stats_stage_runner.py</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="orchestration-workflow">
+            <p class="eyebrow">orchestration workflow</p>
+            <h2>Orchestration workflow</h2>
+            <p>Orchestration workflow source consumes selected model profiles and family-specific defaults to define numeric forecast and evaluation rows. The public page presents this as source architecture and contract shape, not as a runtime claim.</p>
+<p>The orchestration package remains useful as a source link, but it is not the main content headline for Numerics Forecasting.</p>
+            
+            <div class="table-wrap" role="region" aria-label="Orchestration workflow by family" tabindex="0"><table class="report-table data-table"><caption>Orchestration workflow by family</caption><thead><tr><th scope="col">Family</th><th scope="col">Orchestration workflow shape</th><th scope="col">Source notes</th></tr></thead><tbody><tr><td>Tabular</td><td>Model specs resolve default or requested interval/horizon/task combos, runtime config keys, prediction prefixes, and family-specific output tags.</td><td>XGBoost shares approved default combo policy through numeric_forecast_profiles.py; other tabular families resolve defaults from their numeric profile modules.</td></tr><tr><td>Neural</td><td>Family registries route LSTM, TCN, and N-BEATS to numeric entry points and family root names.</td><td>Shared neural runners and profile modules own the sequence-model execution details.</td></tr><tr><td>Bayesian</td><td>The shared Bayesian runner uses model specs, quantile metadata, optional exogenous/factor inputs, and seasonality only where the selected profile or module spec enables it.</td><td>DLM/TVP exposes seasonal-strength profile parameters; shared runner records seasonality mode and period when usable.</td></tr><tr><td>Statistical</td><td>Stats runner resolves task target columns, family capability, fit metadata, and forecast rows. SARIMAX and LLT resolve seasonality profiles when usable.</td><td>Stage summaries can record selected seasonal orders, seasonality sources, and seasonal periods for models that consume them.</td></tr></tbody></table></div>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/production_orchestrator/runner.py">Forecasting orchestration source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/tabular/shared/tabular_numeric_model_registry.py">src/forecasting/ml/tabular/shared/tabular_numeric_model_registry.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/neural/shared/neural_numeric_runner.py">src/forecasting/ml/neural/shared/neural_numeric_runner.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/bayesian/shared/bayesian_numeric_runner.py">src/forecasting/ml/bayesian/shared/bayesian_numeric_runner.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/stats/shared/stats_numeric_runner.py">src/forecasting/stats/shared/stats_numeric_runner.py</a></li>
+</ul>
+          </section>
+          <section class="stack" id="source-files">
+            <p class="eyebrow">Source Files</p>
+            <h2>Public source links from the manifest.</h2>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting/common">src/forecasting/common</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting/ml/tabular">src/forecasting/ml/tabular</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting/ml/neural">src/forecasting/ml/neural</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting/ml/bayesian">src/forecasting/ml/bayesian</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting/stats">src/forecasting/stats</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/pipeline_test/src/forecasting">src/forecasting</a></li>
+</ul>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/features/numeric_forecast_profiles.py">Numeric task and horizon profile source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/common/stats_module_utils.py">Target-column and statistical capability source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/tabular/shared/tabular_numeric_model_registry.py">Tabular model registry</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/bayesian/shared/bayesian_numeric_model_registry.py">Bayesian model registry</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/stats/sarimax_forecaster.py">Representative statistical source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/stats/shared/stats_stage_runner.py">Statistical stage summary source</a></li>
+</ul>
+          </section>
+          
+          <section class="stack" id="terms">
+            <p class="eyebrow">Terms</p>
+            <h2>Plain-language source notes.</h2>
+            <dl class="meta-list">
+              <div class="meta-row"><dt>target</dt><dd>The supervised future value a model is trained to estimate, such as future_log_return or future_realized_vol.</dd></div>
+<div class="meta-row"><dt>horizon</dt><dd>The future lead time, in minutes, associated with a target.</dd></div>
+<div class="meta-row"><dt>model family</dt><dd>A source grouping for related forecasting implementations and helper files.</dd></div>
+<div class="meta-row"><dt>seasonality profile</dt><dd>A model-side seasonal input resolved by specific statistical or Bayesian source paths when the profile is usable; it is not presented as a standalone feature page topic.</dd></div>
+            </dl>
+          </section>
+          
+        </article>
+      </section>
+    </main>
+
+    <footer class="section site-shell">
+      <p>Source-only public guide. Generated data, model artifacts, run logs, and private operational records are outside this site.</p>
+    </footer>
+
+    <script type="module" src="assets/js/nav.js?v=20260623-copy1"></script>
+    <script type="module" src="assets/js/reveal.js?v=20260623-copy1"></script>
+    <script type="module" src="assets/js/transitions.js?v=20260623-copy1"></script>
+  </body>
+</html>

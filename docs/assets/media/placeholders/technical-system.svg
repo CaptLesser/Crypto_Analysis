@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 960 560">
+  <title id="title">Abstract technical system diagram placeholder</title>
+  <desc id="desc">A dark technical interface placeholder with connected panels, metric rows, and a subdued blue accent.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#111b27"/>
+      <stop offset="1" stop-color="#080d13"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" x2="1">
+      <stop offset="0" stop-color="#74c7f7"/>
+      <stop offset="1" stop-color="#9ad7c5"/>
+    </linearGradient>
+  </defs>
+  <rect width="960" height="560" rx="36" fill="url(#bg)"/>
+  <path d="M80 96h800M80 184h800M80 272h800M80 360h800M80 448h800M160 64v432M320 64v432M480 64v432M640 64v432M800 64v432" stroke="#d8e8ff" stroke-opacity=".07"/>
+  <rect x="92" y="88" width="250" height="128" rx="18" fill="#152232" stroke="#d8e8ff" stroke-opacity=".18"/>
+  <rect x="382" y="88" width="226" height="128" rx="18" fill="#111a26" stroke="#d8e8ff" stroke-opacity=".14"/>
+  <rect x="650" y="88" width="218" height="128" rx="18" fill="#111a26" stroke="#d8e8ff" stroke-opacity=".14"/>
+  <rect x="92" y="278" width="244" height="138" rx="18" fill="#111a26" stroke="#d8e8ff" stroke-opacity=".14"/>
+  <rect x="382" y="278" width="486" height="138" rx="18" fill="#101824" stroke="#d8e8ff" stroke-opacity=".14"/>
+  <circle cx="217" cy="152" r="34" fill="url(#accent)" opacity=".9"/>
+  <path d="M342 152h40M608 152h42M217 216v62M336 347h46" stroke="url(#accent)" stroke-width="4" stroke-linecap="round" opacity=".8"/>
+  <g fill="#e8f2ff" opacity=".82">
+    <rect x="132" y="306" width="108" height="10" rx="5"/>
+    <rect x="132" y="334" width="172" height="10" rx="5" opacity=".56"/>
+    <rect x="132" y="362" width="138" height="10" rx="5" opacity=".4"/>
+    <rect x="420" y="122" width="136" height="10" rx="5"/>
+    <rect x="420" y="150" width="84" height="10" rx="5" opacity=".5"/>
+    <rect x="690" y="122" width="124" height="10" rx="5"/>
+    <rect x="690" y="150" width="76" height="10" rx="5" opacity=".5"/>
+  </g>
+  <g stroke="url(#accent)" stroke-width="6" stroke-linecap="round" opacity=".75">
+    <path d="M430 364l64-48 58 34 92-74 90 44 88-78" fill="none"/>
+    <path d="M430 392h402" opacity=".22"/>
+  </g>
+  <g fill="#74c7f7">
+    <circle cx="430" cy="364" r="7"/>
+    <circle cx="494" cy="316" r="7"/>
+    <circle cx="552" cy="350" r="7"/>
+    <circle cx="644" cy="276" r="7"/>
+    <circle cx="734" cy="320" r="7"/>
+    <circle cx="822" cy="242" r="7"/>
+  </g>
+</svg>

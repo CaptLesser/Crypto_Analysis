@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Explain the public source architecture and source boundary without describing private operations beyond what is visible in the public source set.">
+    <title>Architecture | Crypto_Analysis</title>
+    <link rel="stylesheet" href="assets/css/layers.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/reset.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/tokens.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/base.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/layout.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/components.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/utilities.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/effects.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/theme.css?v=20260623-copy1">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <nav class="nav site-shell" aria-label="Primary" data-nav>
+        <a class="nav__brand" href="index.html">Crypto_Analysis <span class="muted">Source Guide</span></a>
+        <ul class="nav__links">
+          <li><a href="index.html">Overview</a></li>
+<li><a href="architecture.html" aria-current="page">Architecture</a></li>
+<li><a href="scalar-features.html">Features</a></li>
+<li><a href="regimes.html">Regimes</a></li>
+<li><a href="numerics-forecasting.html">Numerics Forecasting</a></li>
+<li><a href="roadmap-source.html">Source Map</a></li>
+        </ul>
+      </nav>
+    </header>
+
+    <main id="main-content" tabindex="-1">
+      
+      <section class="section site-shell">
+        <div class="hero hero-banner page-hero-banner surface-grid">
+          <figure class="hero-banner__media" aria-hidden="true"><img src="assets/media/graphics/architecture-source-boundary.png?v=20260623-copy1" alt="" width="1254" height="1254" loading="eager" fetchpriority="high" decoding="async"></figure>
+          <div class="hero__copy hero-banner__copy">
+          <img class="asset-badge page-title__badge" src="assets/media/badges/badge_branches_v2.svg?v=20260623-copy1" alt="Public branch lanes badge" width="1600" height="520" loading="lazy" decoding="async">
+          <h1>Architecture</h1>
+          <p class="measure">Explain the public source architecture and source boundary without describing private operations beyond what is visible in the public source set.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section site-shell doc-layout reveal">
+        
+        <div class="doc-rail-shell" data-doc-rail-shell>
+          <nav class="doc-rail" aria-label="Documentation sections" data-doc-rail>
+            <button class="doc-rail__toggle" type="button" aria-expanded="true" aria-controls="architecture-contents" data-doc-rail-toggle>
+              <span class="doc-rail__heading">Contents</span>
+              <span class="doc-rail__toggle-state" data-doc-rail-toggle-label>Hide</span>
+            </button>
+            <div class="doc-rail__content" id="architecture-contents" data-doc-rail-content>
+              <a href="#source-boundary">Public source boundary</a><a href="#source-layers">Source layers</a><a href="#branch-lanes">Branch lanes</a><a href="#excluded-surfaces">Excluded surfaces</a><a href="#conceptual-flow">Conceptual flow</a><a href="#source-files">Source files</a><a href="#terms">Terms</a>
+            </div>
+          </nav>
+          <button class="doc-rail__edge-toggle" type="button" aria-expanded="false" aria-controls="architecture-contents" aria-label="Show contents" data-doc-rail-edge-toggle hidden>
+            <span aria-hidden="true">+</span>
+          </button>
+        </div>
+        <article class="stack measure">
+          
+          <section class="stack" id="source-boundary">
+            <p class="eyebrow">source boundary</p>
+            <h2>Public source boundary</h2>
+            <p>The public source guide is organized around selected source modules rather than generated data or operational records.</p>
+<p>The current allowlist points to feature modules, forecasting modules, statistical modules, regime modules, and selected test-lane study code.</p>
+            
+            
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src">src</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/pipeline_test/src">src</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="source-layers">
+            <p class="eyebrow">source layers</p>
+            <h2>Source layers</h2>
+            <p>Feature source lives under src/features and src/regimes feature subpackages. This guide presents Scalar Features, Regime Features, and Relationship Features as the public feature families.</p>
+<p>Forecasting source is split between common helpers, machine-learning families, statistical families, and an orchestration package under src/forecasting.</p>
+<p>Regime source lives under src/regimes and includes core contracts, market-state, asset-state, cross-asset, relationship-discovery, regime-feature, and study modules.</p>
+<p>The site describes those source layers as repository organization; it does not assert private runtime coverage or expose generated artifacts.</p>
+            
+            
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/features">src/features</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting/common">src/forecasting/common</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting/ml">src/forecasting/ml</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting/stats">src/forecasting/stats</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes">src/regimes</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="branch-lanes">
+            <p class="eyebrow">branch lanes</p>
+            <h2>Branch lanes</h2>
+            <p>The main branch is the primary public source lane.</p>
+<p>The pipeline_test branch is a public branch for selected test-lane modules, including visible experiment, scaling, tuning, and asset-state study code.</p>
+<p>Branch-lane wording should remain explicit so readers do not infer that test-lane files are generated outputs or that private data is published.</p>
+            
+            
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main">main branch</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/pipeline_test">pipeline_test branch</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="excluded-surfaces">
+            <p class="eyebrow">excluded surfaces</p>
+            <h2>Excluded surfaces</h2>
+            <p>The public site should not represent private data, generated outputs, model files, run logs, local reports, or local machine paths as part of the public source guide.</p>
+<p>Any claim about runtime behavior should be backed by reviewed public source or a separate approved public report.</p>
+<p>The architecture page should stay at source-layer level: inputs, features, labels, forecasts, and public boundaries are described conceptually, not through private pipeline state.</p>
+            
+            
+            
+          </section>
+
+          <section class="stack" id="conceptual-flow">
+            <p class="eyebrow">conceptual flow</p>
+            <h2>Conceptual flow</h2>
+            <p>The public architecture can be read as a conservative flow: source-visible feature builders feed derived feature concepts, regime modules describe state-label concepts, and forecasting modules organize numeric forecast families.</p>
+<p>The source guide presents repository organization and public boundaries without exposing generated runtime artifacts.</p>
+            
+            
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/features">src/features</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes">src/regimes</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting">src/forecasting</a></li>
+</ul>
+          </section>
+          <section class="stack" id="source-files">
+            <p class="eyebrow">Source Files</p>
+            <h2>Public source links from the manifest.</h2>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/features">src/features</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting/common">src/forecasting/common</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting/ml">src/forecasting/ml</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/forecasting/stats">src/forecasting/stats</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes">src/regimes</a></li>
+</ul>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/common/runtime_config.py">Representative runtime configuration source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/common/io_atomic.py">Representative safe file-output helper source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/core/contracts.py">Representative regime core contract source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/forecasting/ml/production_orchestrator/runner.py">Representative forecasting orchestration source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/market_state/feature_builder.py">Representative market-state feature source</a></li>
+</ul>
+          </section>
+          
+          <section class="stack" id="terms">
+            <p class="eyebrow">Terms</p>
+            <h2>Plain-language source notes.</h2>
+            <dl class="meta-list">
+              <div class="meta-row"><dt>allowlist</dt><dd>The approved set of source paths eligible for the public source guide.</dd></div>
+<div class="meta-row"><dt>branch lane</dt><dd>A public branch used for a distinct source scope, such as the primary source lane or selected test-lane source.</dd></div>
+<div class="meta-row"><dt>artifact</dt><dd>A generated file or runtime product; the public site should discuss source code, not generated runtime products.</dd></div>
+            </dl>
+          </section>
+          
+        </article>
+      </section>
+    </main>
+
+    <footer class="section site-shell">
+      <p>Source-only public guide. Generated data, model artifacts, run logs, and private operational records are outside this site.</p>
+    </footer>
+
+    <script type="module" src="assets/js/nav.js?v=20260623-copy1"></script>
+    <script type="module" src="assets/js/reveal.js?v=20260623-copy1"></script>
+    <script type="module" src="assets/js/transitions.js?v=20260623-copy1"></script>
+  </body>
+</html>

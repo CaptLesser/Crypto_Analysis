@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc" viewBox="0 0 960 560">
+  <title id="title">Abstract experimental signal field placeholder</title>
+  <desc id="desc">A dark cyber-lab placeholder with luminous signal arcs, panels, and magenta cyan data lines.</desc>
+  <defs>
+    <radialGradient id="fieldA" cx="28%" cy="18%" r="70%">
+      <stop offset="0" stop-color="#26f6ff" stop-opacity=".45"/>
+      <stop offset=".38" stop-color="#7c3cff" stop-opacity=".16"/>
+      <stop offset="1" stop-color="#071018" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="fieldB" cx="82%" cy="72%" r="62%">
+      <stop offset="0" stop-color="#ff3fb4" stop-opacity=".38"/>
+      <stop offset=".46" stop-color="#26f6ff" stop-opacity=".14"/>
+      <stop offset="1" stop-color="#071018" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="line" x1="0" x2="1">
+      <stop offset="0" stop-color="#26f6ff"/>
+      <stop offset=".5" stop-color="#b367ff"/>
+      <stop offset="1" stop-color="#ff3fb4"/>
+    </linearGradient>
+  </defs>
+  <rect width="960" height="560" rx="36" fill="#071018"/>
+  <rect width="960" height="560" rx="36" fill="url(#fieldA)"/>
+  <rect width="960" height="560" rx="36" fill="url(#fieldB)"/>
+  <path d="M70 110h860M70 190h860M70 270h860M70 350h860M70 430h860M150 60v460M270 60v460M390 60v460M510 60v460M630 60v460M750 60v460M870 60v460" stroke="#dffaff" stroke-opacity=".06"/>
+  <g fill="none" stroke="url(#line)" stroke-width="4" stroke-linecap="round" opacity=".78">
+    <path d="M98 384C210 278 260 448 378 330s184-40 250-126 132-48 236-132"/>
+    <path d="M132 218c88-60 150-52 234 26s170 72 260-4 152-76 230-26" opacity=".42"/>
+  </g>
+  <g fill="#0c1b27" stroke="#baf7ff" stroke-opacity=".24">
+    <rect x="108" y="92" width="202" height="116" rx="20"/>
+    <rect x="640" y="102" width="218" height="132" rx="20"/>
+    <rect x="170" y="328" width="240" height="126" rx="20"/>
+    <rect x="514" y="316" width="284" height="126" rx="20"/>
+  </g>
+  <g fill="#e8fbff">
+    <rect x="142" y="126" width="106" height="10" rx="5"/>
+    <rect x="142" y="154" width="146" height="10" rx="5" opacity=".48"/>
+    <rect x="674" y="136" width="116" height="10" rx="5"/>
+    <rect x="674" y="164" width="78" height="10" rx="5" opacity=".48"/>
+    <rect x="206" y="362" width="132" height="10" rx="5"/>
+    <rect x="206" y="390" width="86" height="10" rx="5" opacity=".48"/>
+    <rect x="550" y="350" width="172" height="10" rx="5"/>
+    <rect x="550" y="378" width="108" height="10" rx="5" opacity=".48"/>
+  </g>
+  <g fill="#26f6ff">
+    <circle cx="98" cy="384" r="8"/>
+    <circle cx="378" cy="330" r="8"/>
+    <circle cx="628" cy="204" r="8"/>
+    <circle cx="864" cy="72" r="8"/>
+  </g>
+  <g fill="#ff3fb4">
+    <circle cx="132" cy="218" r="6"/>
+    <circle cx="626" cy="240" r="6"/>
+    <circle cx="856" cy="214" r="6"/>
+  </g>
+</svg>

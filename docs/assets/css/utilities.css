@@ -1,0 +1,102 @@
+@layer utilities {
+  .stack {
+    display: grid;
+    gap: var(--space-4);
+    min-width: 0;
+  }
+
+  .stack > * {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .stack > :where(p, li, dd, blockquote) {
+    overflow-wrap: anywhere;
+  }
+
+  .cluster {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    align-items: center;
+  }
+
+  .eyebrow {
+    color: var(--accent);
+    font-size: var(--step--1);
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .measure {
+    max-width: 68ch;
+  }
+
+  .doc-layout > article.measure {
+    max-width: none;
+  }
+
+  .muted {
+    color: var(--text-3);
+  }
+
+  .skip-link {
+    position: fixed;
+    inset-block-start: var(--space-3);
+    inset-inline-start: var(--space-3);
+    z-index: 100;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--text-1);
+    font-weight: 800;
+    text-decoration: none;
+    transform: translateY(calc(-100% - var(--space-5)));
+    transition: transform var(--dur-fast) var(--ease-standard);
+  }
+
+  .skip-link:focus-visible {
+    transform: translateY(0);
+  }
+
+  .reveal {
+    opacity: 0;
+    transform: translateY(var(--reveal-distance));
+    transition: opacity var(--dur-slow) var(--ease-emphasis), transform var(--dur-slow) var(--ease-emphasis);
+  }
+
+  .reveal.is-visible,
+  .no-js .reveal {
+    opacity: 1;
+    transform: none;
+  }
+
+  .visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      scroll-behavior: auto !important;
+      animation-duration: 1ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 1ms !important;
+    }
+
+    .reveal,
+    .reveal.is-visible {
+      opacity: 1;
+      transform: none;
+      transition: none;
+    }
+  }
+}

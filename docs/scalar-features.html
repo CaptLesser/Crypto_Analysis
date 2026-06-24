@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Explain the source-visible feature layer across Scalar Features, Regime Features, and Relationship Features, with source-backed intervals and feature-column summaries.">
+    <title>Features | Crypto_Analysis</title>
+    <link rel="stylesheet" href="assets/css/layers.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/reset.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/tokens.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/base.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/layout.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/components.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/utilities.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/effects.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/theme.css?v=20260623-copy1">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <nav class="nav site-shell" aria-label="Primary" data-nav>
+        <a class="nav__brand" href="index.html">Crypto_Analysis <span class="muted">Source Guide</span></a>
+        <ul class="nav__links">
+          <li><a href="index.html">Overview</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+<li><a href="scalar-features.html" aria-current="page">Features</a></li>
+<li><a href="regimes.html">Regimes</a></li>
+<li><a href="numerics-forecasting.html">Numerics Forecasting</a></li>
+<li><a href="roadmap-source.html">Source Map</a></li>
+        </ul>
+      </nav>
+    </header>
+
+    <main id="main-content" tabindex="-1">
+      
+      <section class="section site-shell">
+        <div class="hero hero-banner page-hero-banner surface-grid">
+          <figure class="hero-banner__media" aria-hidden="true"><img src="assets/media/graphics/features-data-pipeline.png?v=20260623-copy1" alt="" width="1254" height="1254" loading="eager" fetchpriority="high" decoding="async"></figure>
+          <div class="hero__copy hero-banner__copy">
+          <img class="asset-badge page-title__badge" src="assets/media/badges/badge_features_v2.svg?v=20260623-copy1" alt="Features badge" width="1600" height="520" loading="lazy" decoding="async">
+          <h1>Features</h1>
+          <p class="measure">Explain the source-visible feature layer across Scalar Features, Regime Features, and Relationship Features, with source-backed intervals and feature-column summaries.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section site-shell doc-layout reveal">
+        
+        <div class="doc-rail-shell" data-doc-rail-shell>
+          <nav class="doc-rail" aria-label="Documentation sections" data-doc-rail>
+            <button class="doc-rail__toggle" type="button" aria-expanded="true" aria-controls="scalar_features-contents" data-doc-rail-toggle>
+              <span class="doc-rail__heading">Contents</span>
+              <span class="doc-rail__toggle-state" data-doc-rail-toggle-label>Hide</span>
+            </button>
+            <div class="doc-rail__content" id="scalar_features-contents" data-doc-rail-content>
+              <a href="#feature-overview">Feature families</a><a href="#feature-flow">Feature flow v1</a><a href="#scalar-feature-columns">Scalar feature columns</a><a href="#regime-feature-outputs">Regime feature outputs</a><a href="#relationship-feature-outputs">Relationship feature outputs</a><a href="#source-files">Source files</a><a href="#terms">Terms</a>
+            </div>
+          </nav>
+          <button class="doc-rail__edge-toggle" type="button" aria-expanded="false" aria-controls="scalar_features-contents" aria-label="Show contents" data-doc-rail-edge-toggle hidden>
+            <span aria-hidden="true">+</span>
+          </button>
+        </div>
+        <article class="stack measure">
+          
+          <section class="stack" id="feature-overview">
+            <p class="eyebrow">feature overview</p>
+            <h2>Feature families</h2>
+            <p>The public source separates feature generation into three related families: Scalar Features, Regime Features, and Relationship Features.</p>
+<p>Each family produces historical numeric records intended for downstream state analysis or numeric forecasting. The public site describes schemas, intervals, and source paths; it does not publish generated values.</p>
+<p>This page keeps the compatibility filename scalar-features.html, but the visible page title is now Features.</p>
+            
+            <div class="table-wrap" role="region" aria-label="Source-visible feature families" tabindex="0"><table class="report-table data-table"><caption>Source-visible feature families</caption><thead><tr><th scope="col">Feature family</th><th scope="col">What it produces</th><th scope="col">Intervals and bands</th><th scope="col">Representative source</th></tr></thead><tbody><tr><td>Scalar Features</td><td>Per-asset mathematical indicator columns derived from OHLCVT inputs, such as moving averages, oscillators, volatility measures, activity measures, drawdown measures, and price transforms.</td><td>1, 5, 15, 30, 60, 240, 720, and 1440 minutes.</td><td>src/features/scalar_features.py</td></tr><tr><td>Regime Features</td><td>Market-level feature rows, asset-state feature pools, pairwise relationship feature rows, cross-asset summary feature rows, and related eligibility or universe snapshots.</td><td>Asset-state bands use micro, meso, and macro interval groups. Market-state test defaults use 60, 240, and 1440 minute intervals. Cross-asset state currently supports meso and macro bands.</td><td>src/regimes/regime_features and src/regimes/*_state</td></tr><tr><td>Relationship Features</td><td>Relationship edges, asset relationship profiles, stability scores, aliases, isolation profiles, and cross-asset feature columns derived from relationship snapshots.</td><td>Relationship method results carry an interval field and default 30, 90, and 180 day comparison windows. Pairwise scaffold policy exposes micro-gated 1, 5, and 15 minute intervals.</td><td>src/regimes/relationship_discovery and src/regimes/regime_features/cross_asset_feature_catalog.py</td></tr></tbody></table></div>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/features">src/features</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes/regime_features">src/regimes/regime_features</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes/relationship_discovery">src/regimes/relationship_discovery</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="feature-flow">
+            <p class="eyebrow">feature flow</p>
+            <h2>Feature flow v1</h2>
+            <p>The v1 flow below follows the source-visible handoff implied by scalar feature generation, state feature construction, and relationship-derived cross-asset feature generation.</p>
+<p>This is an information-design draft, not a final visual diagram. It is intentionally simple so reviewers can adjust the styling later without changing the source-backed wording.</p>
+            
+            <div class="stack">
+              <h3>Source-backed feature flow</h3>
+              <div class="grid grid--3 flow-grid">
+                <article class="card flow-card"><span class="status-chip">Step 1</span><h3>Scalar Features</h3><p>OHLCVT input columns are transformed into approved scalar feature columns at configured intervals.</p><p class="muted flow-card__source">src/features/scalar_features.py</p></article><article class="card flow-card"><span class="status-chip">Step 2</span><h3>Regime Features</h3><p>Scalar and aggregate feature pools feed market-state, asset-state, and cross-asset state candidate workflows.</p><p class="muted flow-card__source">src/regimes/asset_state/feature_pools.py; src/regimes/market_state/test_branch_campaign.py</p></article><article class="card flow-card"><span class="status-chip">Step 3</span><h3>Relationship Features</h3><p>Relationship Discovery outputs are converted into relationship edges, profiles, stability scores, and cross-asset model-facing feature columns.</p><p class="muted flow-card__source">src/regimes/relationship_discovery; src/regimes/regime_features/cross_asset_feature_catalog.py</p></article>
+              </div>
+            </div>
+            
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/asset_state/feature_pools.py">src/regimes/asset_state/feature_pools.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/market_state/test_branch_campaign.py">src/regimes/market_state/test_branch_campaign.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/regime_features/cross_asset_feature_catalog.py">src/regimes/regime_features/cross_asset_feature_catalog.py</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="scalar-feature-columns">
+            <p class="eyebrow">scalar feature columns</p>
+            <h2>Scalar feature columns</h2>
+            <p>Scalar Features are mathematical indicators computed per asset and interval from OHLCVT source columns. The source manifest defines 172 produced scalar feature columns, plus ts and asset key columns.</p>
+<p>The table groups every produced scalar feature column by the public asset-state feature column catalog when available. The final row lists produced scalar outputs that are present in scalar_features.py but not assigned to one of those catalog categories.</p>
+            
+            <div class="table-wrap" role="region" aria-label="Produced scalar feature columns" tabindex="0"><table class="report-table data-table"><caption>Produced scalar feature columns</caption><thead><tr><th scope="col">Indicator group</th><th scope="col">Count</th><th scope="col">Feature columns</th></tr></thead><tbody><tr><td>Trend and directionality</td><td>27</td><td>log_return, pct_change, delta_close, macd_12_26_9, macd_signal_12_26_9, macd_hist_12_26_9, rsi_14, plus_di_14, minus_di_14, adx_14, aroon_up_25, aroon_down_25, aroon_osc_25, roc_14, mom_14, cmo_14, trix_15, dpo_20, ultosc_7_14_28, lr_slope_20, lr_slope_norm_20, lr_r2_20, lr_slope_norm_50, lr_r2_50, vi_plus_14, vi_minus_14, dir</td></tr><tr><td>Volatility, expansion, and compression</td><td>29</td><td>true_range, true_range_pct, atr_14, atr_pct_14, ret_std_20, cv_20, chaikin_vol_10_10, vol_osc_14_28, vol_osc_pct_14_28, var_20, skew_20, kurt_20, q25_20, q50_20, q75_20, parkinson_vol_20, garman_klass_vol_20, rogers_satchell_vol_20, bipower_var_20, jump_var_20, vol_of_vol_20, range_hl, range_co, range_expansion_ratio_20, squeeze_scalar, in_squeeze, squeeze_breakout_pressure, vol_expansion_with_negative_return, range_expansion_with_direction</td></tr><tr><td>Activity, participation, and liquidity</td><td>22</td><td>volume_zscore_20, trades_zscore_20, dollar_volume_proxy, volume_share_vs_rolling_20, trade_count_intensity_zscore_20, activity_state_score_20, illiquidity_proxy_20, avg_trade_size, trade_intensity, prr, vroc_14, obv, mfi_14, adl, force_index, chaikin_osc_3_10, vpt, eom_14, pvi, nvi, vpt_vol_14, msv_14</td></tr><tr><td>Mean reversion, chop, and range</td><td>19</td><td>stoch_k_14, stoch_d_3, williams_r_14, cci_20, bollinger_pct_b_20, bollinger_bandwidth_20, zscore_20, choppiness_14, hurst_100, entropy_20, fractal_100, tir, donchian_hi_20, donchian_lo_20, donchian_width_pct_20, rolling_position_in_range_20, distance_from_mid_band_20, distance_from_vwap_day, prank_20</td></tr><tr><td>Drawdown, stress, and downside</td><td>24</td><td>drawdown_from_rolling_high_20, drawdown_from_rolling_high_50, rolling_max_drawdown_20, rolling_max_drawdown_50, downside_vol_20, downside_vol_50, ulcer_index_14, ulcer_index_50, downside_excursion_20, recovery_ratio_20, drawdown_duration_lookback, negative_return_share_20, omega_ratio_20, upside_downside_vol_ratio_20, ret_q05_50, ret_q95_50, ret_tail_spread_50, high_vol_downside_pressure_20, d_close_2, d_close_3, d_close_5, d_close_10, d_close_14, d_close_20</td></tr><tr><td>Range efficiency, runup, and drawdown</td><td>13</td><td>range_efficiency_20, range_efficiency_50, range_efficiency_100, path_efficiency_20, path_efficiency_50, abs_return_over_true_range_sum_20, directional_efficiency_20, directional_efficiency_50, runup_drawdown_ratio_20, close_location_value, body_to_range_ratio, upper_wick_ratio, lower_wick_ratio</td></tr><tr><td>Price transforms and bands</td><td>28</td><td>typical_price, median_price, weighted_close, sma_20, ema_20, wma_20, hma_20, wilder_14, ma_env_upper_20_2pct, ma_env_lower_20_2pct, boll_mid_20, boll_up_20, boll_low_20, keltner_mid_20, keltner_up_20, keltner_low_20, keltner_bandwidth_20, vwap_day, psar, tenkan_9, kijun_26, span_a_26, span_b_26, chikou_26, kama_10_2_30, frama_16, ewm_mean_alpha_0_1, ewm_mean_alpha_0_2</td></tr><tr><td>Other produced scalar outputs</td><td>10</td><td>ret_mean_20, sharpe_20, sortino_20, lr_intercept_20, lr_channel_hi_20, lr_channel_lo_20, rvi_10, elder_bull_13, elder_bear_13, crsi_3_2_100</td></tr></tbody></table></div>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/features/scalar_features.py">src/features/scalar_features.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/asset_state/feature_column_catalog.py">src/regimes/asset_state/feature_column_catalog.py</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="regime-feature-outputs">
+            <p class="eyebrow">regime feature outputs</p>
+            <h2>Regime feature outputs</h2>
+            <p>Regime Features are numeric and categorical source artifacts used to prepare state workflows. The source contract separates market features, pairwise relationship features, cross-asset summary features, eligibility snapshots, and universe snapshots.</p>
+<p>Market feature code defines primitive market feature families and columns. Asset-state code defines feature pools and preprocessing options for behavioral axes. Cross-asset code defines model-facing relationship feature families for meso and macro bands.</p>
+            
+            <div class="table-wrap" role="region" aria-label="Regime feature families and columns" tabindex="0"><table class="report-table data-table"><caption>Regime feature families and columns</caption><thead><tr><th scope="col">Feature family</th><th scope="col">Source-backed outputs</th><th scope="col">Notes</th></tr></thead><tbody><tr><td>Primitive market regime features</td><td>market_return_equal_weight, market_return_core_equal_weight, market_return_median, market_return_q05/q10/q25/q75/q90/q95, market_realized_volatility, market_core_return_realized_volatility, market_volatility_q10/median/q90, market_volatility_asset_count, breadth, dispersion, correlation, covariance, activity, and stress columns.</td><td>Grouped by return summary, realized volatility, breadth, dispersion, correlation summary, covariance summary, liquidity/activity, and stress families.</td></tr><tr><td>Asset-state feature pools</td><td>Trend, volatility, and activity pools with compact_axis, broad_axis, and interaction_or_compressed_axis styles; embeddings include none, pca, factor_analysis, and feature_agglomeration.</td><td>These are source-column pools used to test behavioral axes, not final public claims about active states.</td></tr><tr><td>Pairwise relationship features</td><td>rolling_corr, rolling_cov, rolling_beta, residual_corr, lead_lag_corr, return_distance, volatility_distance, and correlation_distance with value, sample_count, coverage, known_at_ts, lineage_id, and schema_version fields.</td><td>The source marks this surface as a compatibility scaffold; Relationship Discovery v1 is canonical.</td></tr><tr><td>Cross-asset relationship feature catalog</td><td>corr_to_anchor_primary, corr_to_anchor_secondary, corr_to_core_basket, beta_to_core_basket, residual_peer_signal_score, relationship_concentration, relationship_entropy, top_peer_count, top_peer_stability_mean, strongest_peer_slot_1_strength.</td><td>Deferred and sidecar fields are tracked separately so the public page does not treat every catalog field as model-facing.</td></tr></tbody></table></div>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/regime_features/contracts.py">src/regimes/regime_features/contracts.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/regime_features/market.py">src/regimes/regime_features/market.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/regime_features/pairwise.py">src/regimes/regime_features/pairwise.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/regime_features/cross_asset_feature_catalog.py">src/regimes/regime_features/cross_asset_feature_catalog.py</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="relationship-feature-outputs">
+            <p class="eyebrow">relationship feature outputs</p>
+            <h2>Relationship feature outputs</h2>
+            <p>Relationship Features start with Relationship Discovery method comparisons and schemas, then feed cross-asset state feature families.</p>
+<p>The source compares rolling correlation, beta-to-core-basket, residual return, residual correlation, volatility similarity, and feature-distance similarity by default. A lead-lag diagnostic exists but is disabled unless explicitly requested in the method config.</p>
+            
+            <div class="table-wrap" role="region" aria-label="Relationship Discovery schemas" tabindex="0"><table class="report-table data-table"><caption>Relationship Discovery schemas</caption><thead><tr><th scope="col">Schema</th><th scope="col">Row grain</th><th scope="col">Representative columns</th></tr></thead><tbody><tr><td>selected_relationship_edges</td><td>One selected edge per refit_key, interval, window, method_id, asset, related asset, and relationship family.</td><td>asset, related_asset_or_benchmark, relationship_family, relationship_type, method_id, value, abs_value, direction, rank, slot, sample_count, coverage, stability_score</td></tr><tr><td>asset_relationship_profiles</td><td>One row per asset, refit_key, interval, and window.</td><td>corr_to_anchor_primary, corr_to_anchor_secondary, corr_to_core_basket, beta_to_core_basket, market_mode_exposure_score, residual_peer_signal_score, relationship_concentration, relationship_entropy, top_peer_count, isolated_asset_score</td></tr><tr><td>relationship_stability_scores</td><td>One row per asset, related asset, method_id, interval, window, and refit key or score window.</td><td>survival_count, survival_share, mean_strength, strength_std, sign_stability, rank_stability, activation_status</td></tr></tbody></table></div>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/relationship_discovery/methods.py">src/regimes/relationship_discovery/methods.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/relationship_discovery/schemas.py">src/regimes/relationship_discovery/schemas.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/cross_asset_state/feature_families.py">src/regimes/cross_asset_state/feature_families.py</a></li>
+</ul>
+          </section>
+          <section class="stack" id="source-files">
+            <p class="eyebrow">Source Files</p>
+            <h2>Public source links from the manifest.</h2>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/features">src/features</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes/regime_features">src/regimes/regime_features</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes/relationship_discovery">src/regimes/relationship_discovery</a></li>
+</ul>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/features/scalar_features.py">Scalar feature columns and intervals</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/asset_state/feature_column_catalog.py">Scalar column grouping source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/regime_features/contracts.py">Regime feature artifact contracts</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/regime_features/market.py">Primitive market feature columns</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/relationship_discovery/methods.py">Relationship method comparison source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/relationship_discovery/schemas.py">Relationship output schemas</a></li>
+</ul>
+          </section>
+          
+          <section class="stack" id="terms">
+            <p class="eyebrow">Terms</p>
+            <h2>Plain-language source notes.</h2>
+            <dl class="meta-list">
+              <div class="meta-row"><dt>feature column</dt><dd>A named numeric output column used by downstream state or forecasting workflows.</dd></div>
+<div class="meta-row"><dt>interval</dt><dd>The sampling frequency in minutes for the source rows that feed a feature family.</dd></div>
+<div class="meta-row"><dt>behavioral axis</dt><dd>A conceptual domain for clustering or state interpretation, such as trend, volatility, activity, breadth, dispersion, or relationship exposure.</dd></div>
+<div class="meta-row"><dt>relationship edge</dt><dd>A source row describing a measured relationship between an asset and a related asset or benchmark.</dd></div>
+            </dl>
+          </section>
+          
+        </article>
+      </section>
+    </main>
+
+    <footer class="section site-shell">
+      <p>Source-only public guide. Generated data, model artifacts, run logs, and private operational records are outside this site.</p>
+    </footer>
+
+    <script type="module" src="assets/js/nav.js?v=20260623-copy1"></script>
+    <script type="module" src="assets/js/reveal.js?v=20260623-copy1"></script>
+    <script type="module" src="assets/js/transitions.js?v=20260623-copy1"></script>
+  </body>
+</html>

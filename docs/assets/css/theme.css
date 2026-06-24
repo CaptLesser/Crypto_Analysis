@@ -1,0 +1,16 @@
+@layer tokens {
+  :root {
+    --surface-0: #080d12;
+    --surface-1: #101820;
+    --surface-2: #17222d;
+    --text-1: #f0f6fb;
+    --text-2: #afbdc9;
+    --accent: #86d1ff;
+    --accent-2: #92dec8;
+    --hero-bg: linear-gradient(135deg, rgb(134 209 255 / 0.12), rgb(255 255 255 / 0.035));
+    --card-bg: rgb(255 255 255 / 0.055);
+    --glow-alpha: 0.14;
+    --glass-alpha: 0.08;
+    --scanline-opacity: 0;
+  }
+}

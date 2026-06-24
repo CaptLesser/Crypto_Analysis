@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Explain the source-visible Market, Asset, and Cross-Asset regime processes, separating Test workflow evaluation from planning workflow contracts.">
+    <title>Regimes | Crypto_Analysis</title>
+    <link rel="stylesheet" href="assets/css/layers.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/reset.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/tokens.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/base.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/layout.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/components.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/utilities.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/effects.css?v=20260623-copy1">
+    <link rel="stylesheet" href="assets/css/theme.css?v=20260623-copy1">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <nav class="nav site-shell" aria-label="Primary" data-nav>
+        <a class="nav__brand" href="index.html">Crypto_Analysis <span class="muted">Source Guide</span></a>
+        <ul class="nav__links">
+          <li><a href="index.html">Overview</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+<li><a href="scalar-features.html">Features</a></li>
+<li><a href="regimes.html" aria-current="page">Regimes</a></li>
+<li><a href="numerics-forecasting.html">Numerics Forecasting</a></li>
+<li><a href="roadmap-source.html">Source Map</a></li>
+        </ul>
+      </nav>
+    </header>
+
+    <main id="main-content" tabindex="-1">
+      
+      <section class="section site-shell">
+        <div class="hero hero-banner page-hero-banner surface-grid">
+          <figure class="hero-banner__media" aria-hidden="true"><img src="assets/media/graphics/regime-relationship-flow.png?v=20260623-copy1" alt="" width="1254" height="1254" loading="eager" fetchpriority="high" decoding="async"></figure>
+          <div class="hero__copy hero-banner__copy">
+          <img class="asset-badge page-title__badge" src="assets/media/badges/badge_regimes_v2.svg?v=20260623-copy1" alt="Regimes badge" width="1600" height="520" loading="lazy" decoding="async">
+          <h1>Regimes</h1>
+          <p class="measure">Explain the source-visible Market, Asset, and Cross-Asset regime processes, separating Test workflow evaluation from planning workflow contracts.</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section site-shell doc-layout reveal">
+        
+        <div class="doc-rail-shell" data-doc-rail-shell>
+          <nav class="doc-rail" aria-label="Documentation sections" data-doc-rail>
+            <button class="doc-rail__toggle" type="button" aria-expanded="true" aria-controls="regimes-contents" data-doc-rail-toggle>
+              <span class="doc-rail__heading">Contents</span>
+              <span class="doc-rail__toggle-state" data-doc-rail-toggle-label>Hide</span>
+            </button>
+            <div class="doc-rail__content" id="regimes-contents" data-doc-rail-content>
+              <a href="#regime-definitions">Market, asset, and cross-asset regimes</a><a href="#test-workflow">Test workflow</a><a href="#planning-workflow">Planning workflow</a><a href="#relationship-cross-reference">Relationship Discovery cross-reference</a><a href="#source-files">Source files</a><a href="#terms">Terms</a>
+            </div>
+          </nav>
+          <button class="doc-rail__edge-toggle" type="button" aria-expanded="false" aria-controls="regimes-contents" aria-label="Show contents" data-doc-rail-edge-toggle hidden>
+            <span aria-hidden="true">+</span>
+          </button>
+        </div>
+        <article class="stack measure">
+          
+          <section class="stack" id="regime-definitions">
+            <p class="eyebrow">regime definitions</p>
+            <h2>Market, asset, and cross-asset regimes</h2>
+            <p>The regime source tree has three public state workflows: Market State, Asset State, and Cross-Asset State. Each workflow interprets a different behavioral scope and has its own axes, feature pools, candidate methods, and planning contracts.</p>
+<p>The public site should describe the workflow shape and output contracts without claiming current active labels or publishing generated state rows.</p>
+            
+            <div class="table-wrap" role="region" aria-label="Regime workflow scopes" tabindex="0"><table class="report-table data-table"><caption>Regime workflow scopes</caption><thead><tr><th scope="col">Workflow</th><th scope="col">Plain-language interpretation</th><th scope="col">Axes or families</th><th scope="col">Source contract</th></tr></thead><tbody><tr><td>Market State</td><td>Interprets broad conditions across the asset universe: whether the market is rising or falling together, how broad participation is, how dispersed returns are, how correlated assets are, how volatile the market is, and whether leadership is concentrated.</td><td>Core contract axes: market, breadth, dispersion, correlation, market_vol, leadership. Test workflow panels also include return, volatility, breadth, dispersion, correlation, liquidity/activity, stress, stable-peg stress, and speculative sidecar panels.</td><td>src/regimes/core/contracts.py and src/regimes/market_state/test_branch_campaign.py</td></tr><tr><td>Asset State</td><td>Interprets each asset&#x27;s own behavior across trend, volatility, and activity. Source labels use cluster assignments plus plain labels, confidence, and intensity fields.</td><td>trend, vol, activity; bands are micro, meso, and macro with 30, 240, and 1440 minute ceiling intervals.</td><td>src/regimes/contracts.py and src/regimes/asset_state/feature_pools.py</td></tr><tr><td>Cross-Asset State</td><td>Interprets how each asset behaves relative to anchors, core baskets, peer strength, concentration, entropy, and residual peer signals. The core contract calls this relative_state; the source folder for the current workflow is cross_asset_state.</td><td>Core relative-state axes: relative, beta, correlation, relative_strength, relative_dispersion. Cross-asset feature families: anchor_core_exposure, peer_strength_stability, relationship_concentration_entropy, residual_peer_signal.</td><td>src/regimes/cross_asset_state/feature_families.py and src/regimes/cross_asset_state/method_universe.py</td></tr></tbody></table></div>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/core/contracts.py">src/regimes/core/contracts.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/contracts.py">src/regimes/contracts.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/cross_asset_state/feature_families.py">src/regimes/cross_asset_state/feature_families.py</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="test-workflow">
+            <p class="eyebrow">test workflow</p>
+            <h2>Test workflow</h2>
+            <p>The Test workflow is where the source compares candidate feature panels, preprocessing choices, dimensionality-reduction choices, clustering methods, and profile evidence before any planning workflow step.</p>
+<p>Raw clustering outputs should be treated as cluster assignments until a workflow produces an interpreted profile or label contract.</p>
+            
+            <div class="table-wrap" role="region" aria-label="Test workflow by regime type" tabindex="0"><table class="report-table data-table"><caption>Test workflow by regime type</caption><thead><tr><th scope="col">Workflow</th><th scope="col">Candidate columns or axes</th><th scope="col">Preprocessing and methods</th><th scope="col">Profile artifacts produced</th></tr></thead><tbody><tr><td>Asset State</td><td>Feature-pool styles are compact_axis, broad_axis, and interaction_or_compressed_axis. Source pools cover trend, volatility, activity, mean_reversion, drawdown, and range_efficiency candidates while the label contract exposes trend, vol, and activity axes.</td><td>Embeddings include none, pca, factor_analysis, and feature_agglomeration. Shared method candidates include kmeans, minibatch_kmeans, pca_kmeans, factor_analysis_kmeans, gaussian_mixture, factor_analysis_gaussian_mixture, bayesian_gaussian_mixture, birch, hdbscan, optics, and agglomerative.</td><td>Selected profile manifests, candidate score rows, cluster diagnostics, feature pool metadata, and output-finalization artifacts for later planning.</td></tr><tr><td>Market State</td><td>Axis panels include market_return_state, market_volatility_state, market_breadth_state, market_dispersion_state, market_correlation_state, market_liquidity_activity_state, market_stress_state, stable_peg_stress_state, and market_speculative_state.</td><td>Preprocessing options are standard_scale, robust_scale, and noop. Reducers are none, pca, and factor_analysis. Candidate profiles compare kmeans, minibatch_kmeans, Gaussian mixture variants, Birch, HDBSCAN, OPTICS, and agglomerative methods, with diagnostic-only status where source policy requires it.</td><td>Selected profile manifests, candidate scoreboards, masked-or-skipped cells, runtime telemetry, and campaign summaries.</td></tr><tr><td>Cross-Asset State</td><td>Feature families are anchor_core_exposure, peer_strength_stability, relationship_concentration_entropy, and residual_peer_signal, using relationship snapshots and cross-asset feature catalogs.</td><td>Profile types include rule_threshold, ordinal_quantile, kmeans, minibatch_kmeans, pca_kmeans, factor_analysis_kmeans, gaussian_mixture, factor_analysis_gaussian_mixture, bayesian_gaussian_mixture, birch, hdbscan, optics, agglomerative, and diagnostic_only. Birch is diagnostic-only in the current method universe.</td><td>Selected cross-asset profile manifests, diagnostic-only profile rows, masked cells, relationship-context handoff references, output-health evidence, and method-universe manifests.</td></tr></tbody></table></div>
+<div class="table-wrap" role="region" aria-label="Shared clustering candidate policy" tabindex="0"><table class="report-table data-table"><caption>Shared clustering candidate policy</caption><thead><tr><th scope="col">Candidate status</th><th scope="col">Methods</th><th scope="col">Meaning</th></tr></thead><tbody><tr><td>Default candidate</td><td>kmeans, minibatch_kmeans, pca_kmeans, factor_analysis_kmeans, gaussian_mixture, factor_analysis_gaussian_mixture, bayesian_gaussian_mixture, birch</td><td>The shared registry marks these as default candidates, while each pathway still owns enablement and search-space policy.</td></tr><tr><td>Diagnostic conditional by default</td><td>hdbscan, optics, agglomerative</td><td>Adapters exist, but pathway policy must prove suitability before candidate promotion.</td></tr><tr><td>Excluded by default</td><td>spectral_clustering</td><td>The shared registry keeps this out of default tuning unless a pathway explicitly proves otherwise.</td></tr></tbody></table></div>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/core/clustering_candidates.py">src/regimes/core/clustering_candidates.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/asset_state/feature_pools.py">src/regimes/asset_state/feature_pools.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/market_state/test_branch_campaign.py">src/regimes/market_state/test_branch_campaign.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/cross_asset_state/test_prototype.py">src/regimes/cross_asset_state/test_prototype.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/cross_asset_state/method_universe.py">src/regimes/cross_asset_state/method_universe.py</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="planning-workflow">
+            <p class="eyebrow">planning workflow</p>
+            <h2>Planning workflow</h2>
+            <p>The source-visible planning workflow starts after profile selection. It validates selected profile manifests, resolves the input edge, builds timestamp plans, creates planning units, and emits job-matrix and telemetry payloads.</p>
+<p>This page presents planning contracts as source architecture. It does not claim that the public site publishes generated labels or runtime rows.</p>
+            
+            <div class="table-wrap" role="region" aria-label="Planning workflow outputs" tabindex="0"><table class="report-table data-table"><caption>Planning workflow outputs</caption><thead><tr><th scope="col">Workflow</th><th scope="col">Planner inputs</th><th scope="col">Planned outputs</th><th scope="col">Label or row contract</th></tr></thead><tbody><tr><td>Asset State</td><td>Selected asset-state profile manifest plus input edge and profile artifact hash.</td><td>Planning units, selected/skipped counts, job matrix summary, reuse-cache telemetry, clamp policy, refit cadence, normalized lineage checks.</td><td>Asset label rows include ts, asset, band, ceiling_interval_min, each trend/vol/activity cluster_id, label, confidence_pct, intensity_pct, and feature_schema_hash.</td></tr><tr><td>Market State</td><td>Selected market-state profiles and masked/skipped cells from the market-state selected-profile artifact.</td><td>Planning units for selected and masked-unavailable cells, job matrix summary, per-axis target keys, input-edge telemetry, and profile lookup metadata.</td><td>Wide market-state rows are keyed by ts, band, and profile_id, with per-axis assignment, id, score, confidence, and status columns.</td></tr><tr><td>Cross-Asset State</td><td>Selected, diagnostic-only, and masked cross-asset profiles plus relationship-input freshness checks.</td><td>Planning units by asset, relationship feature family, and band; relationship freshness summary; job matrix summary; selected, diagnostic-only, and masked counts.</td><td>Selected profile records include asset_id, relationship_feature_family, band, profile_id, method_family, feature_columns, state_count, label health, relationship snapshot lineage, and support metadata.</td></tr></tbody></table></div>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/asset_state/production_planner.py">Asset-state planning source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/market_state/production_planner.py">Market-state planning source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/cross_asset_state/production_planner.py">Cross-asset planning source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/market_state/output_contract.py">src/regimes/market_state/output_contract.py</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/cross_asset_state/schema.py">src/regimes/cross_asset_state/schema.py</a></li>
+</ul>
+          </section>
+
+          <section class="stack" id="relationship-cross-reference">
+            <p class="eyebrow">relationship cross reference</p>
+            <h2>Relationship Discovery cross-reference</h2>
+            <p>Relationship Discovery belongs on the Features page because it primarily produces relationship edges, profiles, stability scores, and cross-asset feature inputs.</p>
+<p>On the Regimes page, it should stay a cross-reference: Cross-Asset State consumes relationship-derived feature families, but the relationship artifacts themselves are feature-generation outputs.</p>
+            
+            
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes/relationship_discovery">src/regimes/relationship_discovery</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes/regime_features">src/regimes/regime_features</a></li>
+</ul>
+          </section>
+          <section class="stack" id="source-files">
+            <p class="eyebrow">Source Files</p>
+            <h2>Public source links from the manifest.</h2>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes/core">src/regimes/core</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes/market_state">src/regimes/market_state</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes/asset_state">src/regimes/asset_state</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes/cross_asset_state">src/regimes/cross_asset_state</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes/regime_features">src/regimes/regime_features</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/main/src/regimes/relationship_discovery">src/regimes/relationship_discovery</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/tree/pipeline_test/src/regimes/asset_state_test">src/regimes/asset_state_test</a></li>
+</ul>
+            <ul class="timeline source-links">
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/core/contracts.py">Core regime layers and axes</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/core/clustering_candidates.py">Shared clustering candidate policy</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/asset_state/feature_pools.py">Asset-state feature pools</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/market_state/test_branch_campaign.py">Market-state Test workflow campaign source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/cross_asset_state/method_universe.py">Cross-asset method universe</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/asset_state/production_planner.py">Asset-state planning workflow source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/market_state/production_planner.py">Market-state planning workflow source</a></li>
+<li><a href="https://github.com/CaptLesser/Crypto_Analysis/blob/main/src/regimes/cross_asset_state/production_planner.py">Cross-asset planning workflow source</a></li>
+</ul>
+          </section>
+          
+          <section class="stack" id="terms">
+            <p class="eyebrow">Terms</p>
+            <h2>Plain-language source notes.</h2>
+            <dl class="meta-list">
+              <div class="meta-row"><dt>behavioral axis</dt><dd>The conceptual domain being evaluated or clustered, such as trend, volatility, activity, breadth, dispersion, or relationship exposure.</dd></div>
+<div class="meta-row"><dt>cluster assignment</dt><dd>The raw result of a clustering method before a workflow interprets it as a state label.</dd></div>
+<div class="meta-row"><dt>profile</dt><dd>A selected method and configuration record with evidence, lineage, target keys, and planner metadata.</dd></div>
+<div class="meta-row"><dt>Planning workflow</dt><dd>The source-visible planning path that consumes selected profiles and prepares job matrices and telemetry; the public site does not publish generated runtime rows.</dd></div>
+            </dl>
+          </section>
+          
+        </article>
+      </section>
+    </main>
+
+    <footer class="section site-shell">
+      <p>Source-only public guide. Generated data, model artifacts, run logs, and private operational records are outside this site.</p>
+    </footer>
+
+    <script type="module" src="assets/js/nav.js?v=20260623-copy1"></script>
+    <script type="module" src="assets/js/reveal.js?v=20260623-copy1"></script>
+    <script type="module" src="assets/js/transitions.js?v=20260623-copy1"></script>
+  </body>
+</html>
