@@ -1,0 +1,79 @@
+{
+  "schema_version": "styleforge-pack-manifest-v1",
+  "pack_id": "polished-technical",
+  "name": "Polished Technical System",
+  "status": "first-review",
+  "catalog_scope": "milestone-1",
+  "description": "A restrained dark technical design pack for project mirrors, documentation hubs, status pages, and automation reports.",
+  "runtime": "plain-html-css-js",
+  "pages": [
+    {
+      "title": "Home",
+      "path": "index.html",
+      "role": "landing"
+    },
+    {
+      "title": "Projects",
+      "path": "projects.html",
+      "role": "project-library"
+    },
+    {
+      "title": "Docs",
+      "path": "docs.html",
+      "role": "documentation"
+    },
+    {
+      "title": "Report",
+      "path": "report.html",
+      "role": "status-report"
+    }
+  ],
+  "assets": {
+    "css": [
+      "assets/css/layers.css",
+      "assets/css/reset.css",
+      "assets/css/tokens.css",
+      "assets/css/theme.css",
+      "assets/css/base.css",
+      "assets/css/layout.css",
+      "assets/css/components.css",
+      "assets/css/utilities.css",
+      "assets/css/effects.css"
+    ],
+    "js": [
+      "assets/js/nav.js",
+      "assets/js/reveal.js",
+      "assets/js/transitions.js"
+    ],
+    "media": [
+      "assets/media/placeholders/technical-system.svg",
+      "assets/media/placeholders/experimental-signal.svg"
+    ]
+  },
+  "design_profile": {
+    "personality": [
+      "credible",
+      "engineered",
+      "restrained",
+      "public-facing"
+    ],
+    "effect_intensity": "low",
+    "best_for": [
+      "project mirrors",
+      "technical portfolios",
+      "documentation hubs",
+      "automation reports"
+    ]
+  },
+  "portability": {
+    "requires_build_step": false,
+    "requires_backend": false,
+    "static_hosting_ready": true,
+    "local_preview": "Open index.html directly or serve the repository root with a static server."
+  },
+  "accessibility": {
+    "reduced_motion": true,
+    "keyboard_navigation_target": true,
+    "core_content_visible_without_js": true
+  }
+}
